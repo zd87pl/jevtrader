@@ -17,11 +17,15 @@ from typing import Callable
 
 
 MAX_TEXT_CHARS = 40_000
+MAX_OUTPUT_TOKENS = 4_096  # requested of OpenAI; spend estimates assume it for any paid call
 MAX_RESPONSE_BYTES = 1_048_576
 REQUEST_TIMEOUT = 30.0
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
 Transport = Callable[[str, dict, str, float], dict]
+PROVIDERS = ("rules", "local", "jev", "openai")
+PAID_PROVIDERS = frozenset({"jev", "openai"})  # local engines and the rules baseline cost nothing
+_PROVIDER_CHOICES = "provider must be rules, local, jev, or openai"
 _QUESTION_KEYS = {"direction", "materiality", "novelty"}
 _FEATURE_KEYS = _QUESTION_KEYS | {"uncertainty"}
 _DIRECTIONS = {"improving", "unchanged", "deteriorating", "unclear"}
@@ -130,8 +134,8 @@ def require_credentials(provider: str) -> None:
         _api_key("TYPESAFE_API_KEY")
     elif provider == "openai":
         _api_key("OPENAI_API_KEY")
-    elif provider != "rules":
-        raise ProviderInputError("provider must be rules, jev, or openai")
+    elif provider not in PROVIDERS:
+        raise ProviderInputError(_PROVIDER_CHOICES)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -328,7 +332,7 @@ def _openai_request(
         "instructions": instructions,
         "input": _json_text(data),
         "store": False,
-        "max_output_tokens": 4_096,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
     }
     raw = _request(transport, OPENAI_ENDPOINT, payload, _api_key("OPENAI_API_KEY"))
@@ -423,6 +427,7 @@ def extract_features(
     strategy: dict,
     *,
     transport: Transport | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Extract bounded semantic features and retain the provider response for audit.
 
@@ -431,15 +436,25 @@ def extract_features(
     Empty comparison text always produces zero novelty. Provider aliases are not
     resolved here: the caller supplies its chosen model and the response records
     the actual resolved model. The rules baseline always reports ``rules-v1``.
+    ``base_url`` is the loopback address of a ``local`` engine (default: Ollama's).
     """
     questions = _validate_inputs(model, current_text, previous_text, strategy)
+    if base_url is not None and provider != "local":
+        raise ProviderInputError("base_url applies only to the local provider")
     if provider == "rules":
         return _rules(current_text, previous_text)
+    if provider == "local":
+        from . import local  # local imports this module's names, so it loads on first use
+
+        url = local.DEFAULT_BASE_URL if base_url is None else base_url
+        return local.extract(
+            model, current_text, previous_text, questions, base_url=url, transport=transport
+        )
     if provider == "jev":
         return _jev(model, current_text, previous_text, questions, transport)
     if provider == "openai":
         return _openai(model, current_text, previous_text, questions, transport)
-    raise ProviderInputError("provider must be rules, jev, or openai")
+    raise ProviderInputError(_PROVIDER_CHOICES)
 
 
 def propose_strategy(

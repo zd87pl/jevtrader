@@ -5,7 +5,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from jevtrader import engine
+from jevtrader import engine, registry
 from jevtrader.common import digest, load_strategy, timestamp
 from jevtrader.market import normalize_bar, outcome
 from jevtrader.providers import (
@@ -173,6 +173,34 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(extract.call_count, 1)
         self.assertEqual(self.ledger.counts()["extractions"], 1)
         self.assertEqual(self.ledger.counts()["forecasts"], 2)
+
+    def test_replay_freezes_its_evidence_basis_and_hand_picked_replays_never_count(self):
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        current = self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], "no_model_knowledge")
+        self.assertEqual(
+            result["eligibility_basis"],
+            {
+                "key": "rules:rules-v1",
+                "training_cutoff": None,
+                "origin": "builtin",
+                "source": registry.MODELS["rules:rules-v1"]["source"],
+            },
+        )
+        # What was sent, so the spend cap need not trust a provider's own token count.
+        questions = sum(len(text) for text in self.strategy["questions"].values())
+        extraction = self.ledger.get("extractions", result["extraction_id"])
+        self.assertEqual(
+            extraction["input_chars"],
+            len(current["text"]) + len("Business was unchanged.") + questions,
+        )
+        adhoc = engine.observe(
+            self.ledger, "current", self.strategy, as_of=self.at(20, "22:01:00"), adhoc=True
+        )
+        self.assertEqual(adhoc["eligibility"], "adhoc_replay")
+        self.assertFalse(registry.counts_as_evidence(adhoc["eligibility"]))
 
     def test_uncalibrated_rules_observation_is_watch(self):
         self.populate()

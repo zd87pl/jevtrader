@@ -9,6 +9,10 @@ import re
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# US equity sessions and EDGAR dates are defined in New York time.
+EASTERN = ZoneInfo("America/New_York")
 
 
 def utc_now() -> str:
@@ -56,6 +60,22 @@ def symbol(value: str) -> str:
     if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,11}", result):
         raise ValueError(f"Invalid symbol: {value!r}")
     return result
+
+
+def sec_symbol(value: str) -> str:
+    """A symbol in SEC's share-class form (BRK-B), which users and brokers write as BRK.B."""
+    return symbol(value).replace(".", "-")
+
+
+def ledger_file(ledger: object) -> Path | None:
+    """The resolved file behind a ledger's main database; None for memory or fakes."""
+    connection = getattr(ledger, "db", None)
+    if connection is None:
+        return None
+    for _, name, location in connection.execute("PRAGMA database_list").fetchall():
+        if name == "main" and location:
+            return Path(location).resolve()
+    return None
 
 
 def load_strategy(path: str | Path | None = None) -> dict:

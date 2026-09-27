@@ -274,5 +274,216 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(network.calls), 3)
 
 
+class CollectFilingTests(unittest.TestCase):
+    """collect_filing is shared by collect_disclosures and the universe-wide feeds."""
+
+    DOCS = {
+        BASE + "index.json": {"directory": {"item": [{"name": "d123ex991.htm"}]}},
+        BASE + "d123ex991.htm": "<p>Operating update.</p>",
+    }
+
+    def collect(self, responses=None, *, submissions=None, **kwargs):
+        network = FakeNetwork({**self.DOCS, **(responses or {})})
+        client = network.client("Bot a@b.test", 20, 4)
+        record = sec.collect_filing(
+            client, "123456", ACCESSION, "abc", submissions=submissions, **kwargs
+        )
+        return record, network
+
+    def test_forward_record_carries_acceptance_fields_and_actual_receipt(self):
+        record, network = self.collect({SUBMISSIONS: recent()})
+        self.assertEqual(network.calls[0][0], SUBMISSIONS)
+        self.assertEqual(record["accepted_at"], record["published_at"])
+        self.assertEqual(record["published_at"], "2026-09-25T20:30:00Z")
+        self.assertIs(record["after_hours"], False)
+        self.assertEqual(record["first_seen_at"], "2026-09-27T04:00:00Z")
+        self.assertEqual(record["mode"], "forward")
+        self.assertEqual(record["sec_acceptance_raw"], "2026-09-25T16:30:00-04:00")
+        self.assertEqual(record["cik"], CIK)
+        self.assertEqual(record["symbol"], "ABC")
+
+    def test_supplied_submissions_save_a_request(self):
+        record, network = self.collect(submissions=recent())
+        self.assertEqual([call[0] for call in network.calls], list(self.DOCS))
+        self.assertEqual(record["id"], f"sec:{ACCESSION}:d123ex991.htm")
+
+    def test_after_hours_starts_at_1730_eastern_and_reads_utc_labels_late(self):
+        for acceptance, expected in [
+            ("2026-09-25T17:29:59-04:00", False),
+            ("2026-09-25T17:30:00-04:00", True),
+            ("2026-01-06T17:30:00-05:00", True),
+            ("2026-09-25T21:29:00Z", True),  # 17:29 EDT, or 21:29 if SEC means Eastern
+            ("2026-09-25T13:00:00Z", False),
+            ("2026-09-25T18:01:14.000Z", True),
+        ]:
+            with self.subTest(acceptance=acceptance):
+                record, _ = self.collect(submissions=recent(acceptanceDateTime=[acceptance]))
+                self.assertIs(record["after_hours"], expected)
+
+    def test_latest_acceptance_never_reads_early(self):
+        utc = datetime(2026, 9, 25, 16, 30, tzinfo=timezone.utc)
+        self.assertEqual(sec.latest_acceptance("2026-09-25T16:30:00-04:00"), utc.replace(hour=20))
+        self.assertEqual(sec.latest_acceptance("2026-09-25T16:30:00.000Z"), utc.replace(hour=20))
+        self.assertEqual(sec.latest_acceptance("2026-09-25T16:30:00"), utc.replace(hour=20))
+        self.assertEqual(sec.latest_acceptance("2026-09-25T16:30:00+01:00"), utc.replace(hour=15))
+        # 01:30 happens twice when daylight saving ends; the later (EST) instant wins.
+        self.assertEqual(
+            sec.latest_acceptance("2026-11-01T01:30:00"),
+            datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+        )
+        for value in ["2026-09-25", "", None, "soon"]:
+            with self.subTest(value=value), self.assertRaises(sec.SECError):
+                sec.latest_acceptance(value)
+
+    def test_non_qualifying_filing_returns_none_without_document_requests(self):
+        for changes in [
+            {"items": ["2.02,7.01"]},
+            {"items": ["9.01"]},
+            {"form": ["10-K"]},
+            {"primaryDocument": ["cover.pdf"]},
+            {"acceptanceDateTime": ["2026-09-25"]},
+        ]:
+            with self.subTest(changes=changes):
+                record, network = self.collect(submissions=recent(**changes))
+                self.assertIsNone(record)
+                self.assertEqual(network.calls, [])
+
+    def test_missing_accession_raises_filing_not_found(self):
+        other = recent(accessionNumber=["0000123456-26-000999"])
+        with self.assertRaises(sec.FilingNotFound):
+            self.collect(submissions=other)
+        self.assertTrue(issubclass(sec.FilingNotFound, sec.SECError))
+
+    def test_submissions_of_another_company_are_refused(self):
+        data = recent()
+        for reported in ["654321", "abc", 654321]:
+            data["cik"] = reported
+            with self.subTest(reported=reported), self.assertRaises(sec.SECError):
+                self.collect(submissions=data)
+        data["cik"] = "123456"
+        self.assertIsNotNone(self.collect(submissions=data)[0])
+        with self.assertRaises(sec.SECError):
+            self.collect(submissions=[])
+
+    def test_first_seen_rules_by_mode(self):
+        late = "2026-09-26T10:00:00Z"
+        record, _ = self.collect(submissions=recent(), mode="historical", first_seen=late)
+        self.assertEqual((record["first_seen_at"], record["mode"]), (late, "historical"))
+        seen = []
+
+        def assume(raw):
+            seen.append(raw)
+            return "2026-09-25T20:45:00+00:00"
+
+        record, _ = self.collect(submissions=recent(), mode="historical", first_seen=assume)
+        self.assertEqual(seen, ["2026-09-25T16:30:00-04:00"])
+        self.assertEqual(record["first_seen_at"], "2026-09-25T20:45:00Z")
+        for kwargs in [
+            {"mode": "forward", "first_seen": late},
+            {"mode": "historical"},
+            {"mode": "synthetic", "first_seen": late},
+            {"mode": "historical", "first_seen": "2026-09-25T20:29:59Z"},
+            {"mode": "historical", "first_seen": "2026-09-26T10:00:00"},
+            {"mode": "historical", "first_seen": "2026-09-26"},
+            {"mode": "historical", "first_seen": lambda raw: None},
+        ]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(sec.SECError):
+                self.collect(submissions=recent(), **kwargs)
+
+    def test_utc_labelled_acceptance_needs_first_seen_after_eastern_reading(self):
+        data = recent(acceptanceDateTime=["2026-09-25T16:30:00.000Z"])
+        with self.assertRaises(sec.SECError):
+            self.collect(submissions=data, mode="historical", first_seen="2026-09-25T16:45:00Z")
+        record, _ = self.collect(
+            submissions=data, mode="historical", first_seen="2026-09-25T20:45:00Z"
+        )
+        self.assertEqual(record["published_at"], "2026-09-25T16:30:00Z")
+
+    def test_invalid_arguments_never_make_a_request(self):
+        network = FakeNetwork({})
+        client = network.client("Bot a@b.test", 20, 4)
+        for args in [
+            ("0", ACCESSION, "ABC"),
+            ("12345678901", ACCESSION, "ABC"),
+            ("\u0661\u0662", ACCESSION, "ABC"),
+            ("123456", "../../x", "ABC"),
+            ("123456", ACCESSION.replace("0", "\u0660"), "ABC"),
+            ("123456", ACCESSION, "A/B"),
+            ("123456", ACCESSION, ""),
+        ]:
+            with self.subTest(args=args), self.assertRaises(sec.SECError):
+                sec.collect_filing(client, *args)
+        self.assertEqual(network.calls, [])
+
+
+class FeedURLTests(unittest.TestCase):
+    FEED = (
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company="
+        "&dateb=&owner=include&start=0&count={}&output=atom"
+    )
+
+    def test_feed_ticker_and_daily_index_urls_are_approved(self):
+        for url in [
+            self.FEED.format(100),
+            self.FEED.format(10),
+            "https://www.sec.gov/files/company_tickers.json",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/form.20260925.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR1/form.20260331.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2024/QTR1/form.20240229.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR4/form.20261231.idx",
+        ]:
+            with self.subTest(url=url):
+                sec._validate_url(url)
+
+    def test_near_miss_feed_ticker_and_index_urls_are_blocked(self):
+        feed = self.FEED.format(100)
+        for url in [
+            self.FEED.format(50),
+            self.FEED.format(1000),
+            feed.replace("type=8-K", "type=4"),
+            feed.replace("action=getcurrent&type=8-K", "type=8-K&action=getcurrent"),
+            feed + "&extra=1",
+            feed.replace("output=atom", "output=xml"),
+            feed.replace("start=0", "start=100"),
+            feed.replace("company=", "company=x"),
+            feed + "#top",
+            feed.replace("https://", "http://"),
+            feed.replace("www.sec.gov", "www.sec.gov:443"),
+            feed.replace("www.sec.gov", "user@www.sec.gov"),
+            feed.replace("/cgi-bin/browse-edgar", "/cgi-bin/browse-edgar2"),
+            feed.replace("&count", "\n&count"),
+            feed.replace("&count", "\t&count"),
+            "https://www.sec.gov/cgi-bin/browse-edgar",
+            "https://www.sec.gov/cgi-bin/srch-edgar?text=form-type%3D8-K",
+            "https://data.sec.gov/cgi-bin/browse-edgar?action=getcurrent",
+            "https://www.sec.gov/files/company_tickers.json?x=1",
+            "https://www.sec.gov/files/company_tickers_exchange.json",
+            "https://www.sec.gov/files/../files/company_tickers.json",
+            "https://sec.gov/files/company_tickers.json",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR2/form.20260925.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2025/QTR3/form.20260925.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR1/form.20260230.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/master.20260925.idx",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/form.20260925.idx.gz",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/",
+            "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/form.20260925.idx?x",
+            "https://www.sec.gov/Archives/edgar/data/123456/000012345626000001/ex99.htm?",
+            BASE + "d\u00e9x99.htm",
+        ]:
+            with self.subTest(url=url), self.assertRaises(sec.SECError):
+                sec._validate_url(url)
+
+    def test_bulk_reads_have_their_own_byte_bound(self):
+        url = "https://www.sec.gov/files/company_tickers.json"
+        network = FakeNetwork({url: b"x" * (sec.MAX_RESPONSE_BYTES + 1)})
+        client = network.client("Bot a@b.test", 20, 3)
+        with self.assertRaises(sec.SECError):
+            client.get(url)
+        self.assertEqual(len(client.get(url, max_bytes=sec.MAX_BULK_BYTES)), 2_000_001)
+        network.responses[url] = b"x" * (sec.MAX_BULK_BYTES + 1)
+        with self.assertRaises(sec.SECError):
+            client.get(url, max_bytes=sec.MAX_BULK_BYTES)
+
+
 if __name__ == "__main__":
     unittest.main()

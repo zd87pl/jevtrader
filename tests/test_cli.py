@@ -129,6 +129,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual(self.command("show", "forecasts", "missing")[0], 2)
 
     def test_json_import_is_idempotent_and_no_claimed_forward(self):
+        self.assertEqual(self.command("import-disclosures", "missing.jsonl")[0], 2)
+        self.assertFalse(Path(self.db).exists())  # Only init and demo create a ledger.
+        self.assertEqual(self.command("init")[0], 0)
         path = Path(self.temp.name) / "events.jsonl"
         event = {
             "id": "example",
@@ -566,6 +569,7 @@ class CLITests(unittest.TestCase):
             self.assertEqual([r["id"] for r in ledger.all("experiments")], ["trial"])
 
     def test_fit_and_evaluate_forward_explicit_mode(self):
+        self.assertEqual(self.command("init")[0], 0)
         for command, function in (("fit", "train"), ("evaluate", "evaluate")):
             with (
                 self.subTest(command=command),

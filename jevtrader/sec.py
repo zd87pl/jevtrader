@@ -13,6 +13,7 @@ actually received the selected document, never a reconstructed historical date.
 Consumers must persist that first observation rather than overwrite it on repeat
 polls, deduplicate on ``id``, and never backdate a forward decision. Amendments are
 separate records. No API key, external link fetching, or live model is used.
+Only a historical collection may carry a supplied (assumed) ``first_seen_at``.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import json
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 from typing import Callable
@@ -31,6 +32,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_BULK_BYTES = 10_000_000  # One day's form index or the ticker map; both are single SEC files.
 MAX_TEXT_CHARS = 200_000
 MAX_DIRECTORY_FILES = 1_000
 MAX_RECENT_FILINGS = 1_000
@@ -39,10 +41,28 @@ REQUEST_INTERVAL = 0.21  # Safely below SEC's 10/s ceiling; at most 5/s.
 _DOCUMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\.(?:htm|html|txt)\Z", re.I)
 _EXHIBIT = re.compile(r"(?:ex(?:hibit|h)?)[_.-]*99", re.I)
 _EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_ACCESSION = re.compile(r"\d{10}-\d{2}-\d{6}", re.A)
+_SYMBOL = re.compile(r"[A-Za-z][A-Za-z0-9.-]{0,14}")
+_EASTERN = ZoneInfo("America/New_York")
+AFTER_HOURS = clock_time(17, 30)  # EDGAR assigns the next business day's filing date from here.
+FORMS = ("8-K", "8-K/A")
+MODES = ("forward", "historical")
+# The only approved query: the newest 8-K filings as Atom, with a fixed parameter order.
+_CURRENT_8K_QUERY = re.compile(
+    r"action=getcurrent&type=8-K&company=&dateb=&owner=include&start=0"
+    r"&count=(?:10|20|40|80|100)&output=atom"
+)
+_DAILY_INDEX = re.compile(
+    r"/Archives/edgar/daily-index/(\d{4})/QTR([1-4])/form\.(\d{4})(\d{2})(\d{2})\.idx"
+)
 
 
 class SECError(ValueError):
     """Unsafe input, malformed SEC response, or an exceeded collection bound."""
+
+
+class FilingNotFound(SECError):
+    """The accession is absent from the company's recent submissions (not yet indexed or older)."""
 
 
 def _utc_now() -> datetime:
@@ -66,23 +86,65 @@ def _published_at(value: object) -> str:
     except ValueError as exc:
         raise SECError("Invalid acceptanceDateTime") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo("America/New_York"))
+        parsed = parsed.replace(tzinfo=_EASTERN)
     return _iso_utc(parsed)
 
 
+def latest_acceptance(value: str) -> datetime:
+    """The latest instant an SEC acceptanceDateTime can denote.
+
+    The submissions API appears to label Eastern wall-clock time with "Z" (unverified).
+    Keeping the later of both readings can only delay availability, never backdate it.
+    """
+    _published_at(value)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None and parsed.utcoffset() != timedelta(0):
+        return parsed.astimezone(timezone.utc)
+    # Both folds, so an ambiguous wall time at the end of daylight saving reads late too.
+    readings = [
+        parsed.replace(tzinfo=_EASTERN, fold=fold).astimezone(timezone.utc) for fold in (0, 1)
+    ]
+    if parsed.tzinfo is not None:
+        readings.append(parsed.astimezone(timezone.utc))
+    return max(readings)
+
+
+def _daily_index_path(match: re.Match[str]) -> bool:
+    year, quarter, *day = (int(part) for part in match.groups())
+    try:
+        parsed = date(*day)
+    except ValueError:
+        return False
+    return parsed.year == year and (parsed.month - 1) // 3 + 1 == quarter
+
+
 def _validate_url(url: str) -> None:
+    # urlsplit silently drops tabs and newlines, so reject every non-printable byte first.
+    if not isinstance(url, str) or any(not 33 <= ord(char) <= 126 for char in url):
+        raise SECError("SEC requests require an approved HTTPS URL")
     parts = urlsplit(url)
     if parts.scheme != "https" or parts.username or parts.password or parts.port:
         raise SECError("SEC requests require an approved HTTPS URL")
-    if parts.query or parts.fragment:
+    if "#" in url:
+        raise SECError("SEC request URLs cannot contain queries or fragments")
+    if parts.netloc == "www.sec.gov" and parts.path == "/cgi-bin/browse-edgar":
+        if _CURRENT_8K_QUERY.fullmatch(parts.query):
+            return
+        raise SECError("Only the current 8-K Atom feed query is approved")
+    if "?" in url:
         raise SECError("SEC request URLs cannot contain queries or fragments")
     if parts.netloc == "data.sec.gov" and re.fullmatch(r"/submissions/CIK\d{10}\.json", parts.path):
         return
     if parts.netloc == "www.sec.gov":
+        if parts.path == "/files/company_tickers.json":
+            return
+        daily = _DAILY_INDEX.fullmatch(parts.path)
+        if daily and _daily_index_path(daily):
+            return
         match = re.fullmatch(r"/Archives/edgar/data/\d{1,10}/\d{18}/([^/]+)", parts.path)
         if match and (match[1] == "index.json" or _DOCUMENT.fullmatch(match[1])):
             return
-    raise SECError("URL is outside approved SEC submissions/archive paths")
+    raise SECError("URL is outside approved SEC submissions/archive/index paths")
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -153,7 +215,7 @@ class _SECClient:
             else _RateLimiter(self.clock, self.sleep)
         )
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, *, max_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
         _validate_url(url)
         if self.requests >= self.max_requests:
             raise SECError("SEC request budget exhausted")
@@ -163,19 +225,19 @@ class _SECClient:
             url,
             headers={
                 "User-Agent": self.user_agent,
-                "Accept": "application/json,text/html,text/plain",
+                "Accept": "application/json,application/atom+xml,text/html,text/plain",
             },
         )
         with self.transport(request, timeout=self.timeout) as response:
             _validate_url(response.geturl())
-            payload = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(payload) > MAX_RESPONSE_BYTES:
+            payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
             raise SECError("SEC response exceeds maximum byte size")
         return payload
 
-    def get_json(self, url: str) -> dict:
+    def get_json(self, url: str, *, max_bytes: int = MAX_RESPONSE_BYTES) -> dict:
         try:
-            value = json.loads(self.get(url))
+            value = json.loads(self.get(url, max_bytes=max_bytes))
         except (ValueError, UnicodeDecodeError) as exc:
             raise SECError("Invalid SEC JSON response") from exc
         if not isinstance(value, dict):
@@ -328,6 +390,160 @@ def _filing_document(client: _SECClient, base: str, primary: str) -> tuple[str, 
     return primary, cover_text, "primary_document_fallback", "no_supported_ex99_found"
 
 
+def _check_cik(cik: object) -> str:
+    if not isinstance(cik, str) or not re.fullmatch(r"\d{1,10}", cik, re.A) or int(cik) == 0:
+        raise SECError("CIK must contain 1 to 10 digits and be nonzero")
+    return cik
+
+
+def _check_symbol(symbol: object) -> str:
+    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
+        raise SECError("Invalid stock symbol")
+    return symbol
+
+
+def _recent_filings(data: dict) -> dict:
+    filings = data.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict):
+        raise SECError("Missing SEC recent filings")
+    required = ("accessionNumber", "form", "primaryDocument", "acceptanceDateTime", "items")
+    if any(not isinstance(recent.get(key), list) for key in required):
+        raise SECError("Malformed SEC recent filing arrays")
+    lengths = {len(recent[key]) for key in required}
+    if len(lengths) != 1:
+        raise SECError("SEC recent filing arrays have inconsistent lengths")
+    return recent
+
+
+def _qualifying(recent: dict, index: int) -> dict | None:
+    """The filing at ``index`` when it is a supported non-earnings 8-K, else None."""
+    form = recent["form"][index]
+    item_value = recent["items"][index]
+    if form not in FORMS or not isinstance(item_value, str):
+        return None
+    items = sorted(set(re.findall(r"\b\d{1,2}\.\d{2}\b", item_value)))
+    if "2.02" in items or not {"7.01", "8.01"}.intersection(items):
+        return None
+    accession = recent["accessionNumber"][index]
+    primary = recent["primaryDocument"][index]
+    if not isinstance(accession, str) or not _ACCESSION.fullmatch(accession):
+        return None
+    if not isinstance(primary, str) or not _DOCUMENT.fullmatch(primary):
+        return None
+    acceptance = recent["acceptanceDateTime"][index]
+    try:
+        published = _published_at(acceptance)
+    except SECError:
+        return None
+    return {
+        "accession": accession,
+        "form": form,
+        "primary": primary,
+        "items": items,
+        "published_at": published,
+        "acceptance": acceptance,
+    }
+
+
+def _supplied_first_seen(first_seen: str | Callable[[str], str], row: dict) -> str:
+    value = first_seen(row["acceptance"]) if callable(first_seen) else first_seen
+    if not isinstance(value, str) or ("T" not in value and " " not in value):
+        raise SECError("first_seen must be a timestamp with a time and timezone")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SECError("Invalid first_seen timestamp") from exc
+    if parsed.tzinfo is None:
+        raise SECError("first_seen needs an explicit timezone")
+    if parsed < latest_acceptance(row["acceptance"]):
+        raise SECError("first_seen cannot precede the latest reading of SEC acceptance")
+    return _iso_utc(parsed)
+
+
+def collect_filing(
+    client: _SECClient,
+    cik: str,
+    accession: str,
+    symbol: str,
+    *,
+    submissions: dict | None = None,
+    mode: str = "forward",
+    first_seen: str | Callable[[str], str] | None = None,
+) -> dict | None:
+    """Collect one filing's selected document, or None when the filing does not qualify.
+
+    ``submissions`` (the company's data.sec.gov JSON) saves one request when already
+    fetched. Forward mode stamps actual receipt and refuses a supplied ``first_seen``.
+    Historical mode requires one: a timestamp, or a callable given SEC's raw
+    acceptanceDateTime; it may not precede the latest reading of that acceptance.
+    Raises FilingNotFound when the accession is absent from the recent submissions.
+    At most 1 + 3 requests, all through ``client``'s allowlist, budget and limiter.
+    """
+    cik = _check_cik(cik)
+    symbol = _check_symbol(symbol)
+    if not isinstance(accession, str) or not _ACCESSION.fullmatch(accession):
+        raise SECError("Accession must look like 0000000000-00-000000")
+    if mode not in MODES:
+        raise SECError("mode must be forward or historical")
+    if mode == "forward" and first_seen is not None:
+        raise SECError("Forward collection records actual receipt; first_seen is not accepted")
+    if mode == "historical" and first_seen is None:
+        raise SECError("Historical collection requires an explicit first_seen assumption")
+    normalized_cik = cik.zfill(10)
+    data = (
+        submissions
+        if submissions is not None
+        else client.get_json(f"https://data.sec.gov/submissions/CIK{normalized_cik}.json")
+    )
+    if not isinstance(data, dict):
+        raise SECError("SEC submissions must be an object")
+    reported = data.get("cik")
+    if reported is not None and (
+        not re.fullmatch(r"\d{1,10}", str(reported), re.A) or int(str(reported)) != int(cik)
+    ):
+        raise SECError("SEC submissions belong to a different CIK")
+    recent = _recent_filings(data)
+    try:
+        index = recent["accessionNumber"].index(accession)
+    except ValueError:
+        raise FilingNotFound(f"Accession {accession} is not in recent SEC submissions") from None
+    row = _qualifying(recent, index)
+    if row is None:
+        return None
+    base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
+    document, text, role, method = _filing_document(client, base, row["primary"])
+    observed = _iso_utc(client.now())
+    if not text.strip():
+        # Empty source content is an error rather than a reason to exceed
+        # the filing/request budget while looking for another candidate.
+        raise SECError("Selected SEC document contains no readable text")
+    seen = observed if first_seen is None else _supplied_first_seen(first_seen, row)
+    latest = latest_acceptance(row["acceptance"]).astimezone(_EASTERN)
+    return {
+        "id": f"sec:{accession}:{document}",
+        "symbol": symbol.upper(),
+        "published_at": row["published_at"],
+        "accepted_at": row["published_at"],
+        "after_hours": latest.time() >= AFTER_HOURS,
+        "first_seen_at": seen,
+        "source_url": base + document,
+        "text": text[:MAX_TEXT_CHARS],
+        "source_type": "sec",
+        "cik": normalized_cik,
+        "accession": accession,
+        "form": row["form"],
+        "items": row["items"],
+        "document": document,
+        "document_role": role,
+        "selection_method": method,
+        "text_truncated": len(text) > MAX_TEXT_CHARS,
+        "timestamp_basis": "sec_acceptance_not_public_availability",
+        "sec_acceptance_raw": row["acceptance"],
+        "mode": mode,
+    }
+
+
 def collect_disclosures(
     cik: str,
     symbol: str,
@@ -343,72 +559,21 @@ def collect_disclosures(
     text is fetched; PDF-only exhibits and unknown item metadata are skipped or
     marked as cover-page fallbacks. Errors propagate so callers can fail closed.
     """
-    if not isinstance(cik, str) or not re.fullmatch(r"\d{1,10}", cik) or int(cik) == 0:
-        raise SECError("CIK must contain 1 to 10 digits and be nonzero")
-    if not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,14}", symbol):
-        raise SECError("Invalid stock symbol")
+    _check_cik(cik)
+    _check_symbol(symbol)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise SECError(f"limit must be an integer from 1 to {MAX_LIMIT}")
     client = _SECClient(user_agent, timeout, 1 + 3 * limit)
-    normalized_cik = cik.zfill(10)
-    data = client.get_json(f"https://data.sec.gov/submissions/CIK{normalized_cik}.json")
-    filings = data.get("filings")
-    recent = filings.get("recent") if isinstance(filings, dict) else None
-    if not isinstance(recent, dict):
-        raise SECError("Missing SEC recent filings")
-    required = ("accessionNumber", "form", "primaryDocument", "acceptanceDateTime", "items")
-    if any(not isinstance(recent.get(key), list) for key in required):
-        raise SECError("Malformed SEC recent filing arrays")
-    lengths = {len(recent[key]) for key in required}
-    if len(lengths) != 1:
-        raise SECError("SEC recent filing arrays have inconsistent lengths")
+    data = client.get_json(f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json")
+    recent = _recent_filings(data)
     records = []
     for index in range(min(len(recent["form"]), MAX_RECENT_FILINGS)):
-        form = recent["form"][index]
-        item_value = recent["items"][index]
-        if form not in ("8-K", "8-K/A") or not isinstance(item_value, str):
+        row = _qualifying(recent, index)
+        if row is None:
             continue
-        items = sorted(set(re.findall(r"\b\d{1,2}\.\d{2}\b", item_value)))
-        if "2.02" in items or not {"7.01", "8.01"}.intersection(items):
-            continue
-        accession = recent["accessionNumber"][index]
-        primary = recent["primaryDocument"][index]
-        if not isinstance(accession, str) or not re.fullmatch(r"\d{10}-\d{2}-\d{6}", accession):
-            continue
-        if not isinstance(primary, str) or not _DOCUMENT.fullmatch(primary):
-            continue
-        try:
-            published = _published_at(recent["acceptanceDateTime"][index])
-        except SECError:
-            continue
-        base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
-        document, text, role, method = _filing_document(client, base, primary)
-        observed = _iso_utc(client.now())
-        if not text.strip():
-            # Empty source content is an error rather than a reason to exceed
-            # the filing/request budget while looking for another candidate.
-            raise SECError("Selected SEC document contains no readable text")
-        records.append(
-            {
-                "id": f"sec:{accession}:{document}",
-                "symbol": symbol.upper(),
-                "published_at": published,
-                "first_seen_at": observed,
-                "source_url": base + document,
-                "text": text[:MAX_TEXT_CHARS],
-                "source_type": "sec",
-                "cik": normalized_cik,
-                "accession": accession,
-                "form": form,
-                "items": items,
-                "document": document,
-                "document_role": role,
-                "selection_method": method,
-                "text_truncated": len(text) > MAX_TEXT_CHARS,
-                "timestamp_basis": "sec_acceptance_not_public_availability",
-                "mode": "forward",
-            }
-        )
+        record = collect_filing(client, cik, row["accession"], symbol, submissions=data)
+        if record is not None:
+            records.append(record)
         if len(records) >= limit:
             break
     return records

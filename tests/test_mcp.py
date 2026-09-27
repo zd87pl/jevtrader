@@ -867,11 +867,13 @@ class StreamTests(ServerCase):
 
 class ProcessTests(unittest.TestCase):
     def test_real_pipes_carry_only_protocol_under_an_ascii_locale(self):
+        # The command line stays ASCII (non-UTF-8 locales cannot decode argv);
+        # the non-ASCII text travels only through the pipes under test.
         script = (
             "from jevtrader import mcp_server\n"
             "def brief(arguments):\n"
             "    print('stray handler output')\n"
-            "    return {'symbol': 'ABC', 'reason': 'Zürich ✓'}\n"
+            "    return {'symbol': 'ABC', 'reason': 'Z\\u00fcrich \\u2713'}\n"
             "mcp_server.serve({'today_brief': brief})\n"
         )
         messages = [INIT, {"jsonrpc": "2.0", "method": "notifications/initialized"}]

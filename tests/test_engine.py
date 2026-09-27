@@ -1,14 +1,20 @@
 """Offline integration tests for immutable, causally timed research records."""
 
+import copy
 import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from jevtrader import engine
-from jevtrader.common import load_strategy, timestamp
+from jevtrader import engine, registry
+from jevtrader.common import digest, load_strategy, timestamp
 from jevtrader.market import normalize_bar, outcome
-from jevtrader.providers import extract_features
-from jevtrader.research import FEATURE_NAMES
+from jevtrader.providers import (
+    MissingCredentials,
+    ProviderError,
+    ProviderValidationError,
+    extract_features,
+)
+from jevtrader.research import FEATURE_NAMES, VERSION
 from jevtrader.store import Ledger
 
 
@@ -89,6 +95,7 @@ class EngineTests(unittest.TestCase):
     def calibrator(self, key, *, identity="calibrator", **changes):
         model = {
             "model_id": identity,
+            "version": VERSION,
             "extractor_key": key,
             "cutoff": self.at(19),
             "training_modes": ["historical"],
@@ -166,6 +173,34 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(extract.call_count, 1)
         self.assertEqual(self.ledger.counts()["extractions"], 1)
         self.assertEqual(self.ledger.counts()["forecasts"], 2)
+
+    def test_replay_freezes_its_evidence_basis_and_hand_picked_replays_never_count(self):
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        current = self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], "no_model_knowledge")
+        self.assertEqual(
+            result["eligibility_basis"],
+            {
+                "key": "rules:rules-v1",
+                "training_cutoff": None,
+                "origin": "builtin",
+                "source": registry.MODELS["rules:rules-v1"]["source"],
+            },
+        )
+        # What was sent, so the spend cap need not trust a provider's own token count.
+        questions = sum(len(text) for text in self.strategy["questions"].values())
+        extraction = self.ledger.get("extractions", result["extraction_id"])
+        self.assertEqual(
+            extraction["input_chars"],
+            len(current["text"]) + len("Business was unchanged.") + questions,
+        )
+        adhoc = engine.observe(
+            self.ledger, "current", self.strategy, as_of=self.at(20, "22:01:00"), adhoc=True
+        )
+        self.assertEqual(adhoc["eligibility"], "adhoc_replay")
+        self.assertFalse(registry.counts_as_evidence(adhoc["eligibility"]))
 
     def test_uncalibrated_rules_observation_is_watch(self):
         self.populate()
@@ -310,26 +345,53 @@ class EngineTests(unittest.TestCase):
 
     def test_long_documents_use_a_recorded_deterministic_excerpt(self):
         self.populate()
-        long_text = "Raised guidance with strong demand. " * 1_400  # 50,400 characters
-        self.event("long-prior", index=21, text=long_text)
-        self.event("long-current", index=23, text=long_text + "New contract signed.")
-        first = self.observe("long-prior", index=21)
-        second = self.observe("long-current", index=23)
-        repeated = self.observe("long-current", index=23)
+        # Position-coded text, so any other slice of either document is detectable.
+        prior = "".join(f"p{i:06d} " for i in range(6_300))  # 50,400 characters
+        current = "".join(f"c{i:06d} " for i in range(6_300))
+        self.event("long-prior", index=21, text=prior)
+        self.event("long-current", index=23, text=current)
+        with patch.object(engine, "extract_features", wraps=extract_features) as extract:
+            first = self.observe("long-prior", index=21)
+            second = self.observe("long-current", index=23)
+            repeated = self.observe("long-current", index=23)
         self.assertEqual(second, repeated)
         self.assertEqual(second["previous_event_id"], "long-prior")
-        for forecast, previous_total in ((first, 0), (second, len(long_text))):
-            excerpt = self.ledger.get("extractions", forecast["extraction_id"])["text_excerpt"]
-            self.assertLessEqual(excerpt["current_chars"] + excerpt["previous_chars"], 40_000)
-            self.assertEqual(excerpt["previous_total"], previous_total)
+        self.assertEqual(extract.call_count, 2)
+        # Without a comparison document, nothing is reserved for one.
+        self.assertEqual(extract.call_args_list[0].args[2:4], (prior[:40_000], ""))
+        self.assertEqual(extract.call_args_list[1].args[2:4], (current[:30_000], prior[:10_000]))
+        # Budget a short current document leaves unused goes to the previous one.
+        short = "".join(f"s{i:06d} " for i in range(550))  # 4,400 characters
+        self.event("short-current", index=25, text=short)
+        with patch.object(engine, "extract_features", wraps=extract_features) as extract:
+            self.observe("short-current", index=25)
+        self.assertEqual(extract.call_args.args[2:4], (short, current[: 40_000 - len(short)]))
+        excerpts = {
+            forecast["id"]: self.ledger.get("extractions", forecast["extraction_id"])
+            for forecast in (first, second)
+        }
         self.assertEqual(
-            self.ledger.get("extractions", second["extraction_id"])["text_excerpt"],
+            excerpts[first["id"]]["text_excerpt"],
+            {
+                "current_chars": 40_000,
+                "current_total": len(prior),
+                "previous_chars": 0,
+                "previous_total": 0,
+            },
+        )
+        self.assertEqual(
+            excerpts[second["id"]]["text_excerpt"],
             {
                 "current_chars": 30_000,
-                "current_total": len(long_text) + 20,
+                "current_total": len(current),
                 "previous_chars": 10_000,
-                "previous_total": len(long_text),
+                "previous_total": len(prior),
             },
+        )
+        # The cache key covers the full stored documents, not just the excerpt sent.
+        spec = excerpts[second["id"]]["spec"]
+        self.assertEqual(
+            second["extraction_id"], digest({"spec": spec, "current": current, "previous": prior})
         )
 
     def test_calibrator_schema_mismatch_is_rejected_before_paid_extraction(self):
@@ -338,19 +400,133 @@ class EngineTests(unittest.TestCase):
         rules = self.observe()
         model_id = self.calibrator(rules["extractor_key"])
         self.event("fresh", index=21)
+        questions = copy.deepcopy(self.strategy)
+        questions["questions"]["novelty"] = "A different novelty question for this calibrator."
+        horizon = {**self.strategy, "horizon_sessions": self.strategy["horizon_sessions"] + 1}
+        spread = {**self.strategy, "spread_bps": self.strategy["spread_bps"] + 1}
+        history = {
+            **self.strategy,
+            "min_history_sessions": self.strategy["min_history_sessions"] + 1,
+        }
+        cases = [
+            ("provider", self.strategy, {"provider": "jev", "model": "jev-1.13.0"}),
+            ("requested-model", self.strategy, {"model": "rules-v2"}),
+            ("questions", questions, {}),
+            ("horizon", horizon, {}),
+            ("spread", spread, {}),
+            ("history", history, {}),
+        ]
+        for label, strategy, options in cases:
+            with (
+                self.subTest(label),
+                patch.object(
+                    engine,
+                    "extract_features",
+                    side_effect=AssertionError("Paid extraction ran before schema check"),
+                ) as extract,
+                self.assertRaisesRegex(engine.ObservationRejected, "schemas/models"),
+            ):
+                engine.observe(
+                    self.ledger,
+                    "fresh",
+                    strategy,
+                    as_of=self.at(21),
+                    calibrator_id=model_id,
+                    **options,
+                )
+            extract.assert_not_called()
+
+    def test_cached_extraction_for_another_calibrator_is_a_local_rejection(self):
+        self.populate()
+        self.event()
+        self.observe()
+        model_id = self.calibrator("resolved-by-another-model")
+        with (
+            patch.object(
+                engine, "extract_features", side_effect=AssertionError("Extraction is cached")
+            ) as extract,
+            self.assertRaisesRegex(engine.ObservationRejected, "schemas/models"),
+        ):
+            self.observe(calibrator_id=model_id)
+        extract.assert_not_called()
+
+    def test_calibrator_from_another_evaluator_version_is_rejected(self):
+        self.populate()
+        self.event()
+        forecast = self.observe()
+        self.event("fresh", index=21)
+        for version in ("ridge-event-v1", None):
+            model_id = self.calibrator(
+                forecast["extractor_key"], identity=f"calibrator-{version}", version=version
+            )
+            with (
+                self.subTest(version=version),
+                patch.object(
+                    engine, "extract_features", side_effect=AssertionError("Must not extract")
+                ) as extract,
+                self.assertRaisesRegex(engine.ObservationRejected, "re-fit"),
+            ):
+                self.observe("fresh", index=21, calibrator_id=model_id)
+            extract.assert_not_called()
+
+    def test_failed_paid_request_leaves_an_attempt_record(self):
+        self.populate()
+        self.event()
+        paid = {"provider": "jev", "model": "jev-1.13.0"}
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("jevtrader.providers._post_json") as post,
+            self.assertRaises(MissingCredentials),
+        ):
+            self.observe(**paid)
+        post.assert_not_called()
+        self.assertEqual(self.ledger.all("attempts"), [])
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch.object(
-                engine,
-                "extract_features",
-                side_effect=AssertionError("Paid extraction ran before schema check"),
-            ) as extract,
-            self.assertRaisesRegex(ValueError, "schemas/models"),
+            patch("jevtrader.providers._post_json", side_effect=ProviderError("HTTP error 500")),
+            self.assertRaises(ProviderError),
         ):
-            self.observe(
-                "fresh", index=21, provider="jev", model="jev-1.13.0", calibrator_id=model_id
-            )
-        extract.assert_not_called()
+            self.observe(**paid)
+        [attempt] = self.ledger.all("attempts")
+        self.assertEqual(
+            {key: attempt[key] for key in ("event_id", "provider", "requested_model", "error")},
+            {
+                "event_id": "current",
+                "provider": "jev",
+                "requested_model": "jev-1.13.0",
+                "error": "HTTP error 500",
+            },
+        )
+        self.assertEqual(attempt["questions_digest"], digest(self.strategy["questions"]))
+        self.assertEqual(self.ledger.counts().get("extractions", 0), 0)
+
+    def test_billed_malformed_or_incomplete_responses_leave_attempt_records(self):
+        self.populate()
+        malformed = {"model": "jev-1.13.0", "answers": {}, "usage": {"input_tokens": 1}}
+        cases = [
+            ("jev", "jev-1.13.0", malformed, ProviderValidationError),
+            ("openai", "gpt-test", {"status": "incomplete"}, ProviderError),
+        ]
+        for index, (provider, model, response, error) in enumerate(cases):
+            with (
+                self.subTest(provider),
+                patch.dict("os.environ", {"TYPESAFE_API_KEY": "test", "OPENAI_API_KEY": "test"}),
+                patch("jevtrader.providers._post_json", return_value=response),
+            ):
+                self.event(provider, index=20 + index)
+                with self.assertRaises(error):
+                    self.observe(provider, index=20 + index, provider=provider, model=model)
+                attempts = [a for a in self.ledger.all("attempts") if a["event_id"] == provider]
+                self.assertEqual(len(attempts), 1)
+
+    def test_unscorable_event_is_rejected_before_the_disclosure_scan(self):
+        self.event()  # No market data.
+        with (
+            patch.object(self.ledger, "all", wraps=self.ledger.all) as scan,
+            self.assertRaises(engine.ObservationRejected),
+        ):
+            self.observe()
+        self.assertNotIn("disclosures", [call.args[0] for call in scan.call_args_list])
 
     def test_calibrator_rejects_schema_cutoff_and_training_event_mismatches(self):
         self.populate()
@@ -369,6 +545,14 @@ class EngineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.observe(calibrator_id=model_id)
         self.assertEqual(self.ledger.counts()["forecasts"], 1)
+
+    def test_replaying_a_stored_strategy_uses_the_rules_it_was_recorded_under(self):
+        self.populate()
+        self.event()
+        padded = copy.deepcopy(self.strategy)
+        padded["questions"]["novelty"] = "   New info?     "  # Accepted by providers too.
+        result = engine.observe(self.ledger, "current", padded, as_of=self.at(20))
+        self.assertEqual(result["strategy"], padded)
 
     def test_synthetic_calibrator_cannot_score_real_disclosures(self):
         self.populate()

@@ -2,6 +2,7 @@ import copy
 import json
 import unittest
 
+from jevtrader.common import load_strategy, validate_strategy
 from jevtrader.paper import plan_order
 
 
@@ -32,6 +33,15 @@ class PaperPlanTests(unittest.TestCase):
         self.assertTrue(plan["simulation_only"])
         self.assertEqual(signal, original)
         json.dumps(plan, allow_nan=False)
+
+    def test_question_rules_match_what_providers_accept(self):
+        padded = load_strategy()
+        padded["questions"]["novelty"] = "   New info?     "  # Providers accept it.
+        validate_strategy(padded)
+        self.assertEqual(plan_order(forecast(), padded, equity=3000)["action"], "LONG")
+        padded["questions"]["novelty"] = " " * 12  # Never accepted by any provider.
+        with self.assertRaisesRegex(ValueError, "Questions"):
+            plan_order(forecast(), padded, equity=3000)
 
     def test_commissions_reserved_in_risk_and_cash(self):
         plan = plan_order(forecast(), {"commission_per_order": 1.0}, equity=3000)

@@ -5,19 +5,22 @@ budgeting and development-universe boundaries.
 """
 
 import copy
+import json
 import unittest
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from jevtrader.common import load_strategy
+from jevtrader.common import digest, load_strategy
 from jevtrader.lab import (
     MAX_TRIALS,
+    ProposalRejected,
     autoresearch,
     development_feedback,
     experiment,
     generate_proposal,
 )
+from jevtrader.research import VERSION
 from jevtrader.store import Ledger
 
 
@@ -50,7 +53,15 @@ class LabTests(unittest.TestCase):
         }
 
     def seed(
-        self, index, *, strategy=None, decision_at=None, label_at=None, event_id=None, mode=None
+        self,
+        index,
+        *,
+        strategy=None,
+        decision_at=None,
+        label_at=None,
+        outcome_at=None,
+        event_id=None,
+        mode=None,
     ):
         start = datetime(2024, 1, 1, tzinfo=timezone.utc)
         event_id = event_id or f"event-{index:03d}"
@@ -77,7 +88,7 @@ class LabTests(unittest.TestCase):
             {
                 "id": identity,
                 "label_available_at": label,
-                "outcome_at": label,
+                "outcome_at": outcome_at or label,
                 "target": 0.0,
             },
         )
@@ -391,20 +402,204 @@ class LabTests(unittest.TestCase):
         self.assertEqual(kinds.count("trial_started"), 1)
         self.assertEqual(kinds.count("proposal_started"), 0)
 
-    def test_universe_that_cannot_survive_purging_is_rejected_before_calls(self):
-        self.ledger = Ledger(":memory:")
-        self.addCleanup(self.ledger.db.close)
-        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-        for index in range(25):
-            # Labels mature 40 days later, so no test event ever has matured training rows.
-            self.seed(index, label_at=(start + timedelta(days=index + 40)).isoformat())
+    def test_missing_keys_cannot_lock_a_protocol(self):
+        for provider, variable in (("openai", "OPENAI_API_KEY"), ("jev", "TYPESAFE_API_KEY")):
+            with (
+                self.subTest(provider),
+                patch.dict("os.environ", {}, clear=True),
+                patch("jevtrader.lab.observe") as observe,
+                self.assertRaisesRegex(RuntimeError, variable),
+            ):
+                experiment(
+                    self.ledger,
+                    self.candidate,
+                    self.baseline,
+                    provider=provider,
+                    model="frozen-test-model",
+                    development_until=CUTOFF,
+                )
+            observe.assert_not_called()
+        self.assertEqual(self.ledger.all("experiments"), [])
+
+    def test_autoresearch_checks_proposal_key_before_the_baseline_trial_spends(self):
         with (
+            patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}, clear=True),
             patch("jevtrader.lab.observe") as observe,
-            self.assertRaisesRegex(ValueError, "after purging"),
+            self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"),
         ):
-            self.run_openai_trial(self.candidate)
+            autoresearch(
+                self.ledger,
+                self.baseline,
+                provider="jev",
+                model="jev-1.13.0",
+                proposal_model="proposal-model",
+                development_until=CUTOFF,
+                rounds=2,
+            )
         observe.assert_not_called()
         self.assertEqual(self.ledger.all("experiments"), [])
+
+    def test_autoresearch_checks_extraction_key_before_paying_for_a_proposal(self):
+        with (
+            patch("jevtrader.lab.observe", return_value={"extractor_key": "baseline"}),
+            patch("jevtrader.lab.settle", return_value={}),
+            patch("jevtrader.lab.evaluate", return_value=copy.deepcopy(self.report)),
+        ):
+            experiment(
+                self.ledger,
+                self.baseline,
+                self.baseline,
+                provider="jev",
+                model="jev-1.13.0",
+                development_until=CUTOFF,
+            )
+        with (
+            patch.dict("os.environ", {"OPENAI_API_KEY": "test-secret"}, clear=True),
+            patch("jevtrader.lab.propose_strategy") as propose,
+            patch("jevtrader.lab.observe") as observe,
+            self.assertRaisesRegex(RuntimeError, "TYPESAFE_API_KEY"),
+        ):
+            autoresearch(
+                self.ledger,
+                self.baseline,
+                provider="jev",
+                model="jev-1.13.0",
+                proposal_model="proposal-model",
+                development_until=CUTOFF,
+                rounds=2,
+            )
+        propose.assert_not_called()
+        observe.assert_not_called()
+        types = [row.get("type") for row in self.ledger.all("experiments")]
+        self.assertNotIn("proposal_started", types)
+
+    def test_completed_trials_are_returned_without_keys(self):
+        trial, _, _, _ = self.mocked_run(candidate=self.baseline)
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("jevtrader.lab.observe") as observe,
+        ):
+            result = autoresearch(
+                self.ledger,
+                self.baseline,
+                provider="openai",
+                model="frozen-test-model",
+                proposal_model="unused",
+                development_until=CUTOFF,
+                rounds=1,
+            )
+        self.assertEqual(result["best_trial_id"], trial["id"])
+        observe.assert_not_called()
+
+    def test_trials_from_another_evaluator_version_are_not_reused(self):
+        first, _, _, _ = self.mocked_run()
+        protocol = self.ledger.get("experiments", "protocol-v1")
+        self.assertEqual(
+            first["id"],
+            digest({"protocol": protocol, "candidate": self.candidate, "evaluator": VERSION}),
+        )
+        with patch("jevtrader.lab.VERSION", "ridge-event-v3"):
+            rescored, observe, _, _ = self.mocked_run()
+        self.assertNotEqual(rescored["id"], first["id"])
+        self.assertEqual(observe.call_count, 25)
+
+    def legacy_trial(self, candidate, *, version=None):
+        """Records as written before trial ids named the evaluator (HEAD scheme)."""
+        protocol = self.ledger.get("experiments", "protocol-v1")
+        identity = digest({"protocol": protocol, "candidate": candidate})
+        start = {
+            "id": f"start:{identity}",
+            "type": "trial_started",
+            "candidate": candidate,
+            "created_at": CUTOFF,
+            "max_provider_calls": 25,
+        }
+        self.ledger.put("experiments", start["id"], start)
+        if version is None:
+            return None
+        completed = {
+            "id": identity,
+            "type": "trial_completed",
+            "candidate": candidate,
+            "score": 0.0005,
+            "report": {**copy.deepcopy(self.report), "version": version},
+        }
+        self.ledger.put("experiments", identity, completed)
+        return completed
+
+    def test_completed_trials_from_before_evaluator_ids_are_reused_if_current(self):
+        self.mocked_run(candidate=self.baseline)
+        legacy = self.legacy_trial(self.candidate, version=VERSION)
+        with patch.dict("os.environ", {}, clear=True), patch("jevtrader.lab.observe") as observe:
+            self.assertEqual(self.run_openai_trial(self.candidate), legacy)
+        observe.assert_not_called()
+        stale = copy.deepcopy(self.candidate)
+        stale["name"] = "scored-by-an-earlier-evaluator"
+        self.legacy_trial(stale, version="ridge-event-v1")
+        rescored, observe, _, _ = self.mocked_run(candidate=stale)
+        self.assertEqual(observe.call_count, 25)
+        self.assertEqual(rescored["type"], "trial_completed")
+
+    def test_started_trials_are_never_rerun_under_another_evaluator_or_id(self):
+        with (
+            patch("jevtrader.lab.VERSION", "ridge-event-v1"),
+            patch("jevtrader.lab.observe", side_effect=RuntimeError("synthetic failure")),
+            self.assertRaises(RuntimeError),
+        ):
+            self.run_openai_trial(self.candidate)
+        legacy = copy.deepcopy(self.candidate)
+        legacy["name"] = "started-before-evaluator-ids"
+        self.legacy_trial(legacy)
+        for candidate in (self.candidate, legacy):
+            with (
+                self.subTest(candidate["name"]),
+                patch("jevtrader.lab.observe") as observe,
+                self.assertRaisesRegex(ValueError, "no automatic retry"),
+            ):
+                self.run_openai_trial(candidate)
+            observe.assert_not_called()
+        slots = [r for r in self.ledger.all("experiments") if r.get("type") == "trial_slot"]
+        self.assertEqual(len(slots), 1)
+
+    def fresh_ledger(self):
+        self.ledger = Ledger(":memory:")
+        self.addCleanup(self.ledger.db.close)
+
+    def test_universe_that_cannot_survive_purging_is_rejected_before_calls(self):
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        # Outcomes are one day later, but labels only become available `lag` days later.
+        for lag, message in ((40, "after purging"), (6, "only 9 evaluated")):
+            self.fresh_ledger()
+            for index in range(25):
+                self.seed(
+                    index,
+                    outcome_at=(start + timedelta(days=index + 1)).isoformat(),
+                    label_at=(start + timedelta(days=index + lag)).isoformat(),
+                )
+            with (
+                self.subTest(lag=lag),
+                patch("jevtrader.lab.observe") as observe,
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self.run_openai_trial(self.candidate)
+            observe.assert_not_called()
+            self.assertEqual(self.ledger.all("experiments"), [])
+        self.fresh_ledger()
+        for index in range(25):
+            self.seed(
+                index,
+                outcome_at=(start + timedelta(days=index + 1)).isoformat(),
+                label_at=(start + timedelta(days=index + 5)).isoformat(),
+            )
+        _, observe, _, _ = self.mocked_run()  # Exactly ten evaluable events is enough.
+        self.assertEqual(observe.call_count, 25)
+
+    def test_universe_mixing_forward_and_historical_observations_is_accepted(self):
+        self.fresh_ledger()
+        for index in range(25):
+            self.seed(index, mode="forward" if index % 2 else "historical")
+        _, observe, _, _ = self.mocked_run()
+        self.assertEqual(observe.call_count, 25)
 
     def test_universe_mixing_real_and_synthetic_is_rejected_before_calls(self):
         for index in range(25, 30):
@@ -587,6 +782,75 @@ class LabTests(unittest.TestCase):
                 rounds=2,
             )
         propose.assert_not_called()
+
+    def test_unusable_paid_proposal_is_recorded_as_rejected(self):
+        trial, _, _, _ = self.mocked_run(candidate=self.baseline)
+        short = copy.deepcopy(self.baseline)
+        short["questions"]["novelty"] = "Short?"  # Providers accept it; strategies do not.
+        with (
+            patch("jevtrader.lab.propose_strategy", return_value=short),
+            self.assertRaisesRegex(ProposalRejected, "rejected.*proposal-slot:0"),
+        ):
+            generate_proposal(self.ledger, trial, "proposal-model")
+        types = [row.get("type") for row in self.ledger.all("experiments")]
+        self.assertEqual(types.count("proposal_started"), 1)
+        self.assertNotIn("proposal", types)
+        [row] = [r for r in self.ledger.all("experiments") if r.get("type") == "proposal_rejected"]
+        self.assertEqual(row["candidate"], short)
+        self.assertEqual(row["reservation_id"], "proposal-slot:0")
+        self.assertIn("Questions", row["error"])
+
+    def test_blank_paid_proposal_is_recorded_as_rejected(self):
+        trial, _, _, _ = self.mocked_run(candidate=self.baseline)
+        proposed = {"name": "blank", "questions": {**self.baseline["questions"], "novelty": ""}}
+        response = {
+            "model": "proposal-model-resolved",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": json.dumps(proposed)}],
+                }
+            ],
+            "usage": {"input_tokens": 10},
+        }
+        with (
+            patch("jevtrader.providers._post_json", return_value=response) as post,
+            self.assertRaisesRegex(ProposalRejected, "novelty.*proposal-slot:0"),
+        ):
+            generate_proposal(self.ledger, trial, "proposal-model")
+        post.assert_called_once()
+        [row] = [r for r in self.ledger.all("experiments") if r.get("type") == "proposal_rejected"]
+        self.assertIsNone(row["candidate"])
+        self.assertEqual(row["metadata"]["raw"], response)
+        self.assertEqual(row["reservation_id"], "proposal-slot:0")
+
+    def test_autoresearch_reports_a_rejected_proposal_and_continues(self):
+        short = copy.deepcopy(self.baseline)
+        short["questions"]["novelty"] = "Short?"
+        with (
+            patch(
+                "jevtrader.lab.observe",
+                return_value={"extractor_key": "same", "resolved_model": "frozen-test-model"},
+            ) as observe,
+            patch("jevtrader.lab.settle", return_value={}),
+            patch("jevtrader.lab.evaluate", return_value=copy.deepcopy(self.report)),
+            patch("jevtrader.lab.propose_strategy", side_effect=[short, self.candidate]),
+        ):
+            result = autoresearch(
+                self.ledger,
+                self.baseline,
+                provider="openai",
+                model="frozen-test-model",
+                proposal_model="proposal-model",
+                development_until=CUTOFF,
+                rounds=3,
+            )
+        self.assertEqual(len(result["trials"]), 2)
+        [message] = result["rejected_proposals"]
+        self.assertIn("proposal-slot:0", message)
+        self.assertEqual(observe.call_count, 50)
 
     def test_failed_proposal_reserves_slot_before_call_and_cannot_evade_cap(self):
         trial, _, _, _ = self.mocked_run(candidate=self.baseline)

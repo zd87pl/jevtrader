@@ -1,4 +1,9 @@
-"""One explicit CLI; no daemons, broker credentials, or hidden provider calls."""
+"""One explicit CLI. It never places orders; paid provider calls happen only when chosen.
+
+Research commands keep their ledger default (data/jevtrader.sqlite); app commands use the
+ledger named by config. Only init and demo create a ledger; read-only commands open it
+read-only. Keys come from the environment or the macOS Keychain and are never printed.
+"""
 
 from __future__ import annotations
 
@@ -7,25 +12,57 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 
-from .common import digest, instant, load_strategy, timestamp, utc_now
+from . import app as local_app
+from . import config as settings
+from . import mcp_server, paths, secrets, web
+from .common import digest, load_strategy, symbol, timestamp, utc_now
 from .demo import run_demo
-from .engine import ObservationRejected, evaluate, observe, settle, train
+from .engine import evaluate, observe, settle, train
 from .lab import autoresearch, experiment, generate_proposal
+from .local import DEFAULT_MODEL as LOCAL_MODEL
 from .market import import_bars
 from .paper import plan_order
-from .providers import ProviderInputError, require_credentials
+from .pipeline import check_options, observe_queue
+from .research import VERSION
 from .sec import collect_disclosures
 from .store import KINDS, Ledger
+
+RESEARCH_DB = "data/jevtrader.sqlite"
+CREATES = frozenset({"init", "demo"})
+READ_ONLY = frozenset({"status", "show", "evaluate"})
+APP_COMMANDS = frozenset(
+    {
+        "setup",
+        "up",
+        "down",
+        "daemon",
+        "poll",
+        "bars",
+        "brief",
+        "serve",
+        "mcp",
+        "doctor",
+        "verify",
+        "backfill",
+    }
+)
+# Commands that can use API keys; the Keychain is read only for these.
+USES_KEYS = frozenset(
+    {"observe", "experiment", "autoresearch", "propose", "bars", "daemon", "backfill"}
+)
 
 
 def parser() -> argparse.ArgumentParser:
     app = argparse.ArgumentParser(description="Auditable disclosure research and paper order plans")
     app.add_argument(
         "--db",
-        default="data/jevtrader.sqlite",
-        help="SQLite ledger (default: data/jevtrader.sqlite)",
+        help=(
+            f"SQLite ledger (default: {RESEARCH_DB} for research commands, the config ledger "
+            "for app commands, the research ledger for backfill)"
+        ),
     )
     app.add_argument("--strategy", help="Strategy JSON; otherwise packaged conservative defaults")
     commands = app.add_subparsers(dest="command", required=True)
@@ -65,7 +102,18 @@ def parser() -> argparse.ArgumentParser:
     observations.add_argument(
         "--calibrator", help="Stored ridge model id; without one all events are WATCH"
     )
-    _provider_options(observations)
+    observations.add_argument(
+        "--max-scan",
+        type=int,
+        default=200,
+        help="Stop after this many local rejections (nothing sent; not counted in --limit)",
+    )
+    observations.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Also queue events whose earlier paid request failed (and may have been billed)",
+    )
+    _provider_options(observations, local=True)
     labels = commands.add_parser("settle", help="Attach matured next-open/horizon-close labels")
     labels.add_argument("--as-of", help="Evaluation timestamp; default now")
     fit = commands.add_parser("fit", help="Fit a ridge calibrator using only matured labels")
@@ -128,11 +176,43 @@ def parser() -> argparse.ArgumentParser:
     )
     auto.add_argument("--proposal-model", default=os.environ.get("OPENAI_MODEL"))
     _provider_options(auto, default="jev")
+    _app_commands(commands)
     return app
 
 
-def _provider_options(command, default="rules"):
-    command.add_argument("--provider", choices=["rules", "jev", "openai"], default=default)
+def _app_commands(commands) -> None:
+    commands.add_parser("setup", help="Guided setup: SEC contact, watchlist, provider, keys")
+    commands.add_parser("up", help="Install and start the background service (launchd)")
+    commands.add_parser("down", help="Stop and remove the background service")
+    commands.add_parser("daemon", help="Run the background schedule in the foreground")
+    commands.add_parser("poll", help="Collect new qualifying 8-Ks once (as the service does)")
+    commands.add_parser("bars", help="Fetch completed daily bars once (as the service does)")
+    brief = commands.add_parser("brief", help="The pre-market brief as JSON")
+    brief.add_argument("--since", help="Filings first seen after this time; default 3 days")
+    brief.add_argument("--notify", action="store_true", help="Also show a macOS notification")
+    serve = commands.add_parser("serve", help="Read-only localhost web view")
+    serve.add_argument("--host", choices=sorted(web.BIND_HOSTS), default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=web.DEFAULT_PORT)
+    commands.add_parser("mcp", help="Read-only MCP server on stdio")
+    commands.add_parser("doctor", help="Check config, ledger, engine, keys and the service")
+    verify = commands.add_parser("verify", help="Recompute every record hash and the chain")
+    verify.add_argument("--anchor-seq", type=int, help="Seq of an earlier head to check against")
+    verify.add_argument("--anchor-hash", help="Chain hash of that earlier head")
+    backfill = commands.add_parser(
+        "backfill", help="Historical 8-Ks into the research ledger (assumed availability)"
+    )
+    backfill.add_argument("--start", required=True, type=date.fromisoformat, help="YYYY-MM-DD")
+    backfill.add_argument("--end", required=True, type=date.fromisoformat, help="YYYY-MM-DD")
+    backfill.add_argument("--symbols", help="Comma-separated symbols; default: config scope")
+    backfill.add_argument("--max-filings", type=int, default=500)
+    backfill.add_argument(
+        "--bars", action="store_true", help="Also fetch historical Alpaca bars for them"
+    )
+
+
+def _provider_options(command, default="rules", *, local=False):
+    choices = ["rules", "local", "jev", "openai"] if local else ["rules", "jev", "openai"]
+    command.add_argument("--provider", choices=choices, default=default)
     command.add_argument(
         "--model", help="Explicit provider model; OpenAI requires this or OPENAI_MODEL"
     )
@@ -141,9 +221,12 @@ def _provider_options(command, default="rules"):
 def _model(args) -> str:
     result = (
         args.model
-        or {"rules": "rules-v1", "jev": "jev-1.13.0", "openai": os.environ.get("OPENAI_MODEL")}[
-            args.provider
-        ]
+        or {
+            "rules": "rules-v1",
+            "local": LOCAL_MODEL,
+            "jev": "jev-1.13.0",
+            "openai": os.environ.get("OPENAI_MODEL"),
+        }[args.provider]
     )
     if not result:
         raise ValueError("Choose an OpenAI model using --model or OPENAI_MODEL")
@@ -163,9 +246,10 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
             "extractor_keys": sorted({f["extractor_key"] for f in forecasts}),
             "models": [
                 {
-                    key: model[key]
+                    key: model.get(key)
                     for key in (
                         "model_id",
+                        "version",
                         "extractor_key",
                         "training_count",
                         "training_modes",
@@ -175,6 +259,14 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
                 for model in ledger.all("models")
             ],
             "modes": sorted({f["mode"] for f in forecasts}),
+            # Paid requests that failed and may have been billed; `show attempts ID` for detail.
+            "failed_attempts": [
+                {
+                    key: attempt[key]
+                    for key in ("id", "event_id", "provider", "requested_model", "attempted_at")
+                }
+                for attempt in ledger.all("attempts")
+            ],
         }
     if command == "show":
         record = ledger.get(args.kind, args.id)
@@ -197,101 +289,25 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
             "event_ids": [r["id"] for r in records],
         }
     if command == "observe":
-        if not 1 <= args.limit <= 200:
-            raise ValueError("--limit must be between 1 and 200")
-        if args.as_of and not args.event:
-            raise ValueError("--as-of requires one --event")
+        # Option errors keep precedence over model resolution, as before the move.
+        check_options(limit=args.limit, max_scan=args.max_scan, event=args.event, as_of=args.as_of)
         model = _model(args)
-        require_credentials(args.provider)
-        calibrator = None
-        if args.calibrator:
-            calibrator = ledger.get("models", args.calibrator)
-            if calibrator is None:
-                raise ValueError(f"Unknown calibrator: {args.calibrator}")
-        events = sorted(ledger.all("disclosures"), key=lambda e: (e["first_seen_at"], e["id"]))
-        skipped = {"requires_replay": 0, "calibrator_ineligible": 0}
-        if args.event:
-            events = [e for e in events if e["id"] == args.event]
-            if not events:
-                raise ValueError("Disclosure not found")
-        else:
-            if not args.replay:
-                # A live clock never decides historical or synthetic records; replay them.
-                skipped["requires_replay"] = sum(e["mode"] != "forward" for e in events)
-                events = [e for e in events if e["mode"] == "forward"]
-            done = {
-                (f["event_id"], f["mode"])
-                for f in ledger.all("forecasts")
-                if f["provider"] == args.provider
-                and f["strategy"] == strategy
-                and f["calibrator_id"] == args.calibrator
-                and ledger.get("extractions", f["extraction_id"])["spec"]["requested_model"]
-                == model
-            }
-            events = [
-                e
-                for e in events
-                if (
-                    e["id"],
-                    "synthetic"
-                    if e["mode"] == "synthetic"
-                    else "historical"
-                    if args.replay or e["mode"] == "historical"
-                    else "forward",
-                )
-                not in done
-            ]
-            if calibrator:
-                # Events first seen by the model's cutoff (or used to train it) cannot get a
-                # timely calibrated decision; keep them from consuming --limit.
-                eligible = [
-                    e
-                    for e in events
-                    if instant(e["first_seen_at"]) > instant(calibrator["cutoff"])
-                    and e["id"] not in calibrator["training_event_ids"]
-                ]
-                skipped["calibrator_ineligible"] = len(events) - len(eligible)
-                events = eligible
-        records, errors, attempted = [], [], 0
-        for event in events:
-            if attempted >= args.limit:
-                break
-            try:
-                result = observe(
-                    ledger,
-                    event["id"],
-                    strategy,
-                    provider=args.provider,
-                    model=model,
-                    as_of=event["first_seen_at"] if args.replay else args.as_of,
-                    calibrator_id=args.calibrator,
-                )
-                records.append(
-                    {
-                        key: result[key]
-                        for key in (
-                            "id",
-                            "event_id",
-                            "mode",
-                            "action",
-                            "reasons",
-                            "expected_return",
-                            "extractor_key",
-                        )
-                    }
-                )
-            except (ObservationRejected, ProviderInputError) as exc:
-                # Nothing was sent, so report it without letting it block later events.
-                errors.append({"event_id": event["id"], "error": str(exc)})
-                continue
-            except (ValueError, RuntimeError) as exc:
-                attempted += 1
-                errors.append({"event_id": event["id"], "error": str(exc)})
-                if args.provider != "rules":
-                    break  # Bound surprise costs after a provider or validation failure.
-            else:
-                attempted += 1
-        return {"forecasts": records, "errors": errors, "skipped": skipped}
+        options = local_app.observe_options({**settings.load(), "provider": args.provider})
+        return observe_queue(
+            ledger,
+            strategy,
+            provider=args.provider,
+            model=model,
+            replay=args.replay,
+            event=args.event,
+            as_of=args.as_of,
+            calibrator=args.calibrator,
+            limit=args.limit,
+            max_scan=args.max_scan,
+            retry_failed=args.retry_failed,
+            observer=observe,  # Looked up here so patching cli.observe still intercepts it.
+            **{key: value for key, value in options.items() if value},
+        )
     if command == "settle":
         return settle(ledger, as_of=args.as_of)
     if command == "fit":
@@ -304,6 +320,14 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
         forecast = ledger.get("forecasts", args.forecast)
         if forecast is None:
             raise ValueError("Forecast not found")
+        if forecast.get("calibrator_id"):
+            # Observation refuses calibrators from another evaluator; so must sizing.
+            scorer = ledger.get("models", forecast["calibrator_id"])
+            version = scorer.get("version") if scorer else None
+            if version != VERSION:
+                raise ValueError(
+                    f"Forecast was scored by {version}, not {VERSION}; re-fit and re-observe"
+                )
         positions = json.loads(Path(args.positions).read_text()) if args.positions else []
         result = plan_order(
             forecast,
@@ -364,14 +388,93 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
     raise ValueError(f"Unknown command: {command}")
 
 
+def app_dispatch(args, strategy: dict) -> dict | None:
+    """App commands open their own ledgers: the config's, or the research ledger."""
+    command = args.command
+    if command == "setup":
+        # Setup writes the config's ledger; `up --db` can pin another one for the service.
+        return local_app.setup(program=local_app.program_args(strategy=args.strategy))
+    if command == "doctor":
+        return local_app.doctor(args.db)
+    if command == "down":
+        return local_app.down()
+    config = settings.load()
+    db = args.db or str(settings.ledger_path(config))
+    if command == "up":
+        program = local_app.program_args(ledger=args.db, strategy=args.strategy)
+        return local_app.up(config, ledger_path=db, program=program)
+    if command == "daemon":
+        return local_app.run_daemon(db, config, strategy)
+    if command in ("poll", "bars"):
+        return local_app.run_once(command, db, config, strategy)
+    if command == "brief":
+        since = timestamp(args.since) if args.since else None
+        return local_app.compose_brief(db, config, now=utc_now(), since=since, send=args.notify)
+    if command == "serve":
+        web.serve(db, host=args.host, port=args.port, watchlist=config["watchlist"])
+        return None
+    if command == "mcp":
+        mcp_server.serve(local_app.mcp_handlers(db, config))
+        return None  # stdout carried the protocol; nothing else may follow it
+    if command == "verify":
+        if (args.anchor_seq is None) != (args.anchor_hash is None):
+            raise ValueError("--anchor-seq and --anchor-hash go together")
+        anchor = (
+            None
+            if args.anchor_seq is None
+            else {"seq": args.anchor_seq, "chain_hash": args.anchor_hash}
+        )
+        return local_app.verify_ledger(db, anchor=anchor)
+    if command == "backfill":
+        symbols = (
+            [symbol(part) for part in args.symbols.split(",") if part.strip()]
+            if args.symbols
+            else None
+        )
+        return local_app.backfill(
+            args.db or str(paths.research_ledger_path()),
+            config,
+            args.start,
+            args.end,
+            symbols=symbols,
+            max_filings=args.max_filings,
+            with_bars=args.bars,
+        )
+    raise ValueError(f"Unknown command: {command}")
+
+
+def _ledger(args) -> Ledger:
+    if args.command in CREATES:
+        return Ledger(args.db)
+    return Ledger(args.db, readonly=args.command in READ_ONLY, create=False)
+
+
+def _exit_code(command: str, result: dict) -> int:
+    if command == "observe" and result["skipped"]["missing_credentials"]:
+        return 2  # A configuration error stopped the run; partial results are printed.
+    if command in ("poll", "bars"):
+        return 0 if result.get("status") == "ok" else 1
+    if command in ("doctor", "verify"):
+        return 0 if result.get("ok") else 1
+    return 1 if result.get("errors") else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command in USES_KEYS:
+            secrets.export_to_environ()
         strategy = load_strategy(args.strategy)
-        with Ledger(args.db) as ledger:
-            result = dispatch(args, ledger, strategy)
+        if args.command in APP_COMMANDS:
+            result = app_dispatch(args, strategy)
+        else:
+            args.db = args.db or RESEARCH_DB
+            with _ledger(args) as ledger:
+                result = dispatch(args, ledger, strategy)
+        if result is None:
+            return 0
         print(json.dumps(result, indent=2, allow_nan=False))
-        return 1 if result.get("errors") else 0
+        return _exit_code(args.command, result)
     except (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error) as exc:
         print(f"jevtrader: {exc}", file=sys.stderr)
         return 2

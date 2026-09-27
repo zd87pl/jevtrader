@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from . import registry
 from .common import digest, instant, round_trip_bps, timestamp, utc_now, validate_strategy
 from .market import outcome, snapshot
-from .providers import MAX_TEXT_CHARS, extract_features
-from .research import FEATURE_NAMES, fit_model, predict, walk_forward
+from .providers import (
+    MAX_TEXT_CHARS,
+    PAID_PROVIDERS,
+    ProviderInputError,
+    ProviderValidationError,
+    extract_features,
+)
+from .research import FEATURE_NAMES, VERSION, fit_model, predict, walk_forward
 
 PREVIOUS_MIN_CHARS = 10_000
 
@@ -42,8 +49,15 @@ def observe(
     as_of: str | None = None,
     calibrator_id: str | None = None,
     transport=None,
+    base_url: str | None = None,
+    overrides: dict | None = None,
+    adhoc: bool = False,
 ) -> dict:
+    """Freeze one decision. ``base_url`` reaches a local engine; ``overrides`` are the
+    config's registry declarations, used only to label the new forecast's evidence.
+    ``adhoc`` marks a replay of an event picked by hand, which never counts as evidence."""
     validate_strategy(strategy)
+    overrides = registry.validate_overrides(overrides)
     event = ledger.get("disclosures", event_id)
     if event is None:
         raise ObservationRejected(f"Unknown disclosure: {event_id}")
@@ -65,12 +79,25 @@ def observe(
         forecast_model = ledger.get("models", calibrator_id)
         if forecast_model is None:
             raise ObservationRejected(f"Unknown calibrator: {calibrator_id}")
+        if forecast_model.get("version") != VERSION:
+            # Earlier fits could scale constant features by rounding noise; never reuse them.
+            raise ObservationRejected(
+                f"Calibrator was fit by {forecast_model.get('version')}, not {VERSION}; re-fit it"
+            )
         if instant(forecast_model["cutoff"]) >= instant(decision_at):
             raise ObservationRejected("Calibrator cutoff must be strictly before this decision")
         if mode != "synthetic" and "synthetic" in forecast_model["training_modes"]:
             raise ObservationRejected("A synthetic model cannot score real disclosures")
         if event_id in forecast_model["training_event_ids"]:
             raise ObservationRejected("Cannot forecast an event used to train the calibrator")
+    # Validate the local data before incurring a provider charge (and before the
+    # full disclosure scan below, so a queue of unscorable events stays cheap).
+    try:
+        market = snapshot(ledger, event["symbol"], decision_at, strategy, mode=mode)
+    except ObservationRejected:
+        raise
+    except ValueError as exc:
+        raise ObservationRejected(str(exc)) from None
     previous = [
         item
         for item in ledger.all("disclosures")
@@ -80,13 +107,6 @@ def observe(
         and instant(item["first_seen_at"]) <= instant(decision_at)
     ]
     prior = max(previous, key=lambda item: (item["published_at"], item["id"])) if previous else None
-    # Validate the local data before incurring a provider charge.
-    try:
-        market = snapshot(ledger, event["symbol"], decision_at, strategy, mode=mode)
-    except ObservationRejected:
-        raise
-    except ValueError as exc:
-        raise ObservationRejected(str(exc)) from None
     spec = {
         "provider": provider,
         "requested_model": model,
@@ -101,33 +121,63 @@ def observe(
         {"spec": spec, "current": event["text"], "previous": prior["text"] if prior else ""}
     )
     extraction = ledger.get("extractions", extraction_id)
-    if extraction is None and forecast_model:
-        # A calibrator from another provider, model or question set can be rejected before
-        # paying; only a changed resolved model must wait for the provider's response.
-        trained = next(
-            (
-                f
-                for f in ledger.all("forecasts")
-                if f["extractor_key"] == forecast_model["extractor_key"]
-            ),
-            None,
-        )
-        if trained and ledger.get("extractions", trained["extraction_id"])["spec"] != spec:
+    if forecast_model:
+        # A cached extraction, or a calibrator from another provider, model or question set,
+        # is rejected before paying; only a changed resolved model must wait for a response.
+        if extraction:
+            compatible = extraction["extractor_key"] == forecast_model["extractor_key"]
+        else:
+            trained = next(
+                (
+                    f
+                    for f in ledger.all("forecasts")
+                    if f["extractor_key"] == forecast_model["extractor_key"]
+                ),
+                None,
+            )
+            compatible = (
+                trained is None
+                or ledger.get("extractions", trained["extraction_id"])["spec"] == spec
+            )
+        if not compatible:
             raise ObservationRejected("Calibrator and extraction schemas/models do not match")
     if extraction is None:
         current_text, previous_text, excerpt = _excerpt(
             event["text"], prior["text"] if prior else ""
         )
-        result = extract_features(
-            provider,
-            model,
-            current_text,
-            previous_text,
-            strategy,
-            transport=transport,
-        )
+        # Only a local engine takes an address; other adapters keep their exact call.
+        location = {"base_url": base_url} if provider == "local" and base_url is not None else {}
+        try:
+            result = extract_features(
+                provider,
+                model,
+                current_text,
+                previous_text,
+                strategy,
+                transport=transport,
+                **location,
+            )
+        except ProviderInputError:
+            raise
+        except BaseException as exc:
+            # Includes Ctrl-C: an interrupted request may still be billed. A local engine
+            # bills nothing; only its repeated invalid answers are recorded, so queues stop
+            # retrying them, while an engine that was merely down is retried later.
+            if provider in PAID_PROVIDERS or (
+                provider == "local" and isinstance(exc, ProviderValidationError)
+            ):
+                _record_failed_attempt(
+                    ledger, event_id, provider, model, strategy, extraction_id, exc
+                )
+            raise
         extraction = {"id": extraction_id, "created_at": utc_now(), "spec": spec, **result}
         extraction["extractor_key"] = digest({**spec, "resolved_model": result["resolved_model"]})
+        # What was sent, so spend estimates need not trust a provider's own token count.
+        extraction["input_chars"] = (
+            len(current_text)
+            + len(previous_text)
+            + sum(len(question) for question in strategy["questions"].values())
+        )
         if excerpt:
             extraction["text_excerpt"] = excerpt
         ledger.put("extractions", extraction_id, extraction)
@@ -135,9 +185,9 @@ def observe(
         # A prediction only exists when extraction has finished; never backdate API latency.
         decision_at = utc_now()
     features = [extraction[name] if name in extraction else market[name] for name in FEATURE_NAMES]
-    if forecast_model:
-        if forecast_model["extractor_key"] != extraction["extractor_key"]:
-            raise ValueError("Calibrator and extraction schemas/models do not match")
+    if forecast_model and forecast_model["extractor_key"] != extraction["extractor_key"]:
+        # Reached only after a fresh extraction (e.g. a paid one resolving to another model).
+        raise ValueError("Calibrator and extraction schemas/models do not match")
     expected = predict(forecast_model, features) if forecast_model else None
     reasons = []
     if market["price"] < strategy["min_price"]:
@@ -173,6 +223,9 @@ def observe(
     existing = ledger.get("forecasts", identity)
     if existing:
         return existing
+    label, basis = _eligibility(
+        provider, extraction["resolved_model"], mode, event["published_at"], overrides, adhoc=adhoc
+    )
     record = {
         "id": identity,
         "event_id": event_id,
@@ -185,6 +238,9 @@ def observe(
         "extractor_key": extraction["extractor_key"],
         "provider": provider,
         "resolved_model": extraction["resolved_model"],
+        "eligibility": label,
+        # The registry facts behind the label, frozen with it: a config declaration can change.
+        "eligibility_basis": basis,
         "features": features,
         "feature_names": list(FEATURE_NAMES),
         "market": market,
@@ -197,6 +253,62 @@ def observe(
     }
     ledger.put("forecasts", identity, record)
     return record
+
+
+def _eligibility(
+    provider: str,
+    resolved_model: str,
+    mode: str,
+    published_at: str,
+    overrides: dict,
+    *,
+    adhoc: bool = False,
+) -> tuple[str, dict | None]:
+    """The registry's evidence label and the facts behind it; an extractor it cannot identify
+    never earns a replay label, and neither does a hand-picked replay."""
+    try:
+        entry = registry.lookup(provider, resolved_model, overrides)
+        label = registry.eligibility(
+            provider, resolved_model, mode=mode, published_at=published_at, overrides=overrides
+        )
+    except ValueError:
+        return (mode if mode in ("forward", "synthetic") else "unknown_cutoff"), None
+    if adhoc and mode == "historical":
+        label = "adhoc_replay"
+    basis = {key: entry[key] for key in ("key", "training_cutoff", "origin", "source")}
+    return label, basis
+
+
+def _record_failed_attempt(
+    ledger,
+    event_id: str,
+    provider: str,
+    model: str,
+    strategy: dict,
+    extraction_id: str,
+    error: BaseException,
+) -> None:
+    """A request may have been sent and billed; keep an append-only record so queues skip it."""
+    record = {
+        "event_id": event_id,
+        "provider": provider,
+        "requested_model": model,
+        # The paid payload depends on the questions, not on other strategy fields.
+        "questions_digest": digest(strategy["questions"]),
+        "attempted_at": utc_now(),
+    }
+    identity = digest(record)
+    ledger.put(
+        "attempts",
+        identity,
+        {
+            "id": identity,
+            **record,
+            "extraction_id": extraction_id,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        },
+    )
 
 
 def settle(ledger, *, as_of: str | None = None) -> dict:

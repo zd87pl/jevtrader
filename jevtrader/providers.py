@@ -46,6 +46,10 @@ class ProviderInputError(ProviderValidationError):
     """Rejected locally before any provider request was sent; nothing was billed."""
 
 
+class MissingCredentials(ProviderInputError):
+    """No API key for a paid provider; every uncached request would fail the same way."""
+
+
 def _json_text(value: object) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, allow_nan=False)
@@ -116,7 +120,7 @@ def _validate_inputs(model: str, current_text: str, previous_text: str, strategy
 def _api_key(variable: str) -> str:
     key = os.environ.get(variable, "").strip()
     if not key:
-        raise ProviderInputError(f"Set {variable} to use this provider")
+        raise MissingCredentials(f"Set {variable} to use this provider")
     return key
 
 
@@ -449,8 +453,9 @@ def propose_strategy(
     """Propose only a name and three questions; preserve all other policy fields.
 
     If supplied, ``metadata`` receives raw response, resolved_model, input_tokens
-    for auditing. The caller is responsible for restricting feedback to approved
-    development data; this function cannot infer whether a result is held out.
+    for auditing, even when the proposal is then rejected. The caller is
+    responsible for restricting feedback to approved development data; this
+    function cannot infer whether a result is held out.
     """
     questions = _strategy(current)
     _string(model, "model", limit=200)
@@ -484,11 +489,12 @@ def propose_strategy(
         "strategy_proposal",
         transport,
     )
+    if metadata is not None:
+        # Filled before validation, so a paid but unusable proposal can still be audited.
+        metadata.update(raw=raw, resolved_model=resolved, input_tokens=tokens)
     if set(proposed) != {"name", "questions"}:
         raise ProviderValidationError("Strategy proposal must contain only name and questions")
     result = copy.deepcopy(current)
     result.update(proposed)
     _strategy(result)
-    if metadata is not None:
-        metadata.update(raw=raw, resolved_model=resolved, input_tokens=tokens)
     return result

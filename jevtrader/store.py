@@ -9,6 +9,7 @@ from pathlib import Path
 from .common import canonical, digest, instant, symbol, timestamp, utc_now
 
 KINDS = {
+    "attempts",
     "disclosures",
     "bars",
     "extractions",

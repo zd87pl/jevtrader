@@ -13,9 +13,10 @@ from .common import digest, instant, load_strategy, timestamp, utc_now
 from .demo import run_demo
 from .engine import ObservationRejected, evaluate, observe, settle, train
 from .lab import autoresearch, experiment, generate_proposal
-from .market import import_bars
+from .market import bars_for, import_bars
 from .paper import plan_order
-from .providers import ProviderInputError, require_credentials
+from .providers import MissingCredentials, ProviderInputError
+from .research import VERSION
 from .sec import collect_disclosures
 from .store import KINDS, Ledger
 
@@ -64,6 +65,17 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("--as-of", help="Explicit replay timestamp; requires --event")
     observations.add_argument(
         "--calibrator", help="Stored ridge model id; without one all events are WATCH"
+    )
+    observations.add_argument(
+        "--max-scan",
+        type=int,
+        default=200,
+        help="Stop after this many local rejections (nothing sent; not counted in --limit)",
+    )
+    observations.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Also queue events whose earlier paid request failed (and may have been billed)",
     )
     _provider_options(observations)
     labels = commands.add_parser("settle", help="Attach matured next-open/horizon-close labels")
@@ -163,9 +175,10 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
             "extractor_keys": sorted({f["extractor_key"] for f in forecasts}),
             "models": [
                 {
-                    key: model[key]
+                    key: model.get(key)
                     for key in (
                         "model_id",
+                        "version",
                         "extractor_key",
                         "training_count",
                         "training_modes",
@@ -175,6 +188,14 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
                 for model in ledger.all("models")
             ],
             "modes": sorted({f["mode"] for f in forecasts}),
+            # Paid requests that failed and may have been billed; `show attempts ID` for detail.
+            "failed_attempts": [
+                {
+                    key: attempt[key]
+                    for key in ("id", "event_id", "provider", "requested_model", "attempted_at")
+                }
+                for attempt in ledger.all("attempts")
+            ],
         }
     if command == "show":
         record = ledger.get(args.kind, args.id)
@@ -199,26 +220,34 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
     if command == "observe":
         if not 1 <= args.limit <= 200:
             raise ValueError("--limit must be between 1 and 200")
+        if args.max_scan < 1:
+            raise ValueError("--max-scan must be positive")
         if args.as_of and not args.event:
             raise ValueError("--as-of requires one --event")
         model = _model(args)
-        require_credentials(args.provider)
         calibrator = None
         if args.calibrator:
             calibrator = ledger.get("models", args.calibrator)
             if calibrator is None:
                 raise ValueError(f"Unknown calibrator: {args.calibrator}")
+            if calibrator.get("version") != VERSION:
+                raise ValueError(
+                    f"Calibrator was fit by {calibrator.get('version')}, not {VERSION}; re-fit it"
+                )
         events = sorted(ledger.all("disclosures"), key=lambda e: (e["first_seen_at"], e["id"]))
-        skipped = {"requires_replay": 0, "calibrator_ineligible": 0}
+        skipped = {
+            "requires_replay": 0,
+            "failed_before": 0,
+            "calibrator_ineligible": 0,
+            "no_market_data": 0,
+            "scan_truncated": False,
+            "missing_credentials": False,
+        }
         if args.event:
             events = [e for e in events if e["id"] == args.event]
             if not events:
                 raise ValueError("Disclosure not found")
         else:
-            if not args.replay:
-                # A live clock never decides historical or synthetic records; replay them.
-                skipped["requires_replay"] = sum(e["mode"] != "forward" for e in events)
-                events = [e for e in events if e["mode"] == "forward"]
             done = {
                 (f["event_id"], f["mode"])
                 for f in ledger.all("forecasts")
@@ -241,18 +270,53 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
                 )
                 not in done
             ]
+            if not args.replay:
+                # A live clock never decides historical or synthetic records; replay them.
+                skipped["requires_replay"] = sum(e["mode"] != "forward" for e in events)
+                events = [e for e in events if e["mode"] == "forward"]
+            if not args.retry_failed:
+                # A failed paid request may have been billed; never repeat it unasked. The
+                # request depends on the questions, not other strategy fields; a later
+                # successful retry caches the extraction, so scoring it again is free.
+                questions = digest(strategy["questions"])
+                failed = {
+                    a["event_id"]
+                    for a in ledger.all("attempts")
+                    if a["provider"] == args.provider
+                    and a["requested_model"] == model
+                    and a["questions_digest"] == questions
+                    and ledger.get("extractions", a["extraction_id"]) is None
+                }
+                skipped["failed_before"] = sum(e["id"] in failed for e in events)
+                events = [e for e in events if e["id"] not in failed]
             if calibrator:
-                # Events first seen by the model's cutoff (or used to train it) cannot get a
-                # timely calibrated decision; keep them from consuming --limit.
+                # Keep events the model can never score from consuming --limit. A replay
+                # decides at first sight, so it also needs first_seen_at after the cutoff.
                 eligible = [
                     e
                     for e in events
-                    if instant(e["first_seen_at"]) > instant(calibrator["cutoff"])
-                    and e["id"] not in calibrator["training_event_ids"]
+                    if e["id"] not in calibrator["training_event_ids"]
+                    and (
+                        e["mode"] == "synthetic" or "synthetic" not in calibrator["training_modes"]
+                    )
+                    and (
+                        not args.replay
+                        or instant(e["first_seen_at"]) > instant(calibrator["cutoff"])
+                    )
                 ]
                 skipped["calibrator_ineligible"] = len(events) - len(eligible)
                 events = eligible
-        records, errors, attempted = [], [], 0
+            # One bar lookup per symbol: events that can never get a market snapshot must
+            # not fill the bounded scan below and hide scorable events behind them.
+            needed = strategy["min_history_sessions"]
+            enough = {
+                name: len(bars_for(ledger, name)) >= needed
+                for name in {e["symbol"] for e in events} | {strategy["benchmark"]}
+            }
+            scorable = [e for e in events if enough[e["symbol"]] and enough[strategy["benchmark"]]]
+            skipped["no_market_data"] = len(events) - len(scorable)
+            events = scorable
+        records, errors, attempted, rejected = [], [], 0, 0
         for event in events:
             if attempted >= args.limit:
                 break
@@ -280,9 +344,19 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
                         )
                     }
                 )
-            except (ObservationRejected, ProviderInputError) as exc:
-                # Nothing was sent, so report it without letting it block later events.
+            except MissingCredentials as exc:
+                # Every uncached event would fail the same way; cached ones never need a key.
                 errors.append({"event_id": event["id"], "error": str(exc)})
+                skipped["missing_credentials"] = True
+                break
+            except (ObservationRejected, ProviderInputError) as exc:
+                # Nothing was sent, so report it without letting it block later events,
+                # but bound the scan: rejections do not count toward --limit.
+                errors.append({"event_id": event["id"], "error": str(exc)})
+                rejected += 1
+                if rejected >= args.max_scan:
+                    skipped["scan_truncated"] = True
+                    break
                 continue
             except (ValueError, RuntimeError) as exc:
                 attempted += 1
@@ -304,6 +378,14 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
         forecast = ledger.get("forecasts", args.forecast)
         if forecast is None:
             raise ValueError("Forecast not found")
+        if forecast.get("calibrator_id"):
+            # Observation refuses calibrators from another evaluator; so must sizing.
+            scorer = ledger.get("models", forecast["calibrator_id"])
+            version = scorer.get("version") if scorer else None
+            if version != VERSION:
+                raise ValueError(
+                    f"Forecast was scored by {version}, not {VERSION}; re-fit and re-observe"
+                )
         positions = json.loads(Path(args.positions).read_text()) if args.positions else []
         result = plan_order(
             forecast,
@@ -371,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         with Ledger(args.db) as ledger:
             result = dispatch(args, ledger, strategy)
         print(json.dumps(result, indent=2, allow_nan=False))
+        if args.command == "observe" and result["skipped"]["missing_credentials"]:
+            return 2  # A configuration error stopped the run; partial results are printed.
         return 1 if result.get("errors") else 0
     except (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error) as exc:
         print(f"jevtrader: {exc}", file=sys.stderr)

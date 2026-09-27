@@ -72,8 +72,8 @@ def validate_strategy(data: dict) -> None:
     defaults = json.loads(files("jevtrader").joinpath("default_strategy.json").read_text())
     if not isinstance(data, dict) or set(data) != set(defaults):
         raise ValueError("Strategy must contain exactly the documented configuration fields")
-    # Keep these limits identical to the provider request checks, so a strategy that
-    # validates here cannot be rejected only after research budget is reserved.
+    # At least as strict as the provider request checks (nonblank name and questions), so
+    # a strategy that validates here cannot be rejected only after budget is reserved.
     if (
         type(data["version"]) is not int
         or data["version"] != 1
@@ -89,11 +89,7 @@ def validate_strategy(data: dict) -> None:
     }:
         raise ValueError("Strategy requires direction, materiality, novelty questions")
     for question in data["questions"].values():
-        if (
-            not isinstance(question, str)
-            or not 10 <= len(question) <= 4000
-            or len(question.strip()) < 10
-        ):
+        if not isinstance(question, str) or not 10 <= len(question) <= 4000 or not question.strip():
             raise ValueError("Questions must contain 10–4000 characters of text")
     symbol(data["benchmark"])
     if type(data["allow_short"]) is not bool:

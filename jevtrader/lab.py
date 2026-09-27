@@ -10,12 +10,16 @@ from __future__ import annotations
 from .common import digest, instant, timestamp, utc_now, validate_strategy
 from .engine import evaluate, observe, settle
 from .providers import propose_strategy, require_credentials
-from .research import FEATURE_NAMES, walk_forward
+from .research import FEATURE_NAMES, VERSION, walk_forward
 
 
 MAX_TRIALS = 5
 MAX_EVENTS = 200
 MIN_EVALUATED = 10
+
+
+class ProposalRejected(ValueError):
+    """A paid proposal failed local validation; it is recorded and used its slot."""
 
 
 def _evaluable_count(labelled: list[tuple[dict, dict]], baseline: dict) -> int:
@@ -75,18 +79,32 @@ def generate_proposal(ledger, trial: dict, model: str) -> dict:
     }
     if not ledger.put("experiments", slot_id, reservation):
         raise ValueError("Proposal slot is already reserved")
-    metadata = {}
-    candidate = propose_strategy(trial["candidate"], feedback, model, metadata=metadata)
+    metadata: dict = {}
+    candidate, error = None, None
+    try:
+        candidate = propose_strategy(trial["candidate"], feedback, model, metadata=metadata)
+        validate_strategy(candidate)
+    except ValueError as exc:
+        if candidate is None and not metadata:
+            raise  # No response came back to record.
+        error = str(exc)
     proposal = {
-        "type": "proposal",
+        "type": "proposal" if error is None else "proposal_rejected",
         "candidate": candidate,
         "metadata": metadata,
         "parent_trial": trial["id"],
         "reservation_id": slot_id,
         "created_at": utc_now(),
     }
+    if error is not None:
+        # The paid response is kept for audit, but never as a usable candidate.
+        proposal["error"] = error
     proposal["id"] = digest(proposal)
     ledger.put("experiments", proposal["id"], proposal)
+    if error is not None:
+        raise ProposalRejected(
+            f"Proposal {proposal['id']} was rejected ({error}); it used {slot_id}"
+        )
     return proposal
 
 
@@ -102,9 +120,11 @@ def autoresearch(
 ) -> dict:
     if type(rounds) is not int or not 1 <= rounds <= MAX_TRIALS:
         raise ValueError(f"rounds must be between 1 and {MAX_TRIALS}")
-    require_credentials(provider)
+    # experiment() checks the extraction key itself (a completed trial needs none). Later
+    # rounds pay for proposals and then extraction, so check both keys before anything spends.
     if rounds > 1:
         require_credentials("openai")
+        require_credentials(provider)
     best = experiment(
         ledger,
         baseline,
@@ -113,11 +133,15 @@ def autoresearch(
         model=model,
         development_until=development_until,
     )
-    trials = [best["id"]]
+    trials, rejected = [best["id"]], []
     for _ in range(rounds - 1):
         if sum(r.get("type") == "trial_started" for r in ledger.all("experiments")) >= MAX_TRIALS:
             break
-        proposal = generate_proposal(ledger, best, proposal_model)
+        try:
+            proposal = generate_proposal(ledger, best, proposal_model)
+        except ProposalRejected as exc:
+            rejected.append(str(exc))  # Recorded in the ledger; the round is used.
+            continue
         candidate = proposal["candidate"]
         trial = experiment(
             ledger,
@@ -132,6 +156,7 @@ def autoresearch(
             best = trial
     return {
         "trials": trials,
+        "rejected_proposals": rejected,
         "best_trial_id": best["id"],
         "candidate": best["candidate"],
         "development_score": best["score"],
@@ -161,6 +186,8 @@ def experiment(
         "max_trials": MAX_TRIALS,
     }
     if protocol is None:
+        # The lock cannot be undone, so a missing key must not leave one behind.
+        require_credentials(provider)
         seen, universe, labelled = set(), [], []
         forecasts = sorted(ledger.all("forecasts"), key=lambda f: (f["decision_at"], f["id"]))
         for forecast in forecasts:
@@ -196,20 +223,30 @@ def experiment(
         raise ValueError(
             "Research cutoff, baseline, provider and trial budget are already locked for this ledger"
         )
-    identity = digest({"protocol": protocol, "candidate": candidate})
+    # Scores from another evaluator version are not comparable; never reuse them.
+    identity = digest({"protocol": protocol, "candidate": candidate, "evaluator": VERSION})
     existing = ledger.get("experiments", identity)
     if existing:
         return existing
-    attempts = [r for r in ledger.all("experiments") if r.get("type") == "trial_started"]
-    start_id = f"start:{identity}"
-    if ledger.get("experiments", start_id) is not None:
+    # Trials recorded before ids named the evaluator stay valid if their report matches it.
+    legacy = ledger.get("experiments", digest({"protocol": protocol, "candidate": candidate}))
+    if legacy and legacy["report"].get("version") == VERSION:
+        return legacy
+    stored = ledger.all("experiments")
+    attempts = [r for r in stored if r.get("type") == "trial_started"]
+    # The protocol is locked per ledger, so the candidate identifies its trials under any
+    # evaluator or id scheme; a start without a matching completion must never be re-run.
+    if sum(r["candidate"] == candidate for r in attempts) > sum(
+        r.get("type") == "trial_completed" and r["candidate"] == candidate for r in stored
+    ):
         raise ValueError(
             "This trial already started and did not complete; no automatic retry of paid calls"
         )
     if len(attempts) >= MAX_TRIALS:
         raise ValueError(f"Research budget exhausted ({MAX_TRIALS} candidates); no automatic reset")
+    start_id = f"start:{identity}"
     # Unique slot insertion prevents two processes from reserving the last slot.
-    slots = [r for r in ledger.all("experiments") if r.get("type") == "trial_slot"]
+    slots = [r for r in stored if r.get("type") == "trial_slot"]
     if len(slots) >= MAX_TRIALS:
         raise ValueError("Research trial slots exhausted")
     require_credentials(provider)

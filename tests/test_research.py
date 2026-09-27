@@ -49,7 +49,7 @@ class ResearchTests(unittest.TestCase):
     def test_float_noise_in_constant_feature_cannot_move_predictions(self):
         # Means of repeated non-dyadic floats are inexact (30 x 0.8 has std ~2e-16),
         # which must not turn a constant training feature into a huge hidden weight.
-        for value in (0.8, 0.35, 0.001):
+        for value in (0.8, 0.35, 0.001, 12345.678):
             with self.subTest(value=value):
                 rows = sample_rows(30)
                 for index, row in enumerate(rows):
@@ -59,6 +59,20 @@ class ResearchTests(unittest.TestCase):
                 base = rows[0]["features"]
                 changed = [*base[:3], 0.05, *base[4:]]
                 self.assertAlmostEqual(predict(model, base), predict(model, changed), places=12)
+
+    def test_small_real_feature_variance_keeps_its_standardization(self):
+        # Return-scale features (std ~1e-4) are real signal, not rounding noise.
+        rows = sample_rows(30)
+        for index, row in enumerate(rows):
+            row["features"][4] = ((index * 7) % 5 - 2) * 1e-4
+            row["target"] = 10 * row["features"][4]
+        model = fit_model(rows, cutoff="2024-03-01T00:00:00Z", min_samples=30)
+        self.assertEqual(model["version"], "ridge-event-v2")
+        column = np.array([row["features"][4] for row in rows])
+        self.assertEqual(model["scale"][4], np.std(column))
+        base = rows[0]["features"]
+        moved = [*base[:4], base[4] + 2e-4, *base[5:]]
+        self.assertGreater(predict(model, moved) - predict(model, base), 1e-4)
 
     def test_no_penalty_on_intercept(self):
         rows = sample_rows(5)

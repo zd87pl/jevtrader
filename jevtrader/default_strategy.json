@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "name": "disclosure-change-v1",
+  "questions": {
+    "direction": "Compare the current disclosure with the previous disclosure. Is there concrete evidence of improving, unchanged, or deteriorating recurring operating demand, margins, or cash flow? Use unclear when evidence is missing or contradictory. Judge reported economic changes, not promotional tone or hypothetical future success.",
+    "materiality": "Does the current disclosure contain specific evidence of an economically meaningful change in recurring business activity, rather than boilerplate, a one-off accounting effect, or vague optimism?",
+    "novelty": "Does the current disclosure add substantive information absent from the previous disclosure? Repetition and cosmetic rewording are not new information. Without a previous disclosure, novelty is unknown."
+  },
+  "benchmark": "SPY",
+  "horizon_sessions": 10,
+  "min_history_sessions": 21,
+  "max_market_age_hours": 96,
+  "min_price": 5.0,
+  "min_dollar_volume": 5000000.0,
+  "spread_bps": 10.0,
+  "slippage_bps_per_side": 5.0,
+  "commission_per_order": 0.0,
+  "short_borrow_bps_annual": 300.0,
+  "min_edge_bps": 20.0,
+  "max_uncertainty": 0.6,
+  "allow_short": false,
+  "risk_per_trade": 0.0025,
+  "max_position_fraction": 0.15,
+  "max_gross_fraction": 1.0,
+  "max_short_fraction": 0.25,
+  "max_positions": 4,
+  "pause_drawdown": 0.08,
+  "stop_volatility_multiple": 2.0,
+  "min_stop_fraction": 0.03,
+  "ridge_alpha": 10.0,
+  "min_train_samples": 30
+}
+

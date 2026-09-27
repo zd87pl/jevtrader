@@ -1,0 +1,414 @@
+"""Bounded, read-only SEC collector for forward operating-disclosure research.
+
+Only 8-K/8-K/A filings explicitly listing 7.01 or 8.01 and not 2.02 qualify.
+Missing item metadata is skipped. Item numbers are an imperfect non-earnings
+filter: 7.01/8.01 can still contain earnings-related material, and other operating
+disclosures will be missed. A directory index does not expose exhibit types;
+EX-99 selection therefore uses a filename heuristic or a cover-page link label.
+One exhibit per filing is collected, not every attachment. A primary-document
+fallback is explicitly marked and may be only a cover page.
+
+Acceptance is not public availability. ``first_seen_at`` is when this collector
+actually received the selected document, never a reconstructed historical date.
+Consumers must persist that first observation rather than overwrite it on repeat
+polls, deduplicate on ``id``, and never backdate a forward decision. Amendments are
+separate records. No API key, external link fetching, or live model is used.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
+from typing import Callable
+from urllib.error import HTTPError
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from zoneinfo import ZoneInfo
+
+MAX_RESPONSE_BYTES = 2_000_000
+MAX_TEXT_CHARS = 200_000
+MAX_DIRECTORY_FILES = 1_000
+MAX_RECENT_FILINGS = 1_000
+MAX_LIMIT = 20
+REQUEST_INTERVAL = 0.21  # Safely below SEC's 10/s ceiling; at most 5/s.
+_DOCUMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}\.(?:htm|html|txt)\Z", re.I)
+_EXHIBIT = re.compile(r"(?:ex(?:hibit|h)?)[_.-]*99", re.I)
+_EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+class SECError(ValueError):
+    """Unsafe input, malformed SEC response, or an exceeded collection bound."""
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise SECError("Observation clock must return a timezone-aware datetime")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _published_at(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SECError("Missing acceptanceDateTime")
+    # A date-only value cannot establish when the disclosure was accepted.
+    if "T" not in value and " " not in value:
+        raise SECError("acceptanceDateTime must include time")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SECError("Invalid acceptanceDateTime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("America/New_York"))
+    return _iso_utc(parsed)
+
+
+def _validate_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.username or parts.password or parts.port:
+        raise SECError("SEC requests require an approved HTTPS URL")
+    if parts.query or parts.fragment:
+        raise SECError("SEC request URLs cannot contain queries or fragments")
+    if parts.netloc == "data.sec.gov" and re.fullmatch(r"/submissions/CIK\d{10}\.json", parts.path):
+        return
+    if parts.netloc == "www.sec.gov":
+        match = re.fullmatch(r"/Archives/edgar/data/\d{1,10}/\d{18}/([^/]+)", parts.path)
+        if match and (match[1] == "index.json" or _DOCUMENT.fullmatch(match[1])):
+            return
+    raise SECError("URL is outside approved SEC submissions/archive paths")
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SECError("SEC redirects are not followed")
+
+
+def _transport(request: Request, *, timeout: float):
+    return build_opener(_NoRedirects()).open(request, timeout=timeout)
+
+
+class _RateLimiter:
+    def __init__(self, clock: Callable, sleep: Callable):
+        self.clock = clock
+        self.sleep = sleep
+        self.last_request: float | None = None
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self.lock:
+            if self.last_request is not None:
+                delay = REQUEST_INTERVAL - (self.clock() - self.last_request)
+                if delay > 0:
+                    self.sleep(delay)
+            self.last_request = self.clock()
+
+
+# Shared by ordinary calls, including repeated symbols and concurrent threads.
+# Separate processes must be coordinated by their caller or run only one poller.
+_DEFAULT_LIMITER = _RateLimiter(time.monotonic, time.sleep)
+
+
+class _SECClient:
+    """A synchronous client; injectable dependencies keep tests offline."""
+
+    def __init__(
+        self,
+        user_agent: str,
+        timeout: float,
+        max_requests: int,
+        *,
+        transport: Callable | None = None,
+        clock: Callable | None = None,
+        sleep: Callable | None = None,
+        now: Callable | None = None,
+    ):
+        if (
+            not isinstance(user_agent, str)
+            or len(user_agent) > 250
+            or "\r" in user_agent
+            or "\n" in user_agent
+            or not _EMAIL.search(user_agent)
+        ):
+            raise SECError("Provide an explicit SEC User-Agent containing your contact email")
+        if not isinstance(timeout, (int, float)) or not 0 < timeout <= 60:
+            raise SECError("timeout must be between 0 and 60 seconds")
+        self.user_agent = user_agent
+        self.timeout = timeout
+        self.max_requests = max_requests
+        self.transport = transport or _transport
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.now = now or _utc_now
+        self.requests = 0
+        self.limiter = (
+            _DEFAULT_LIMITER
+            if clock is None and sleep is None
+            else _RateLimiter(self.clock, self.sleep)
+        )
+
+    def get(self, url: str) -> bytes:
+        _validate_url(url)
+        if self.requests >= self.max_requests:
+            raise SECError("SEC request budget exhausted")
+        self.limiter.acquire()
+        self.requests += 1
+        request = Request(
+            url,
+            headers={
+                "User-Agent": self.user_agent,
+                "Accept": "application/json,text/html,text/plain",
+            },
+        )
+        with self.transport(request, timeout=self.timeout) as response:
+            _validate_url(response.geturl())
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(payload) > MAX_RESPONSE_BYTES:
+            raise SECError("SEC response exceeds maximum byte size")
+        return payload
+
+    def get_json(self, url: str) -> dict:
+        try:
+            value = json.loads(self.get(url))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SECError("Invalid SEC JSON response") from exc
+        if not isinstance(value, dict):
+            raise SECError("SEC JSON response must be an object")
+        return value
+
+
+class _DocumentParser(HTMLParser):
+    _BLOCKS = {
+        "p",
+        "div",
+        "li",
+        "tr",
+        "br",
+        "hr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "table",
+        "section",
+    }
+    _HIDDEN = {"script", "style", "noscript"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self.hidden: list[str] = []
+        self.anchor: tuple[str, list[str]] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._HIDDEN:
+            self.hidden.append(tag)
+        if self.hidden:
+            return
+        if tag in self._BLOCKS:
+            self.parts.append("\n")
+        elif tag in {"td", "th"}:
+            self.parts.append(" ")
+        if tag == "a":
+            self.anchor = (dict(attrs).get("href", ""), [])
+
+    def handle_endtag(self, tag):
+        if self.hidden:
+            if tag == self.hidden[-1]:
+                self.hidden.pop()
+            return
+        if tag in self._BLOCKS:
+            self.parts.append("\n")
+        if tag == "a" and self.anchor is not None:
+            href, text = self.anchor
+            if href:
+                self.links.append((href, "".join(text)))
+            self.anchor = None
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+            if self.anchor is not None:
+                self.anchor[1].append(data)
+
+    @property
+    def text(self) -> str:
+        lines = [re.sub(r"\s+", " ", line).strip() for line in "".join(self.parts).splitlines()]
+        return "\n\n".join(line for line in lines if line)
+
+
+def _read_document(payload: bytes, filename: str) -> tuple[str, list[tuple[str, str]]]:
+    content = payload.decode("utf-8-sig", errors="replace")
+    if filename.lower().endswith(".txt") and not re.search(
+        r"<(?:html|body|div|p)\b", content, re.I
+    ):
+        lines = [re.sub(r"[\t ]+", " ", line).strip() for line in unescape(content).splitlines()]
+        return "\n\n".join(line for line in lines if line), []
+    parser = _DocumentParser()
+    parser.feed(content)
+    parser.close()
+    return parser.text, parser.links
+
+
+def _directory_names(client: _SECClient, base: str) -> list[str]:
+    try:
+        listing = client.get_json(base + "index.json")
+    except HTTPError as exc:
+        if exc.code == 404:
+            exc.close()
+            return []
+        raise
+    directory = listing.get("directory")
+    entries = directory.get("item") if isinstance(directory, dict) else None
+    if not isinstance(entries, list) or len(entries) > MAX_DIRECTORY_FILES:
+        raise SECError("Malformed or oversized SEC directory index")
+    return [
+        entry["name"]
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and _DOCUMENT.fullmatch(entry["name"])
+    ]
+
+
+def _exhibit_rank(name: str) -> tuple[int, int, str]:
+    normalized = re.sub(r"[_.-]", "", name.lower())
+    return (
+        0 if re.search(r"ex(?:hibit|h)?991", normalized) else 1,
+        1 if name.lower().endswith(".txt") else 0,
+        name.lower(),
+    )
+
+
+def _cover_exhibit(links: list[tuple[str, str]], base: str, primary: str) -> str | None:
+    candidates = []
+    for href, label in links:
+        if not (
+            _EXHIBIT.search(href)
+            or re.search(r"\b(?:ex(?:hibit)?\.?\s*)?99(?:[.\s_-]\d+)?\b", label, re.I)
+        ):
+            continue
+        joined = urlsplit(urljoin(base + primary, href))
+        url = urlunsplit((joined.scheme, joined.netloc, joined.path, joined.query, ""))
+        if not url.startswith(base):
+            continue
+        name = url[len(base) :]
+        if name == primary or not _DOCUMENT.fullmatch(name):
+            continue
+        try:
+            _validate_url(url)
+        except (SECError, ValueError):
+            continue
+        candidates.append(name)
+    return min(candidates, key=_exhibit_rank) if candidates else None
+
+
+def _filing_document(client: _SECClient, base: str, primary: str) -> tuple[str, str, str, str]:
+    names = _directory_names(client, base)
+    exhibits = [name for name in names if name != primary and _EXHIBIT.search(name)]
+    if exhibits:
+        name = min(exhibits, key=_exhibit_rank)
+        text, _ = _read_document(client.get(base + name), name)
+        return name, text, "exhibit", "ex99_filename_heuristic"
+    cover_payload = client.get(base + primary)
+    cover_text, links = _read_document(cover_payload, primary)
+    exhibit = _cover_exhibit(links, base, primary)
+    if exhibit:
+        text, _ = _read_document(client.get(base + exhibit), exhibit)
+        return exhibit, text, "exhibit", "cover_link"
+    return primary, cover_text, "primary_document_fallback", "no_supported_ex99_found"
+
+
+def collect_disclosures(
+    cik: str,
+    symbol: str,
+    *,
+    user_agent: str,
+    limit: int = 5,
+    timeout: float = 20,
+) -> list[dict]:
+    """Collect up to ``limit`` recent non-earnings operating disclosures.
+
+    Explicit contact-bearing User-Agent is required. Each call is bounded to
+    1 + 3*limit requests and at most five requests/second. Only SEC-hosted HTML or
+    text is fetched; PDF-only exhibits and unknown item metadata are skipped or
+    marked as cover-page fallbacks. Errors propagate so callers can fail closed.
+    """
+    if not isinstance(cik, str) or not re.fullmatch(r"\d{1,10}", cik) or int(cik) == 0:
+        raise SECError("CIK must contain 1 to 10 digits and be nonzero")
+    if not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,14}", symbol):
+        raise SECError("Invalid stock symbol")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
+        raise SECError(f"limit must be an integer from 1 to {MAX_LIMIT}")
+    client = _SECClient(user_agent, timeout, 1 + 3 * limit)
+    normalized_cik = cik.zfill(10)
+    data = client.get_json(f"https://data.sec.gov/submissions/CIK{normalized_cik}.json")
+    filings = data.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict):
+        raise SECError("Missing SEC recent filings")
+    required = ("accessionNumber", "form", "primaryDocument", "acceptanceDateTime", "items")
+    if any(not isinstance(recent.get(key), list) for key in required):
+        raise SECError("Malformed SEC recent filing arrays")
+    lengths = {len(recent[key]) for key in required}
+    if len(lengths) != 1:
+        raise SECError("SEC recent filing arrays have inconsistent lengths")
+    records = []
+    for index in range(min(len(recent["form"]), MAX_RECENT_FILINGS)):
+        form = recent["form"][index]
+        item_value = recent["items"][index]
+        if form not in ("8-K", "8-K/A") or not isinstance(item_value, str):
+            continue
+        items = sorted(set(re.findall(r"\b\d{1,2}\.\d{2}\b", item_value)))
+        if "2.02" in items or not {"7.01", "8.01"}.intersection(items):
+            continue
+        accession = recent["accessionNumber"][index]
+        primary = recent["primaryDocument"][index]
+        if not isinstance(accession, str) or not re.fullmatch(r"\d{10}-\d{2}-\d{6}", accession):
+            continue
+        if not isinstance(primary, str) or not _DOCUMENT.fullmatch(primary):
+            continue
+        try:
+            published = _published_at(recent["acceptanceDateTime"][index])
+        except SECError:
+            continue
+        base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
+        document, text, role, method = _filing_document(client, base, primary)
+        observed = _iso_utc(client.now())
+        if not text.strip():
+            # Empty source content is an error rather than a reason to exceed
+            # the filing/request budget while looking for another candidate.
+            raise SECError("Selected SEC document contains no readable text")
+        records.append(
+            {
+                "id": f"sec:{accession}:{document}",
+                "symbol": symbol.upper(),
+                "published_at": published,
+                "first_seen_at": observed,
+                "source_url": base + document,
+                "text": text[:MAX_TEXT_CHARS],
+                "source_type": "sec",
+                "cik": normalized_cik,
+                "accession": accession,
+                "form": form,
+                "items": items,
+                "document": document,
+                "document_role": role,
+                "selection_method": method,
+                "text_truncated": len(text) > MAX_TEXT_CHARS,
+                "timestamp_basis": "sec_acceptance_not_public_availability",
+                "mode": "forward",
+            }
+        )
+        if len(records) >= limit:
+            break
+    return records

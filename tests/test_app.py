@@ -751,10 +751,12 @@ class DoctorTests(TempHome):
     def test_an_invalid_config_is_the_only_problem_and_skips_what_reads_it(self):
         # Defaults would add a spurious "SEC name and email are not set".
         paths.config_path().parent.mkdir(parents=True)
-        paths.config_path().write_text('{\n  "watchlist": ["ABC"],\n}\n')
+        # A missing comma, not a trailing one: Python 3.13 reports trailing commas
+        # at a different position than 3.11/3.12 do.
+        paths.config_path().write_text('{\n  "watchlist": ["ABC"]\n  "provider": "rules"\n}\n')
         report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain())
         [problem] = report["problems"]
-        self.assertRegex(problem, r"^Config: .* is not valid JSON: .* \(line 2, column 23\)$")
+        self.assertRegex(problem, r"^Config: .* is not valid JSON: .* \(line 3, column 3\)$")
         for name in ("sec_user_agent", "ledger", "provider", "keys", "bars"):
             self.assertIsNone(report["checks"][name]["ok"], name)
         path = self.dir / "given.sqlite"

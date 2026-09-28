@@ -1,7 +1,7 @@
 """One explicit CLI. It never places orders; paid provider calls happen only when chosen.
 
 Research commands keep their ledger default (data/jevtrader.sqlite); app commands use the
-ledger named by config. Only init and demo create a ledger; read-only commands open it
+ledger named by config. Only init, demo and setup create a ledger; read-only commands open it
 read-only. Keys come from the environment or the macOS Keychain and are never printed.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sqlite3
 import sys
 from datetime import date
@@ -26,10 +27,12 @@ from .local import DEFAULT_MODEL as LOCAL_MODEL
 from .market import import_bars
 from .paper import plan_order
 from .pipeline import check_options, observe_queue
+from .providers import PROVIDERS
 from .research import VERSION
 from .sec import collect_disclosures
 from .store import KINDS, Ledger
 
+APP = paths.APP_NAME
 RESEARCH_DB = "data/jevtrader.sqlite"
 CREATES = frozenset({"init", "demo"})
 READ_ONLY = frozenset({"status", "show", "evaluate"})
@@ -211,7 +214,7 @@ def _app_commands(commands) -> None:
 
 
 def _provider_options(command, default="rules", *, local=False):
-    choices = ["rules", "local", "jev", "openai"] if local else ["rules", "jev", "openai"]
+    choices = [name for name in PROVIDERS if local or name != "local"]
     command.add_argument("--provider", choices=choices, default=default)
     command.add_argument(
         "--model", help="Explicit provider model; OpenAI requires this or OPENAI_MODEL"
@@ -439,14 +442,38 @@ def app_dispatch(args, strategy: dict) -> dict | None:
             symbols=symbols,
             max_filings=args.max_filings,
             with_bars=args.bars,
+            benchmark=strategy["benchmark"],
         )
     raise ValueError(f"Unknown command: {command}")
 
 
-def _ledger(args) -> Ledger:
+def _ledger(args, *, defaulted: bool = False) -> Ledger:
     if args.command in CREATES:
         return Ledger(args.db)
+    if args.db != ":memory:" and not Path(args.db).is_file():
+        raise ValueError(_missing(args.db, args.command, defaulted=defaulted))
     return Ledger(args.db, readonly=args.command in READ_ONLY, create=False)
+
+
+def _missing(db: str, command: str, *, defaulted: bool) -> str:
+    """Point at the ledger the user most likely meant, not at an init that makes a stray one."""
+    if not defaulted:
+        return (
+            f"No ledger at {db}; check --db, or create one with `{APP} --db {shlex.quote(db)} init`"
+        )
+    try:
+        service = settings.ledger_path(settings.load())
+    except ValueError:
+        service = None
+    if service is not None and service.is_file():
+        return (
+            f"No research ledger at {db} (the default here). The service's ledger is {service}; "
+            f"use `{APP} --db {shlex.quote(str(service))} {command} ...`"
+        )
+    return (
+        f"No ledger at {db}; run `{APP} setup` for the service's ledger, or `{APP} init` to "
+        "start a research ledger here"
+    )
 
 
 def _exit_code(command: str, result: dict) -> int:
@@ -468,8 +495,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in APP_COMMANDS:
             result = app_dispatch(args, strategy)
         else:
+            defaulted = args.db is None
             args.db = args.db or RESEARCH_DB
-            with _ledger(args) as ledger:
+            with _ledger(args, defaulted=defaulted) as ledger:
                 result = dispatch(args, ledger, strategy)
         if result is None:
             return 0

@@ -202,6 +202,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(adhoc["eligibility"], "adhoc_replay")
         self.assertFalse(registry.counts_as_evidence(adhoc["eligibility"]))
 
+    def test_replay_the_registry_cannot_label_is_never_evidence(self):
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        with patch.object(registry, "eligibility", side_effect=ValueError("unidentified")):
+            result = self.observe()
+        self.assertEqual(result["eligibility"], "unknown_cutoff")
+        self.assertIsNone(result["eligibility_basis"])
+        self.assertFalse(registry.counts_as_evidence(result["eligibility"]))
+
     def test_uncalibrated_rules_observation_is_watch(self):
         self.populate()
         self.event("previous", index=17, text="Business was unchanged.")

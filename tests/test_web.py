@@ -1,6 +1,7 @@
 """Localhost view: loopback bind, Host allowlist, CSP, read-only access and escaping."""
 
 import contextlib
+import errno
 import hashlib
 import http.client
 import io
@@ -226,11 +227,55 @@ class PageTests(WebTestCase):
         self.assert_page(body)
         self.assertIn(brief.percent(web.evidence.GATE["futility_upper_bps"] / 10_000), body)
         self.assertIn(digest(web.evidence.GATE), body)
+        # Every matured filing's move is context, never a result: "target" read as a price target.
+        self.assertIn(
+            "average stock-minus-benchmark move, all 0 matured filings (not a strategy result)",
+            body,
+        )
+        self.assertNotIn("mean target", body)
         status, _, body = self.text("/health")
         self.assertEqual(status, 200)
         self.assert_page(body)
         self.assertIn("Needs attention: poll.", body)
         self.assertIn("&lt;i&gt;boom&lt;/i&gt;", body)
+        self.assertNotIn("is the service running", body)
+
+    def test_run_records_and_titles_are_escaped_wherever_shown(self):
+        # Run records are free-form JSON anyone with the file can append; nothing is trusted.
+        hostile = '<b>x</b>"'
+        with Ledger(self.path) as ledger:
+            ledger.put(
+                "runs",
+                "run-2",
+                {
+                    "job": hostile,
+                    "started_at": "2026-03-10T13:41:00Z",
+                    "finished_at": "2026-03-10T13:41:02Z",
+                    "status": "<i>odd",
+                    "counts": {},
+                },
+            )
+        escaped = "&lt;b&gt;x&lt;/b&gt;&quot;"
+        _, _, health = self.text("/health")
+        self.assertIn(f"<td>{escaped}</td>", health)
+        self.assertIn(f"Needs attention: {escaped}, poll.", health)
+        _, _, front = self.text("/")
+        self.assertIn(f'<span class="job">{escaped}</span>', front)
+        for body in (health, front):
+            self.assertNotIn("<b>", body)
+            self.assertNotIn("<i>", body)
+        _, _, titled = web.page(hostile, "", "label")
+        self.assertIn(f"<title>{escaped} · jevtrader</title>", titled.decode())
+
+    def test_health_says_when_runs_stopped_arriving(self):
+        # The last run is two hours old: whatever it said, nothing is running now.
+        status, _, page = web.respond(
+            self.path, "GET", "/health", [HOST], port=PORT, now="2026-03-10T15:40:02Z"
+        )
+        body = page.decode()
+        self.assertEqual(status, 200)
+        self.assertIn("Needs attention: poll, service.", body)
+        self.assertIn("No background runs for 2 h; is the service running?", body)
 
     def test_unknown_route_is_a_calm_404(self):
         status, _, body = self.text("/admin")
@@ -282,44 +327,22 @@ class ReadOnlyTests(WebTestCase):
             for target in ("/", "/scoreboard", "/health", f"/filing/{EVENT_ID}", "/api/brief.json"):
                 self.assertEqual(self.get(target)[0], 200)
         self.assertEqual(len(opened), 5)
-        self.assertTrue(all(getattr(ledger, "readonly", True) for ledger in opened))
+        self.assertTrue(all(ledger.readonly for ledger in opened))
         self.assertEqual(hashlib.sha256(self.path.read_bytes()).hexdigest(), before)
         with Ledger(self.path) as ledger:
             self.assertEqual(ledger.counts()["runs"], 1)
 
-    def test_fallback_reader_when_store_lacks_readonly(self):
-        class OldLedger:
-            def __init__(self, path):
-                raise AssertionError("a writable ledger must never be opened")
-
-        with patch.object(web, "Ledger", OldLedger):
-            ledger = web.open_readonly(self.path)
-            self.assertIsInstance(ledger, web.ReadOnlyLedger)
-            with ledger:
-                self.assertEqual(ledger.get("forecasts", "f1")["action"], "WATCH")
-                self.assertIsNone(ledger.get("forecasts", "missing"))
-                self.assertEqual([r["id"] for r in ledger.all("disclosures")], ["later", EVENT_ID])
-                self.assertEqual(len(ledger.prefix("disclosures", "sec:")), 1)
-                with self.assertRaises(sqlite3.OperationalError):
-                    ledger.db.execute("INSERT INTO records VALUES ('runs', 'x', '{}', 'h', 't')")
-            self.assertEqual(self.get("/")[0], 200)
-        with self.assertRaises(ValueError):
-            web.ReadOnlyLedger(self.dir / "absent.sqlite")
-
-    def test_fallback_reader_detects_tampered_records(self):
-        path = self.dir / "tampered.sqlite"
-        db = sqlite3.connect(path)
-        db.execute(
-            "CREATE TABLE records (kind TEXT, id TEXT, payload TEXT, content_hash TEXT, recorded_at TEXT)"
-        )
-        db.execute(
-            "INSERT INTO records VALUES ('runs', 'r', ?, ?, 't')",
-            (json.dumps({"job": "poll"}), digest({"job": "other"})),
-        )
-        db.commit()
-        db.close()
-        with web.ReadOnlyLedger(path) as ledger, self.assertRaises(ValueError):
-            ledger.all("runs")
+    def test_open_readonly_returns_a_ledger_that_refuses_writes(self):
+        with web.open_readonly(self.path) as ledger:
+            self.assertIsInstance(ledger, Ledger)
+            self.assertTrue(ledger.readonly)
+            self.assertEqual(ledger.get("forecasts", "f1")["action"], "WATCH")
+            with self.assertRaises(sqlite3.OperationalError):
+                ledger.db.execute("INSERT INTO records VALUES ('runs', 'x', '{}', 'h', 't')")
+        missing = self.dir / "absent.sqlite"
+        with self.assertRaisesRegex(ValueError, "setup` first, or check --db"):
+            web.open_readonly(missing)
+        self.assertFalse(missing.exists())
 
 
 class SocketTests(WebTestCase):
@@ -381,6 +404,23 @@ class SocketTests(WebTestCase):
         line = log.getvalue()
         self.assertIn(r'"GET /\x1b]0;pwned\x07\x1b[2J\x9b31m HTTP/1.1" 403', line)
         self.assertTrue(line.endswith("\n") and line[:-1].isprintable(), repr(line))
+
+    def test_a_busy_port_is_named_instead_of_a_raw_errno(self):
+        with (
+            patch.object(web._Server, "serve_forever", side_effect=AssertionError("served")),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(
+                ValueError,
+                rf"^Port {self.port} is in use \(another `jevtrader serve`\?\); pass --port$",
+            ),
+        ):
+            web.serve(self.path, port=self.port)
+        denied = PermissionError(errno.EACCES, "Permission denied")
+        with (
+            patch.object(web, "make_server", side_effect=denied),
+            self.assertRaises(PermissionError),
+        ):
+            web.serve(self.path, port=80)
 
     def test_malformed_requests_get_the_same_headers(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as raw:

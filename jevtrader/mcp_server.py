@@ -58,6 +58,7 @@ INSTRUCTIONS = (
     "personalized investment or financial advice such as what to buy, sell or hold or how much."
 )
 
+BRIEF_DAYS = 3  # the handlers' window (web.LOOKBACK); this module stays free of the ledger
 Handler = Callable[[dict], dict]
 _NOTICE = "Read-only research data, not investment advice."
 
@@ -95,9 +96,9 @@ TOOLS = [
     _tool(
         "today_brief",
         "Today's brief",
-        "The pre-market brief: 8-K filings first seen since the previous brief, watchlist first, "
-        "each with the code-computed action, reasons and expected return, plus the evidence "
-        "summary and service health. No filing text; explain_filing has short excerpts.",
+        f"The pre-market brief: 8-K filings first seen in the last {BRIEF_DAYS} days, watchlist "
+        "first, each with the code-computed action, reasons and expected return, plus the "
+        "evidence summary and service health. No filing text; explain_filing has short excerpts.",
     ),
     _tool(
         "explain_filing",
@@ -134,7 +135,8 @@ TOOLS = [
         "search_filings",
         "Search filings",
         "Stored filings, most recently first seen first, optionally for one symbol and only "
-        "those first seen since a time. No filing text; explain_filing has short excerpts.",
+        "those first seen since a time; each marks whether it is on the watchlist. No filing "
+        "text; explain_filing has short excerpts.",
         {
             "symbol": {
                 "type": "string",

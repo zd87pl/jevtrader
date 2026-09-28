@@ -20,7 +20,7 @@ Use a new, empty demo database; the demo refuses to modify a populated ledger. I
 
 **The demo deliberately injects a relationship between text and future prices. Its results are a plumbing check, not evidence of alpha.** Its weekday calendar and prices are artificial. Setup, demo, and tests make no paid API calls. Provider integrations are tested with mocked responses, not live service verification.
 
-Only `init` and `demo` create a ledger; every other command needs an existing one and says `run init first` otherwise. Read-only commands (`status`, `show`, `evaluate` and the app views below) open it read-only. Research commands default to `--db data/jevtrader.sqlite`; the app commands in the next section default to the ledger named in the app config.
+Only `init`, `demo` and `setup` create a ledger; every other command needs an existing one. Without one, a research command names the service's ledger when setup has created it (use it with `--db`) instead of suggesting an `init` that would make an empty ledger here. Read-only commands (`status`, `show`, `evaluate` and the app views below) open it read-only. Research commands default to `--db data/jevtrader.sqlite`; the app commands in the next section default to the ledger named in the app config.
 
 ## Run it for you (macOS)
 
@@ -39,10 +39,12 @@ jevtrader setup
 1. **Your name and email for SEC.** SEC's fair-access policy asks automated tools to identify themselves; the value goes only to sec.gov in the User-Agent header.
 2. **Watchlist** symbols, and whether to score only those or every qualifying 8-K (`all`).
 3. **Text features**: `rules` (fixed word lists, free, offline), `local` (a model served by Ollama or LM Studio on this Mac; setup runs a health check), `jev` or `openai` (paid; they receive selected filing text). Paid presets also ask for a monthly spend cap and the model's prices per million input and output tokens; the cap counts output (reasoning included) at the requested maximum when a response reports no count, and without both prices the service keeps paid extraction off.
-4. **Alpaca bars**: completed daily bars from Alpaca's free market-data API (needs the keys of a free paper account). Without bars nothing can be scored.
+4. **Alpaca bars**: completed daily bars from Alpaca's free market-data API (needs the keys of a free paper account). Without bars nothing can be scored: filings are collected but their cards say `not scored: no market data`, and setup and `doctor` say so.
 5. **Brief time** (New York, weekdays) and whether to show it as a macOS notification.
 6. **Keys** for the choices above, typed hidden and stored in the macOS Keychain. Blank skips.
 7. Whether to **start the service** now (`jevtrader up`).
+
+Nothing is saved until the last answer is in: cancelling (Ctrl-C or end of input) before then stores no key and writes no file. By the final question, keys, config and both ledgers are saved; cancelling it only leaves the service stopped.
 
 Settings live in `~/Library/Application Support/jevtrader/` (`config.json`, owner-only), next to `forward.sqlite` (the service's ledger), `research.sqlite` (for backfills) and `logs/`. Set `JEVTRADER_HOME` to an absolute path to use another folder; `up` passes it on to the service. Config holds no secrets. `model_overrides` in `config.json` declares facts the model registry lacks, for example `{"local:qwen3:32b": {"training_cutoff": "2024-10-01"}}` or `{"openai:MODEL": {"usd_per_million_input_tokens": 1.25, "usd_per_million_output_tokens": 10}}`.
 
@@ -51,19 +53,31 @@ Settings live in `~/Library/Application Support/jevtrader/` (`config.json`, owne
 | Job | When (New York time) | What it does |
 |---|---|---|
 | `poll` | every 60 s on weekdays 06:00–22:00, else every 15 min | New 8-K/8-K/A filings from SEC's current feed that list Item 7.01 or 8.01 and not 2.02; `first_seen_at` is actual receipt |
-| `bars` | weekdays after 16:30, catching up if missed | Completed sessions (close + 20 min) for the watchlist, recent filers and SPY, stamped with actual receipt |
-| `observe` | after new filings or bars | One frozen forward decision per new filing with the configured provider |
+| `bars` | weekdays after 16:30, catching up if missed | Completed sessions (close + 20 min), stamped with actual receipt: the strategy's benchmark, then open forecasts' symbols and benchmarks, the watchlist and recent filers |
+| `observe` | after new filings or bars | One frozen forward decision per new filing with the configured provider; a batch starts no new filing after 2 minutes, so polling keeps up |
 | `settle` | after bars | Next-open to tenth-close labels once they have matured |
-| `brief` | weekdays at your brief time | Filings since the previous brief; optional notification |
+| `brief` | weekdays at your brief time | Notification of the filings first seen since the previous brief (the `brief` command, page and MCP show the last 3 days) |
 | `reconcile` | 22:45 | Compares the day's EDGAR index with what was collected |
 
-Every run, skip and failure is recorded in the ledger as a `runs` record. If the Mac slept or the service was stopped, a `coverage_gap` record says so; filings that left SEC's 100-entry feed meanwhile are not reconstructed. `jevtrader poll` and `jevtrader bars` run one job by hand (they refuse while the service runs); `jevtrader daemon` runs the schedule in the foreground.
+Every run, skip and failure is recorded in the ledger as a `runs` record. If the Mac slept, the service was stopped, or jobs held up polling for more than 5 minutes past its interval, a `coverage_gap` record says so; filings that left SEC's 100-entry feed meanwhile are not reconstructed. `jevtrader poll` and `jevtrader bars` run one job by hand (they refuse while the service or another such job runs); a service starting meanwhile waits up to 10 minutes for them, then exits with an error so launchd tries again. `jevtrader daemon` runs the schedule in the foreground.
 
 ### What the brief means
 
-Each card shows the symbol, form and items, when this system first saw the filing, the code-computed action and its reasons, and at most two short quotes copied verbatim from the filing (300 characters per card, never the full text). A sentence that addresses the reader or an AI agent, gives orders or names a tool is never quoted. `WATCH` means observation only: **without a fitted calibrator every decision is `WATCH`.** A calibrator needs matured forward observations (`fit`, 30 by default); `LONG`/`SHORT` appear only when its predicted excess return clears costs and the minimum edge.
+Each card shows the symbol, form and items, when this system first saw the filing, the code-computed action and its reasons, and at most two short quotes copied verbatim from the filing (300 characters per card, never the full text). A sentence that addresses the reader or an AI agent, gives orders or names a tool is never quoted. Quotes are labeled as the company's text. `WATCH` means observation only: **without a fitted calibrator every decision is `WATCH`,** and no call counts toward the evidence gate (see [From WATCH to calls](#from-watch-to-calls)). `LONG`/`SHORT` appear only when the calibrator's predicted excess return clears costs and the minimum edge. A card without a decision says `not scored: no market data` when its symbol has no bars. A filing's outcome is the stock's move minus the benchmark's over the label window; no position is ever taken.
 
-The evidence line comes from a pre-registered gate: it counts matured `LONG`/`SHORT` calls net of assumed costs, with a 90% Student-t interval over decision dates. Status is `collecting` until 100 matured calls, then `supported` (whole interval above zero), `no_edge` (whole interval below +0.10%) or `inconclusive`. The health line names jobs that failed or need attention.
+The evidence line comes from a pre-registered gate: it counts matured `LONG`/`SHORT` calls net of assumed costs, with a 90% Student-t interval over decision dates. Status is `collecting` until 100 matured calls, then `supported` (whole interval above zero), `no_edge` (whole interval below +0.10%) or `inconclusive`. The health line names jobs that failed or need attention, and names `service` when no run has been recorded for 30 minutes: the service polls at least every 15 minutes, so silence means it is not running.
+
+### From WATCH to calls
+
+The service decides with the calibrator named in `config.json` (`"calibrator": null` at first). Once enough forward decisions have matured labels (30 by default), fit one on the service's ledger:
+
+```sh
+LEDGER="$HOME/Library/Application Support/jevtrader/forward.sqlite"
+jevtrader --db "$LEDGER" status          # extractor_keys; models once fitted
+jevtrader --db "$LEDGER" fit --extractor-key KEY --mode forward
+```
+
+Set `"calibrator": "MODEL_ID"` in `config.json` and restart the service (`jevtrader down`, then `jevtrader up`). `doctor` checks that the model is in that ledger, fit by the current evaluator and on the service's provider and model; otherwise the service's observe runs fail and health names them. Forward filings it has not yet decided with this calibrator are decided again when the service next runs: live, at that time, never backdated.
 
 ### Evidence labels
 
@@ -76,18 +90,22 @@ Every new forecast records an `eligibility` label from the model registry. Only 
 | `post_cutoff` | Replay of a filing dated more than 92 days after the model's published training cutoff | yes |
 | `contaminated` | Replay of a filing the model may have seen in training | no |
 | `unknown_cutoff` | Replay with a model whose cutoff is undisclosed (JEV) or undeclared | no |
+| `adhoc_replay` | Replay of one filing picked by hand (`--event` with `--replay` or `--as-of`) | no |
 | `synthetic` | Demo data | never |
 
-Forecasts recorded before labels existed keep their records; only forward ones count.
+Each forecast also freezes the registry facts behind its label (`eligibility_basis`: the training cutoff and whether it came from the registry or your config), and the filing page shows them. Each filing counts once: its first recorded forward call (else its first forward forecast); a replay never replaces a forward decision, and a filing with replays only uses the first one recorded. Forecasts recorded before labels existed keep their records; only forward ones count.
 
 ### Look at it
 
 ```sh
-jevtrader brief            # JSON; --notify also shows the notification, --since TIME widens it
-jevtrader serve            # http://127.0.0.1:8765/ (read-only)
-jevtrader doctor           # config, ledger chain, local engine, key names, service, last runs
+jevtrader brief            # JSON; --notify also shows the notification, --since TIME sets the window start (default: 3 days ago)
+jevtrader serve            # http://127.0.0.1:8765/ (read-only); --port if 8765 is taken
+jevtrader doctor           # config, ledger chain, health, calibrator, bars, local engine, key names, service
 jevtrader verify           # recompute every record hash and the hash chain
+jevtrader --db "$HOME/Library/Application Support/jevtrader/forward.sqlite" show forecasts FORECAST_ID
 ```
+
+`brief`, the page and the MCP server show filings first seen in the last 3 days (Monday still shows Friday's); the notification covers the time since the previous brief. Research commands such as `show` and `status` default to `data/jevtrader.sqlite`, so pass the service's ledger with `--db` as above.
 
 The page binds to 127.0.0.1 only, answers only `127.0.0.1`/`localhost` Host headers, has no forms and opens the ledger read-only. `jevtrader mcp` is a read-only MCP server on stdio with five tools (`today_brief`, `explain_filing`, `evidence_report`, `health`, `search_filings`); for example, in an MCP client's config:
 
@@ -102,7 +120,7 @@ For research on older filings, `jevtrader backfill --start 2026-01-02 --end 2026
 ### What it cannot do
 
 - Place, change or track orders or positions, or give investment advice.
-- Show an edge that does not exist: until a calibrator is fitted everything is `WATCH`, and the gate needs 100 matured calls.
+- Show an edge that does not exist: until a calibrator is fitted and named in config everything is `WATCH`, and the gate needs 100 matured calls.
 - See every disclosure: only 8-Ks listing 7.01/8.01 (not 2.02), one EX-99 or primary document each, HTML or text only. Periods when the service was not running stay gaps.
 - Provide market data by itself: bars need Alpaca keys; delisting returns and quotes are not modeled; costs are assumptions.
 - Remove model contamination from replays; it only labels it.

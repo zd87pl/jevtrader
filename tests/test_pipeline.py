@@ -112,6 +112,23 @@ class ObserveQueueTests(unittest.TestCase):
         self.assertIn("runs", KINDS)
         self.assertTrue(self.ledger.put("runs", "run-1", {"job": "poll", "status": "ok"}))
 
+    def test_out_of_time_starts_no_further_event_after_the_first(self):
+        for index in (25, 26, 27):
+            self.ledger.disclosure(event(f"valid-{index}", self.days[index]))
+        observer, asked = fake_observer(), []
+
+        def out_of_time():
+            asked.append(observer.call_count)
+            return True
+
+        result = self.queue(replay=True, observer=observer, out_of_time=out_of_time)
+        self.assertEqual([f["event_id"] for f in result["forecasts"]], ["valid-25"])
+        self.assertTrue(result["skipped"]["out_of_time"])
+        self.assertEqual(asked, [1])  # never before the first event: every batch makes progress
+        result = self.queue(replay=True, observer=fake_observer(), out_of_time=lambda: False)
+        self.assertEqual(len(result["forecasts"]), 3)
+        self.assertFalse(result["skipped"]["out_of_time"])
+
     def test_rejections_limit_and_market_data_skips_with_the_real_engine(self):
         self.ledger.disclosure(event("too-early", self.days[5]))  # Too little history.
         self.ledger.disclosure(event("no-bars", self.days[24], symbol="XYZ"))
@@ -281,6 +298,29 @@ class ObserveQueueTests(unittest.TestCase):
         result = self.queue(event="old")
         self.assertEqual(result["forecasts"], [])
         self.assertIn("--replay", result["errors"][0]["error"])
+
+    def test_engine_address_and_declared_cutoffs_reach_the_observer(self):
+        self.ledger.disclosure(event("valid", self.days[25]))
+        declared = {"local:qwen3:14b": {"training_cutoff": "2024-12-01"}}
+        for options in (
+            {"event": "valid", "as_of": f"{self.days[30]}T15:00:00Z"},
+            {"replay": True},
+        ):
+            with self.subTest(named="event" in options):
+                observer = fake_observer()
+                self.queue(
+                    observer=observer,
+                    base_url="http://127.0.0.1:1234/v1",
+                    overrides=declared,
+                    **options,
+                )
+                self.assertEqual(observer.call_args.kwargs["overrides"], declared)
+                self.assertEqual(observer.call_args.kwargs["base_url"], "http://127.0.0.1:1234/v1")
+        # Not given: the engine keeps its own defaults.
+        observer = fake_observer()
+        self.queue(event="valid", replay=True, observer=observer)
+        self.assertNotIn("overrides", observer.call_args.kwargs)
+        self.assertNotIn("base_url", observer.call_args.kwargs)
 
     def test_transport_reaches_the_default_engine_observer(self):
         self.ledger.disclosure(event("valid", self.days[25]))

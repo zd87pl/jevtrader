@@ -371,7 +371,9 @@ class EndToEndTests(unittest.TestCase):
             watchlist=[TICKER],
         )
         self.assertEqual(status, 200)
-        self.assertIn("benchmark-relative return", page.decode())
+        # A WATCH made no call: the outcome is the stock's move, never shown as a result.
+        self.assertIn("stock minus SPY over the label window (no position taken)", page.decode())
+        self.assertNotIn("benchmark-relative return", page.decode())
         status, _, page = web.respond(
             self.ledger_path,
             "GET",

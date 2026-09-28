@@ -8,7 +8,6 @@ stops before a conservative estimate of this month's spend could exceed the conf
 from __future__ import annotations
 
 import fcntl
-import importlib
 import math
 import os
 import re
@@ -16,21 +15,30 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
+from . import bars as market_bars
+from . import brief as briefing
 from . import config as settings
-from . import engine, paths, pipeline
-from .common import canonical, digest, instant, timestamp, utc_now, validate_strategy
+from . import engine, feeds, paths, pipeline, registry
+from . import notify as notifier
+from .common import (
+    EASTERN,
+    canonical,
+    digest,
+    instant,
+    timestamp,
+    utc_now,
+    validate_strategy,
+)
 from .providers import MAX_OUTPUT_TOKENS, MAX_TEXT_CHARS, PAID_PROVIDERS
 from .secrets import KNOWN as SECRET_NAMES
 
 JOBS = ("poll", "bars", "observe", "settle", "brief", "reconcile")
 GAP_JOB = "coverage_gap"
-ET = ZoneInfo("America/New_York")
 STATUSES = ("ok", "partial", "skipped", "failed", "gap")
 DONE = frozenset({"ok", "partial", "skipped"})  # a failed run is retried; these are not
 
@@ -43,8 +51,13 @@ OBSERVE_INTERVAL_SECONDS = 60
 RETRY_SECONDS = 15 * 60
 GAP_SECONDS = 5 * 60
 TICK_SECONDS = 10
+LOCK_ROLES = ("daemon", "job")
+LOCK_RETRY_SECONDS = 5
+LOCK_WAIT_SECONDS = 10 * 60  # how long a starting daemon waits for a one-off job to finish
 OBSERVE_LIMIT = 10
-BARS_LOOKBACK_DAYS = 60  # covers every forward event still inside its label horizon
+# A batch starts no new event after this long, so polling keeps pace with a slow local model.
+OBSERVE_BUDGET_SECONDS = 120
+BARS_LOOKBACK_DAYS = 60  # at least; longer when the strategy's label horizon needs it
 MAX_BAR_SYMBOLS = 1000
 MAX_ERROR_CHARS = 300
 # Worst case for one paid request: the full text budget plus three 4,000-character questions
@@ -57,29 +70,22 @@ Rates = tuple[float, float]  # the same, both known and positive
 
 
 class AlreadyRunning(RuntimeError):
-    """Another process holds the single-writer lock."""
+    """Another process holds the single-writer lock; ``holder`` is its role when known."""
+
+    def __init__(self, message: str, holder: str | None = None):
+        super().__init__(message)
+        self.holder = holder
 
 
 class _Skip(Exception):
     """A precondition is unmet; the run is recorded as skipped with this reason."""
 
 
-def _lazy(module: str, name: str) -> Callable[..., Any]:
-    """Resolve a sibling module's function at call time so tests and stage wiring stay cheap."""
-
-    def call(*args: Any, **kwargs: Any) -> Any:
-        return getattr(importlib.import_module(f"{__package__}.{module}"), name)(*args, **kwargs)
-
-    call.__name__ = f"{module}.{name}"
-    return call
-
-
 def registry_price(provider: str, model: str) -> Prices | None:
     """USD per million input and output tokens from the model registry; None for no entry."""
     try:
-        registry = importlib.import_module(f"{__package__}.registry")
         entry = registry.lookup(provider, model)
-    except (ImportError, ValueError, KeyError):
+    except (ValueError, KeyError):
         return None
     if not isinstance(entry, dict):
         return None
@@ -98,16 +104,14 @@ class Context:
     config: dict
     strategy: dict
     clock: Callable[[], str] = utc_now
-    poll: Callable[..., dict] = field(default_factory=lambda: _lazy("feeds", "poll"))
-    bars: Callable[..., dict] = field(default_factory=lambda: _lazy("bars", "fetch_forward"))
+    poll: Callable[..., dict] = feeds.poll
+    bars: Callable[..., dict] = market_bars.fetch_forward
     observe: Callable[..., dict] = pipeline.observe_queue
     settle: Callable[..., dict] = engine.settle
-    brief: Callable[..., dict] = field(default_factory=lambda: _lazy("brief", "compose"))
-    render: Callable[[dict], tuple[str, str]] = field(
-        default_factory=lambda: _lazy("brief", "render_text")
-    )
-    notify: Callable[..., bool] = field(default_factory=lambda: _lazy("notify", "macos"))
-    reconcile: Callable[..., list] = field(default_factory=lambda: _lazy("feeds", "daily_index"))
+    brief: Callable[..., dict] = briefing.compose
+    render: Callable[[dict], tuple[str, str]] = briefing.render_text
+    notify: Callable[..., bool] = notifier.macos
+    reconcile: Callable[..., list] = feeds.daily_index
     price: Callable[[str, str], Prices | None] = registry_price
     log: Callable[[str], None] = _stderr
 
@@ -134,8 +138,8 @@ def due_jobs(now_et: datetime, state: dict, config: dict) -> list[str]:
         poll_every = max(poll_every, RETRY_SECONDS)
     bars_enabled = config.get("bars_source", "none") != "none"
     bars_slot = _latest_weekday_slot(now, BARS_AT)
-    brief_at = _clock_time(config.get("brief_time", settings.DEFAULTS["brief_time"]))
-    brief_slot = datetime.combine(now.date(), brief_at, ET)
+    brief_at = settings.clock_time(config.get("brief_time", settings.DEFAULTS["brief_time"]))
+    brief_slot = datetime.combine(now.date(), brief_at, EASTERN)
     checks = {
         "poll": _interval_due(now, attempted.get("poll"), poll_every),
         "bars": bars_enabled
@@ -174,20 +178,13 @@ def reconcile_day(now_et: datetime) -> date:
 def _eastern(value: datetime) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("Scheduling needs a timezone-aware datetime")
-    return value.astimezone(ET)
-
-
-def _clock_time(value: str) -> time:
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value) if isinstance(value, str) else None
-    if not match or int(match[1]) > 23 or int(match[2]) > 59:
-        raise ValueError("brief_time must be HH:MM (24-hour, America/New_York)")
-    return time(int(match[1]), int(match[2]))
+    return value.astimezone(EASTERN)
 
 
 def _latest_weekday_slot(now: datetime, at: time) -> datetime:
     for back in range(8):
         day = now.date() - timedelta(days=back)
-        slot = datetime.combine(day, at, ET)
+        slot = datetime.combine(day, at, EASTERN)
         if day.weekday() < 5 and slot <= now:
             return slot
     raise AssertionError("unreachable: a weekday occurs within any 8 days")
@@ -256,7 +253,13 @@ def _bars(ctx: Context, now: str) -> tuple[dict, list]:
     if ctx.config["bars_source"] == "none":
         raise _Skip("bars_source is none; import bars manually or choose alpaca in setup")
     symbols = _bar_symbols(ctx, now)
-    result = ctx.bars(ctx.ledger, symbols, now=now, feed=ctx.config["alpaca_feed"])
+    result = ctx.bars(
+        ctx.ledger,
+        symbols,
+        now=now,
+        feed=ctx.config["alpaca_feed"],
+        benchmark=ctx.strategy["benchmark"],
+    )
     errors = list(result.get("errors") or [])
     counts = {
         "symbols": _count(result.get("symbols", len(symbols))),
@@ -274,7 +277,21 @@ def _observe(ctx: Context, now: str) -> tuple[dict, list]:
     spend: dict = {}
     if provider in PAID_PROVIDERS:
         limit, spend = _paid_limit(ctx, provider, model, now)
-    result = ctx.observe(ctx.ledger, ctx.strategy, provider=provider, model=model, limit=limit)
+    started = instant(now)
+
+    def out_of_time() -> bool:
+        return (instant(ctx.clock()) - started).total_seconds() >= OBSERVE_BUDGET_SECONDS
+
+    result = ctx.observe(
+        ctx.ledger,
+        ctx.strategy,
+        provider=provider,
+        model=model,
+        # Without a fitted calibrator every decision is WATCH and no call can ever count.
+        calibrator=ctx.config["calibrator"],
+        limit=limit,
+        out_of_time=out_of_time,
+    )
     errors = list(result.get("errors") or [])
     counts = {
         "forecasts": len(result.get("forecasts") or []),
@@ -428,7 +445,22 @@ def _scope(config: dict) -> set[str] | None:
 
 
 def _bar_symbols(ctx: Context, now: str) -> list[str]:
-    since = instant(now) - timedelta(days=BARS_LOOKBACK_DAYS)
+    """Bars that settle open forecasts come first (each forecast's symbol and benchmark,
+    oldest first), then the watchlist, then recent forward filings (newest first), whose
+    snapshots need history."""
+    horizon = ctx.strategy["horizon_sessions"]
+    # Five sessions in seven days, plus holidays, covers the label horizon's calendar span.
+    days = max(BARS_LOOKBACK_DAYS, math.ceil(horizon * 7 / 5) + 14)
+    since = instant(now) - timedelta(days=days)
+    unsettled = sorted(
+        (
+            (forecast["decision_at"], forecast["symbol"], _benchmark(forecast, ctx.strategy))
+            for forecast in ctx.ledger.all("forecasts")
+            if forecast.get("mode") == "forward"
+            and instant(forecast["decision_at"]) >= since
+            and ctx.ledger.get("outcomes", forecast["id"]) is None
+        )
+    )
     recent = sorted(
         (
             (event["first_seen_at"], event["symbol"])
@@ -437,8 +469,20 @@ def _bar_symbols(ctx: Context, now: str) -> list[str]:
         ),
         reverse=True,
     )
-    symbols = [*ctx.config["watchlist"], *(name for _, name in recent)]
+    symbols = [
+        ctx.strategy["benchmark"],
+        *(name for _, *names in unsettled for name in names),
+        *ctx.config["watchlist"],
+        *(name for _, name in recent),
+    ]
     return list(dict.fromkeys(symbols))[:MAX_BAR_SYMBOLS]
+
+
+def _benchmark(forecast: dict, strategy: dict) -> str:
+    # Each outcome is measured against the benchmark of the strategy that made the forecast.
+    frozen = forecast.get("strategy")
+    named = frozen.get("benchmark") if isinstance(frozen, dict) else None
+    return named if isinstance(named, str) and named else strategy["benchmark"]
 
 
 def _rates(
@@ -577,10 +621,11 @@ def remember(state: dict, record: dict, *, at: str | None = None) -> None:
     if job in ("poll", "bars") and counts.get("added", 0) > 0:
         pending["observe"] = True
     elif job == "observe":
-        # A full batch may leave more queued work; errors wait for new data instead of
-        # retrying a paid provider every minute.
-        pending["observe"] = record["status"] == "ok" and counts.get("forecasts", 0) >= counts.get(
-            "limit", OBSERVE_LIMIT
+        # A full or timed-out batch may leave more queued work; errors wait for new data
+        # instead of retrying a paid provider every minute.
+        pending["observe"] = record["status"] == "ok" and (
+            counts.get("forecasts", 0) >= counts.get("limit", OBSERVE_LIMIT)
+            or bool(counts.get("out_of_time"))
         )
 
 
@@ -599,24 +644,72 @@ def tick(ctx: Context, state: dict, now: str, *, stop: threading.Event | None = 
 
 
 @contextmanager
-def single_writer(path: Path | None = None) -> Iterator[Path]:
-    """Exclusive, non-blocking lock; closing the descriptor (even on a crash) releases it."""
+def single_writer(path: Path | None = None, *, role: str = "job") -> Iterator[Path]:
+    """Exclusive, non-blocking lock; closing the descriptor (even on a crash) releases it.
+
+    The file names the holder's pid and role: the ``daemon`` or a one-off ``job``.
+    """
     target = Path(path) if path is not None else paths.lock_path()
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    handle = os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
+    handle = _lock(target, role)
     try:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise AlreadyRunning(
-                f"Another {paths.APP_NAME} daemon is already running (lock: {target}); "
-                "stop it first"
-            ) from None
-        os.ftruncate(handle, 0)
-        os.write(handle, f"{os.getpid()}\n".encode())
         yield target
     finally:
         os.close(handle)
+
+
+def _lock(target: Path, role: str) -> int:
+    if role not in LOCK_ROLES:
+        raise ValueError(f"Lock role must be one of: {', '.join(LOCK_ROLES)}")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = _holder(handle)
+        os.close(handle)
+        message = (
+            f"Another {paths.APP_NAME} daemon is already running (lock: {target}); stop it first"
+            if holder == "daemon"
+            else f"A one-off {paths.APP_NAME} job is running (lock: {target})"
+            if holder == "job"
+            else f"Another {paths.APP_NAME} process holds the lock ({target})"
+        )
+        raise AlreadyRunning(message, holder) from None
+    except BaseException:
+        os.close(handle)
+        raise
+    os.ftruncate(handle, 0)
+    os.write(handle, f"{os.getpid()} {role}\n".encode())
+    return handle
+
+
+def _holder(handle: int) -> str | None:
+    # The holder writes its role just after locking, so a racing read may still find nothing.
+    words = os.pread(handle, 64, 0).decode(errors="replace").split()
+    return words[1] if len(words) == 2 and words[1] in LOCK_ROLES else None
+
+
+def _daemon_lock(
+    target: Path, *, stop: threading.Event, sleep: Callable[[float], Any]
+) -> int | None:
+    """The daemon's lock, or None if stopped while waiting. A one-off job (a CLI poll or bars
+    run) is waited for: launchd never restarts a daemon that exited cleanly, so giving up at
+    once would leave the service down. Another daemon is refused at once; a job that holds on
+    past LOCK_WAIT_SECONDS is refused too, and the caller exits with a failure so launchd
+    retries later."""
+    waited = 0
+    while True:
+        try:
+            return _lock(target, "daemon")
+        except AlreadyRunning as exc:
+            if exc.holder == "daemon" or waited >= LOCK_WAIT_SECONDS:
+                raise
+        if stop.is_set():
+            return None
+        sleep(LOCK_RETRY_SECONDS)
+        waited += LOCK_RETRY_SECONDS
+        if stop.is_set():
+            return None
 
 
 def run_forever(
@@ -628,29 +721,50 @@ def run_forever(
     lock_path: Path | None = None,
     tick_seconds: float = TICK_SECONDS,
 ) -> None:
-    """Run the schedule until ``stop`` is set; raises AlreadyRunning if another writer exists."""
+    """Run the schedule until ``stop`` is set; raises AlreadyRunning if another daemon holds
+    the lock, or a one-off job still holds it after LOCK_WAIT_SECONDS."""
     if clock is not None:
         ctx = replace(ctx, clock=clock)
     stop = stop or threading.Event()
     sleep = sleep or stop.wait  # an interruptible sleep lets a signal handler stop promptly
-    with single_writer(lock_path):
+    handle = _daemon_lock(
+        Path(lock_path) if lock_path is not None else paths.lock_path(), stop=stop, sleep=sleep
+    )
+    if handle is None:
+        return
+    try:
         state = load_state(ctx.ledger)
         now = timestamp(ctx.clock())
-        last_poll = state["attempted"].get("poll")
-        if last_poll is not None:
-            idle = (instant(now) - instant(last_poll)).total_seconds()
-            if idle > poll_interval(instant(last_poll)) + GAP_SECONDS:
-                _gap(ctx, state, last_poll, now, "the service was not running")
+        _stalled(ctx, state, now, "the service was not running")
         while not stop.is_set():
             tick(ctx, state, now, stop=stop)
             if stop.is_set():
                 break
+            # Polling pauses while jobs run (a slow model batch, a Mac asleep mid-request).
             before = timestamp(ctx.clock())
+            _stalled(ctx, state, before, "jobs ran long or the computer slept")
             sleep(tick_seconds)
             now = timestamp(ctx.clock())
             overshoot = (instant(now) - instant(before)).total_seconds() - tick_seconds
             if overshoot > GAP_SECONDS:
                 _gap(ctx, state, before, now, "the computer slept or the clock jumped")
+            else:
+                _stalled(ctx, state, now, "jobs ran long or the computer slept")
+    finally:
+        os.close(handle)
+
+
+def _stalled(ctx: Context, state: dict, now: str, reason: str) -> None:
+    """Record a gap from the last poll when polling is overdue by more than GAP_SECONDS."""
+    last = state.get("attempted", {}).get("poll")
+    if last is None:
+        return
+    # Either side of an active-hours boundary sets the cadence; take the more lenient one.
+    allowed = max(poll_interval(instant(last)), poll_interval(instant(now)))
+    if state.get("backoff", {}).get("poll"):
+        allowed = max(allowed, RETRY_SECONDS)
+    if (instant(now) - instant(last)).total_seconds() > allowed + GAP_SECONDS:
+        _gap(ctx, state, last, now, reason)
 
 
 def _gap(ctx: Context, state: dict, start: str, end: str, reason: str) -> None:

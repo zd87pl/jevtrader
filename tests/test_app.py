@@ -4,13 +4,15 @@ Every system boundary is faked: local engines, the Keychain, launchctl and notif
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import os
+import shlex
 import signal
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,19 +20,23 @@ from unittest.mock import patch
 from jevtrader import (
     app,
     brief,
+    cli,
     daemon,
     engine,
+    launchd,
     local,
     mcp_server,
     paths,
     pipeline,
     providers,
     registry,
+    web,
 )
 from jevtrader import config as settings
 from jevtrader.cli import main
-from jevtrader.common import digest, load_strategy
+from jevtrader.common import digest, load_strategy, timestamp
 from jevtrader.market import normalize_bar
+from jevtrader.research import VERSION
 from jevtrader.store import Ledger
 
 STRATEGY = load_strategy()
@@ -71,15 +77,15 @@ class Engine:
 
 
 class FakeLaunchctl:
-    def __init__(self, *, loaded=False):
-        self.calls, self.loaded = [], loaded
+    def __init__(self, *, loaded=False, printed="\tstate = running\n"):
+        self.calls, self.loaded, self.printed = [], loaded, printed
 
     def __call__(self, argv):
         self.calls.append(list(argv))
         verb = argv[1]
         if verb == "print":
             code = 0 if self.loaded else 113
-            return SimpleNamespace(returncode=code, stdout="\tstate = running\n", stderr="")
+            return SimpleNamespace(returncode=code, stdout=self.printed, stderr="")
         if verb == "bootstrap":
             self.loaded = True
         if verb == "bootout":
@@ -213,6 +219,29 @@ class LocalProviderTests(unittest.TestCase):
             providers.require_credentials("other")
         self.assertEqual(set(providers.PROVIDERS), set(registry.PROVIDERS))
 
+    def test_provider_tables_follow_the_one_provider_list(self):
+        # A provider added to providers.PROVIDERS alone must not be billed, retried or
+        # offered as if it were another kind.
+        for module in (daemon, engine, pipeline, app):
+            with self.subTest(module=module.__name__):
+                self.assertIs(module.PAID_PROVIDERS, providers.PAID_PROVIDERS)
+        self.assertEqual([name for name, _ in app.PRESETS], list(providers.PROVIDERS))
+        self.assertEqual(set(app.PROVIDER_KEYS), providers.PAID_PROVIDERS)
+        commands = next(
+            action
+            for action in cli.parser()._actions
+            if action.choices and "observe" in action.choices
+        ).choices
+        for command, expected in (
+            ("observe", list(providers.PROVIDERS)),
+            ("experiment", [name for name in providers.PROVIDERS if name != "local"]),
+        ):
+            with self.subTest(command=command):
+                option = next(
+                    action for action in commands[command]._actions if action.dest == "provider"
+                )
+                self.assertEqual(option.choices, expected)
+
 
 class EligibilityTests(unittest.TestCase):
     def setUp(self):
@@ -254,6 +283,40 @@ class EligibilityTests(unittest.TestCase):
                     **options,
                 )
                 self.assertEqual(forecast["eligibility"], label)
+
+    def test_the_label_follows_the_model_that_answered_not_the_one_requested(self):
+        # gpt-oss:120b has a known cutoff; the engine answered with an unregistered fine-tune.
+        forecast = self.observe(
+            "e1", "local", "gpt-oss:120b", transport=Engine(completion(model="my-finetune"))
+        )
+        self.assertEqual(forecast["resolved_model"], "my-finetune")
+        self.assertEqual(forecast["eligibility"], "unknown_cutoff")
+        self.assertEqual(forecast["eligibility_basis"]["key"], "local:my-finetune")
+        self.assertIsNone(forecast["eligibility_basis"]["training_cutoff"])
+
+    def test_a_declared_cutoff_is_frozen_with_the_forecast_and_shown_on_its_card(self):
+        # The config can change later; the forecast keeps the declaration behind its label.
+        declared = {"local:qwen3:14b": {"training_cutoff": "2024-12-01"}}
+        forecast = self.observe(
+            "e1",
+            "local",
+            "qwen3:14b",
+            transport=Engine(completion(model="qwen3:14b")),
+            overrides=declared,
+        )
+        basis = {
+            "training_cutoff": "2024-12-01",
+            "origin": "declared",
+            "source": "declared in config",
+        }
+        self.assertEqual(forecast["eligibility"], "post_cutoff")
+        self.assertEqual(forecast["eligibility_basis"], {"key": "local:qwen3:14b", **basis})
+        card = brief.filing_card(self.ledger, "e1", now=f"{self.days[26]}T12:00:00Z")
+        self.assertEqual(card["decisions"][0]["evidence_basis"], basis)
+        self.assertIn(
+            "Evidence basis: training cutoff 2024-12-01 · declared in your config",
+            brief.render_filing_html(card),
+        )
 
     def test_identity_rules_are_unchanged_and_old_records_are_kept(self):
         forecast = self.observe("e1")
@@ -360,6 +423,7 @@ class WiringTests(TempHome):
                 STRATEGY,
             )
             self.assertIsNone(paid.observe.keywords["base_url"])
+            self.assertEqual(paid.observe.keywords["overrides"], declared)
             self.assertEqual(paid.price("openai", "gpt-x"), (2.5, None))
             self.assertEqual(paid.price("jev", "jev-1.13.0"), (None, None))
             self.assertEqual(paid.price("local", "gpt-oss:120b"), (0.0, 0.0))
@@ -389,6 +453,16 @@ class WiringTests(TempHome):
         self.assertEqual(calls[0]["limit"], daemon.OBSERVE_LIMIT)
         self.assertEqual(record["counts"]["cap_usd_month"], 5.0)
 
+    def test_the_service_observes_with_the_configured_calibrator(self):
+        # Without it every service decision is WATCH; the real queue must receive it.
+        with Ledger(":memory:") as ledger:
+            ctx = app.daemon_context(
+                ledger, {"calibrator": "ridge-missing"}, STRATEGY, log=lambda line: None
+            )
+            record = daemon.run_job("observe", ctx)
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("Unknown calibrator: ridge-missing", record["error"])
+
 
 class ReadSideTests(TempHome):
     def setUp(self):
@@ -408,11 +482,23 @@ class ReadSideTests(TempHome):
         self.config = settings.validate({"sec_user_agent": UA, "watchlist": ["ABC"]})
 
     def test_mcp_handlers_read_without_writing(self):
+        before = hashlib.sha256(Path(self.path).read_bytes()).hexdigest()
         handlers = app.mcp_handlers(self.path, self.config, clock=lambda: self.now)
         self.assertEqual(
             set(handlers),
             {"today_brief", "explain_filing", "evidence_report", "health", "search_filings"},
         )
+        # Every call opens the ledger read-only; a writable open would add nothing to head().
+        opened = []
+        real_init = Ledger.__init__
+
+        def spy(ledger, path, **kwargs):
+            opened.append(kwargs.get("readonly", False))
+            real_init(ledger, path, **kwargs)
+
+        spying = patch.object(Ledger, "__init__", spy)
+        spying.start()
+        self.addCleanup(spying.stop)
         today = handlers["today_brief"]({})
         self.assertEqual(today["total"], 1)
         card = handlers["explain_filing"]({"event_id": "sec:0000000001-26-000001:ex99.htm"})
@@ -420,13 +506,39 @@ class ReadSideTests(TempHome):
         self.assertNotIn("text", card)
         found = handlers["search_filings"]({"symbol": "ABC", "limit": 5})
         self.assertEqual(found["total"], 1)
+        self.assertTrue(found["filings"][0]["watchlist"])  # ABC is on the config's watchlist
         self.assertEqual(handlers["search_filings"]({"symbol": "XYZ", "limit": 5})["total"], 0)
         self.assertEqual(handlers["evidence_report"]({})["status"], "collecting")
         self.assertTrue(handlers["health"]({})["ledger"]["ok"])
         with self.assertRaisesRegex(ValueError, "No filing"):
             handlers["explain_filing"]({"event_id": "missing"})
+        self.assertEqual(opened, [True] * 7)  # one read-only open per call
+        spying.stop()
+        self.assertEqual(hashlib.sha256(Path(self.path).read_bytes()).hexdigest(), before)
         with Ledger(self.path, readonly=True) as ledger:
             self.assertEqual(ledger.head(), self.head)
+        missing = self.dir / "absent" / "absent.sqlite"
+        absent = app.mcp_handlers(str(missing), self.config)
+        arguments = {"explain_filing": {"event_id": "x"}, "search_filings": {"symbol": "ABC"}}
+        for name, handler in absent.items():
+            with self.subTest(tool=name):
+                with self.assertRaisesRegex(ValueError, "run `jevtrader setup` first"):
+                    handler(arguments.get(name, {}))
+        self.assertFalse(missing.parent.exists())
+
+    def test_today_brief_covers_the_window_its_description_names(self):
+        described = {tool["name"]: tool["description"] for tool in mcp_server.TOOLS}
+        self.assertIn(f"first seen in the last {web.LOOKBACK.days} days", described["today_brief"])
+        self.assertNotIn("previous brief", described["today_brief"])
+        with Ledger(self.path) as ledger:
+            early = timestamp((datetime.fromisoformat(self.now) - web.LOOKBACK).isoformat())
+            ledger.disclosure(
+                event("early", self.now[:10], symbol="XYZ")
+                | {"published_at": early, "first_seen_at": early}
+            )
+        today = app.mcp_handlers(self.path, self.config, clock=lambda: self.now)["today_brief"]({})
+        self.assertNotIn("early", [filing["event_id"] for filing in today["filings"]])
+        self.assertEqual(today["since"], early)
 
     def test_mcp_never_hands_a_filer_instruction_to_the_client(self):
         # The lexicon phrase would make this the preferred quote without the directive filter.
@@ -527,6 +639,43 @@ class ServiceTests(TempHome):
         with self.assertRaisesRegex(ValueError, "SEC name"):
             app.backfill("r", settings.validate({}), date(2026, 1, 5), date(2026, 1, 6))
 
+    def test_backfill_scans_the_watchlist_unless_symbols_or_universe_all_say_otherwise(self):
+        # Without a scope, one backfill would fetch every 8-K (up to 500 filings) from the SEC.
+        research = str(self.dir / "r.sqlite")
+        Ledger(research).close()
+        watchlist = settings.validate({"sec_user_agent": UA, "watchlist": ["ABC", "XYZ"]})
+        everything = settings.validate({"sec_user_agent": UA, "universe": "all"})
+        for config, symbols, expected in (
+            (watchlist, None, {"ABC", "XYZ"}),
+            (watchlist, ["QQQ"], {"QQQ"}),
+            (everything, None, None),
+        ):
+            with self.subTest(universe=config["universe"], symbols=symbols):
+                with patch.object(app.feeds, "backfill", return_value={"added": []}) as backfill:
+                    app.backfill(
+                        research, config, date(2026, 1, 5), date(2026, 1, 6), symbols=symbols
+                    )
+                self.assertEqual(backfill.call_args.kwargs["symbols"], expected)
+
+
+class BackfillBarsTests(TempHome):
+    def test_backfill_bars_use_the_strategy_benchmark(self):
+        settings.save({"sec_user_agent": UA, "watchlist": ["ABC"]})
+        Ledger(paths.research_ledger_path()).close()
+        strategy = self.dir / "strategy.json"
+        strategy.write_text(json.dumps({**load_strategy(), "benchmark": "QQQ"}))
+        with (
+            patch.object(app.feeds, "backfill", return_value={"added": []}),
+            patch.object(app.bars, "fetch_historical", return_value={"added": 0}) as fetch,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = main(
+                ["--strategy", str(strategy), "backfill", "--start", "2026-01-05"]
+                + ["--end", "2026-01-06", "--bars"]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(fetch.call_args.kwargs["benchmark"], "QQQ")
+
 
 class DoctorTests(TempHome):
     def test_a_fresh_install_reports_what_to_do(self):
@@ -566,23 +715,127 @@ class DoctorTests(TempHome):
         self.assertIn("Local engine", " ".join(down["problems"]))
 
     def test_paid_provider_without_a_price_is_reported(self):
-        settings.save({"sec_user_agent": UA, "provider": "jev"})
+        settings.save({"sec_user_agent": UA, "provider": "jev", "bars_source": "alpaca"})
         Ledger(settings.ledger_path(settings.load())).close()
-        report = app.doctor(
-            launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain({"TYPESAFE_API_KEY": "k"})
-        )
+        keys = FakeKeychain({"TYPESAFE_API_KEY": "k", **dict.fromkeys(app.ALPACA_KEYS, "a")})
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=keys)
         self.assertEqual(report["problems"], [report["problems"][0]])
         self.assertIn("No input- and output-token prices", report["problems"][0])
         # An input price alone still cannot bound spend; both are reported.
         prices = {"jev:jev-1.13.0": {"usd_per_million_input_tokens": 1.5}}
         settings.save({**settings.load(), "model_overrides": prices})
-        report = app.doctor(
-            launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain({"TYPESAFE_API_KEY": "k"})
-        )
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=keys)
         check = report["checks"]["provider"]
         self.assertEqual(check["usd_per_million_input_tokens"], 1.5)
         self.assertIsNone(check["usd_per_million_output_tokens"])
         self.assertIn("output-token prices", report["problems"][0])
+
+    def ready(self, **changes):
+        """A saved alpaca-backed config, its empty ledger and a Keychain holding its keys."""
+        settings.save({"sec_user_agent": UA, "bars_source": "alpaca", **changes})
+        path = settings.ledger_path(settings.load())
+        Ledger(path).close()
+        return path, FakeKeychain(dict.fromkeys(app.ALPACA_KEYS, "a"))
+
+    def test_without_bars_doctor_says_nothing_will_be_scored(self):
+        settings.save({"sec_user_agent": UA, "watchlist": ["ABC"]})
+        Ledger(settings.ledger_path(settings.load())).close()
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain())
+        self.assertEqual(report["problems"], [app.NO_BARS])
+        self.assertIn("never scored", app.NO_BARS)
+        self.assertFalse(report["checks"]["bars"]["ok"])
+        _, keys = self.ready()
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=keys)
+        self.assertTrue(report["ok"], report["problems"])
+
+    def test_an_invalid_config_is_the_only_problem_and_skips_what_reads_it(self):
+        # Defaults would add a spurious "SEC name and email are not set".
+        paths.config_path().parent.mkdir(parents=True)
+        # A missing comma, not a trailing one: Python 3.13 reports trailing commas
+        # at a different position than 3.11/3.12 do.
+        paths.config_path().write_text('{\n  "watchlist": ["ABC"]\n  "provider": "rules"\n}\n')
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain())
+        [problem] = report["problems"]
+        self.assertRegex(problem, r"^Config: .* is not valid JSON: .* \(line 3, column 3\)$")
+        for name in ("sec_user_agent", "ledger", "provider", "keys", "bars"):
+            self.assertIsNone(report["checks"][name]["ok"], name)
+        path = self.dir / "given.sqlite"
+        Ledger(path).close()
+        report = app.doctor(
+            str(path), launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain()
+        )
+        self.assertTrue(report["checks"]["ledger"]["ok"])  # an explicit --db is still checked
+
+    def test_a_service_that_stopped_recording_runs_is_a_problem(self):
+        path, keys = self.ready()
+        before = timestamp((datetime.now(timezone.utc) - timedelta(hours=42)).isoformat())
+        with Ledger(path) as ledger:
+            record = {"job": "poll", "started_at": before, "finished_at": before, "status": "ok"}
+            ledger.put("runs", f"poll:{before}", record)
+        report = app.doctor(launchd_runner=FakeLaunchctl(loaded=True), keychain_runner=keys)
+        self.assertEqual(
+            report["problems"], ["No background runs for 42 h; is the service running?"]
+        )
+        self.assertEqual(report["checks"]["ledger"]["health"], "attention")
+
+    def test_a_loaded_service_that_is_not_running_is_a_problem(self):
+        _, keys = self.ready()
+        stopped = FakeLaunchctl(
+            loaded=True, printed="\tstate = not running\n\tlast exit code = 78: EX_CONFIG\n"
+        )
+        report = app.doctor(launchd_runner=stopped, keychain_runner=keys)
+        [problem] = report["problems"]
+        self.assertIn("loaded but not running (last exit code 78)", problem)
+        self.assertIn(str(paths.log_dir() / "daemon.err.log"), problem)
+        restarted = FakeLaunchctl(loaded=True, printed="\tstate = running\n\tlast exit code = 1\n")
+        report = app.doctor(launchd_runner=restarted, keychain_runner=keys)
+        self.assertTrue(report["ok"], report["problems"])  # it runs now; the exit is history
+        self.assertIn("restarted after an exit (last exit code 1)", " ".join(report["notes"]))
+        plist = launchd.plist_path(home=self.dir)
+        plist.parent.mkdir(parents=True)
+        plist.write_text("")
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=keys, home=self.dir)
+        self.assertEqual(len(report["problems"]), 1)
+        self.assertIn("installed but not loaded", report["problems"][0])
+
+    def test_the_configured_calibrator_is_checked_against_the_service_ledger(self):
+        path, keys = self.ready()
+        with Ledger(path) as ledger:
+            days = seed(ledger)
+            ledger.disclosure(event("e1", days[25]))
+            forecast = engine.observe(ledger, "e1", STRATEGY, as_of=f"{days[25]}T21:30:00Z")
+            model = {
+                "model_id": "ridge-1",
+                "version": VERSION,
+                "extractor_key": forecast["extractor_key"],
+                "cutoff": f"{days[30]}T00:00:00Z",
+            }
+            ledger.put("models", "ridge-1", model)
+            ledger.put("models", "ridge-0", {**model, "model_id": "ridge-0", "version": "old"})
+
+        def doctor(**changes):
+            settings.save({**settings.load(), **changes})
+            return app.doctor(
+                launchd_runner=FakeLaunchctl(), keychain_runner=keys, local_transport=Engine()
+            )
+
+        report = doctor(calibrator=None)
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertIn("every service decision is WATCH", " ".join(report["notes"]))
+        self.assertIn(f"--db {path} fit", " ".join(report["notes"]))
+        report = doctor(calibrator="ridge-1")
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertEqual(report["checks"]["ledger"]["calibrator"]["ok"], True)
+        self.assertNotIn("WATCH", " ".join(report["notes"]))
+        for calibrator, provider, expected in (
+            ("ridge-9", "rules", "is not in"),
+            ("ridge-0", "rules", "re-fit it"),
+            ("ridge-1", "local", "fit on rules:rules-v1 features, but the service uses local:"),
+        ):
+            with self.subTest(calibrator=calibrator, provider=provider):
+                report = doctor(calibrator=calibrator, provider=provider)
+                self.assertEqual(len(report["problems"]), 1, report["problems"])
+                self.assertIn(expected, report["problems"][0])
 
 
 class SetupTests(TempHome):
@@ -633,6 +886,7 @@ class SetupTests(TempHome):
         self.assertTrue(any("sec.gov" in line for line in said))
         self.assertTrue(any("is required" in line for line in said))
         self.assertNotIn("secret-key", json.dumps(result) + " ".join(said))
+        self.assertFalse(any(app.NO_BARS in line for line in said))
 
     def test_paid_preset_records_cap_and_prices(self):
         answers = [UA, "none", "all", "4", "gpt-x", "12", "2.5", "10", "n", "", "", "n"]
@@ -650,6 +904,7 @@ class SetupTests(TempHome):
             },
         )
         self.assertTrue(any("input and output prices" in line for line in said))
+        self.assertIn(f"Note: {app.NO_BARS}.", said)  # Return through the Alpaca question
         self.assertEqual(result["keys_stored"], [])  # blank key skipped
         self.assertIsNone(result["service"])
         answers = [UA, "none", "all", "4", "gpt-x", "12", "2.5", "none", "n", "", "", "n"]
@@ -666,6 +921,52 @@ class SetupTests(TempHome):
         with self.assertRaisesRegex(ValueError, "nothing was saved"):
             app.setup(ask=ask, say=lambda line: None, keychain_runner=FakeKeychain())
         self.assertFalse(paths.config_path().exists())
+
+    def test_cancelling_at_a_key_prompt_stores_no_key_either(self):
+        def secret(prompt):
+            if prompt.startswith("ALPACA_API_SECRET_KEY"):
+                raise KeyboardInterrupt
+            return "key-id"
+
+        replies = iter([UA, "abc", "", "1", "y", "", ""])  # rules, Alpaca bars
+        keychain = FakeKeychain()
+        with self.assertRaisesRegex(ValueError, "nothing was saved"):
+            app.setup(
+                ask=lambda prompt: next(replies),
+                ask_secret=secret,
+                say=lambda line: None,
+                keychain_runner=keychain,
+                launchd_runner=FakeLaunchctl(),
+            )
+        self.assertEqual(keychain.items, {})
+        self.assertFalse(paths.config_path().exists())
+        self.assertFalse(paths.ledger_path().exists())
+        self.assertFalse(paths.research_ledger_path().exists())
+
+    def test_cancelling_the_last_question_keeps_the_setup_and_skips_the_service(self):
+        replies = iter([UA, "none", "all", "1", "n", "", ""])
+
+        def ask(prompt):
+            try:
+                return next(replies)
+            except StopIteration:
+                raise EOFError from None
+
+        said, launchctl = [], FakeLaunchctl()
+        result = app.setup(
+            ask=ask,
+            say=said.append,
+            keychain_runner=FakeKeychain(),
+            launchd_runner=launchctl,
+            program=["/usr/bin/python3", "-m", "jevtrader", "daemon"],
+            home=self.dir,
+        )
+        self.assertIsNone(result["service"])
+        self.assertFalse(launchctl.loaded)
+        self.assertEqual(settings.load()["sec_user_agent"], UA)
+        self.assertTrue(Path(result["ledger_path"]).is_file())
+        self.assertIn("not started", said[-1])
+        self.assertFalse(any("nothing was saved" in line for line in said))
 
 
 class CLITests(TempHome):
@@ -705,6 +1006,27 @@ class CLITests(TempHome):
         code, result, error = self.command("status")
         self.assertEqual((code, result["counts"]), (0, {}), error)
 
+    def test_research_commands_name_the_service_ledger_instead_of_a_stray_init(self):
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, cwd)
+        code, _, error = self.command("show", "forecasts", "f1")
+        self.assertEqual(code, 2)
+        self.assertIn("run `jevtrader setup` for the service's ledger", error)
+        path = self.configure()
+        code, _, error = self.command("show", "forecasts", "f1")
+        self.assertEqual(code, 2)
+        self.assertIn(f"The service's ledger is {path}", error)
+        self.assertIn(f"`jevtrader --db {shlex.quote(path)} show ...`", error)
+        self.assertNotIn("init", error)
+        code, _, error = self.command("--db", "typo.sqlite", "status")
+        self.assertEqual(code, 2)
+        self.assertIn("No ledger at typo.sqlite; check --db", error)
+        self.assertFalse((self.dir / "data").exists())
+        self.assertFalse((self.dir / "typo.sqlite").exists())
+        code, result, error = self.command("--db", path, "show", "forecasts", "f1")
+        self.assertIn("Record not found", error)
+
     def test_keys_are_loaded_only_for_commands_that_can_use_them(self):
         path = self.configure()
         with patch("jevtrader.secrets.export_to_environ", return_value=[]) as export:
@@ -714,7 +1036,8 @@ class CLITests(TempHome):
             export.assert_called_once()
 
     def test_observe_local_passes_the_configured_engine(self):
-        path = self.configure(local_base_url="http://127.0.0.1:1234/v1")
+        declared = {"local:qwen3:14b": {"training_cutoff": "2024-12-01"}}
+        path = self.configure(local_base_url="http://127.0.0.1:1234/v1", model_overrides=declared)
         with Ledger(path) as ledger:
             days = seed(ledger)
             ledger.disclosure(event("e1", days[25]))
@@ -722,9 +1045,11 @@ class CLITests(TempHome):
             self.command("--db", path, "observe", "--replay", "--provider", "local")
         self.assertEqual(observer.call_args.kwargs["base_url"], "http://127.0.0.1:1234/v1")
         self.assertEqual(observer.call_args.kwargs["model"], local.DEFAULT_MODEL)
+        self.assertEqual(observer.call_args.kwargs["overrides"], declared)  # declared cutoffs
         with patch("jevtrader.cli.observe", return_value={}) as observer:
             self.command("--db", path, "observe", "--replay")
         self.assertNotIn("base_url", observer.call_args.kwargs)
+        self.assertEqual(observer.call_args.kwargs["overrides"], declared)
 
     def test_poll_records_a_skipped_run_and_yields_to_a_running_daemon(self):
         path = self.configure(sec_user_agent="")
@@ -734,10 +1059,15 @@ class CLITests(TempHome):
         self.assertIn("sec_user_agent", result["error"])
         with Ledger(path, readonly=True) as ledger:
             self.assertEqual([r["job"] for r in ledger.all("runs")], ["poll"])
-        with daemon.single_writer():
+        with daemon.single_writer(role="daemon"):
             code, _, error = self.command("poll")
         self.assertEqual(code, 2)
         self.assertIn("background service is running", error)
+        with daemon.single_writer(role="job"):  # another poll or bars run from a terminal
+            code, _, error = self.command("bars")
+        self.assertEqual(code, 2)
+        self.assertIn("one-off jevtrader job is running", error)
+        self.assertIn("try again when it finishes", error)
 
     def test_brief_notify_and_mcp(self):
         self.configure()
@@ -769,7 +1099,8 @@ class CLITests(TempHome):
         self.assertTrue(replies[1]["result"]["structuredContent"]["ledger"]["ok"])
 
     def test_doctor_up_and_down_never_touch_the_real_home(self):
-        self.configure()
+        self.configure(bars_source="alpaca")
+        os.environ.update(dict.fromkeys(app.ALPACA_KEYS, "test-key"))  # restored by TempHome
         launchctl = FakeLaunchctl()
         with (
             patch.object(Path, "home", return_value=self.dir),
@@ -809,6 +1140,9 @@ class HealthAndSearchTests(unittest.TestCase):
 
     def test_a_gap_needs_attention_for_a_day_then_stays_listed(self):
         self.gap("2026-03-09T02:00:00Z", "2026-03-09T13:00:00Z")
+        for polled in ("2026-03-09T19:59:00Z", "2026-03-10T12:59:00Z"):  # the service runs on
+            run = {"job": "poll", "started_at": polled, "finished_at": polled, "status": "ok"}
+            self.ledger.put("runs", f"poll:{polled}", run)
         fresh = brief.health(self.ledger, now="2026-03-09T20:00:00Z")
         self.assertEqual(fresh["attention"], ["coverage_gap"])
         later = brief.health(self.ledger, now="2026-03-10T13:00:01Z")
@@ -837,7 +1171,7 @@ class DaemonCommandTests(TempHome):
         before = signal.getsignal(signal.SIGTERM)
         stdout, stderr = io.StringIO(), io.StringIO()
         with (
-            daemon.single_writer(),
+            daemon.single_writer(role="daemon"),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
         ):
@@ -845,6 +1179,21 @@ class DaemonCommandTests(TempHome):
         self.assertTrue(json.loads(stdout.getvalue())["already_running"])
         self.assertIn("already running", stderr.getvalue())
         self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_a_one_off_job_that_outlasts_the_wait_is_a_failed_exit(self):
+        # launchd's KeepAlive restarts only failed exits; exiting 0 would leave it down.
+        settings.save({"sec_user_agent": UA})
+        Ledger(settings.ledger_path(settings.load())).close()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            daemon.single_writer(role="job"),
+            patch.object(daemon, "LOCK_WAIT_SECONDS", 0),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertNotEqual(main(["daemon"]), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("one-off jevtrader job is running", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -773,7 +773,8 @@ class CLITests(TempHome):
         launchctl = FakeLaunchctl()
         with (
             patch.object(Path, "home", return_value=self.dir),
-            patch("jevtrader.launchd._run", launchctl),
+            # The fake stands in for launchctl, so this runs on any OS.
+            patch("jevtrader.launchd._runner", lambda runner: runner or launchctl),
         ):
             code, report, _ = self.command("doctor")
             self.assertEqual(code, 0, report["problems"])
@@ -784,6 +785,17 @@ class CLITests(TempHome):
             self.assertEqual((code, result["removed"]), (0, True), error)
         program = [call for call in launchctl.calls if call[1] == "bootstrap"]
         self.assertEqual(len(program), 1)
+
+    def test_up_refuses_cleanly_off_macos(self):
+        self.configure()
+        with (
+            patch.object(Path, "home", return_value=self.dir),
+            patch("jevtrader.launchd.sys.platform", "linux"),
+        ):
+            code, _, error = self.command("up")
+        self.assertEqual(code, 2)
+        self.assertIn("only available on macOS", error)
+        self.assertFalse((self.dir / "Library" / "LaunchAgents").exists())
 
 
 class HealthAndSearchTests(unittest.TestCase):

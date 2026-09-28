@@ -25,7 +25,6 @@ GATE = {"version": 1, "min_matured_calls": 100, "confidence": 0.90, "futility_up
 ACTIONS = ("WATCH", "PASS", "LONG", "SHORT")
 CALL_SIGNS = {"LONG": 1, "SHORT": -1}
 STATUSES = ("collecting", "inconclusive", "supported", "no_edge")
-MARKET_ZONE = EASTERN
 METHOD = (
     "Student t interval on per-decision-date mean net returns (decision dates in New York "
     "time), so calls made on the same day count once; net = sign x target - round-trip cost"
@@ -229,7 +228,7 @@ def scoreboard(ledger, *, as_of: str, eligible: Callable[[dict], bool] | None = 
             pending += 1
             continue
         value = _net(forecast, outcome, CALL_SIGNS[action])
-        day = instant(forecast["decision_at"]).astimezone(MARKET_ZONE).date().isoformat()
+        day = instant(forecast["decision_at"]).astimezone(EASTERN).date().isoformat()
         by_date.setdefault(day, []).append(value)
         nets.append(value)
     interval = _interval(by_date, gate["confidence"])

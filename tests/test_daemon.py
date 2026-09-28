@@ -1,8 +1,8 @@
 """The daemon schedule, job records, spend cap and loop; every adapter is a fake, nothing leaves."""
 
+import contextlib
 import copy
 import fcntl
-import importlib
 import json
 import os
 import stat
@@ -14,9 +14,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jevtrader import config as settings
-from jevtrader import daemon, secrets
+from jevtrader import bars, brief, daemon, feeds, notify, secrets
+from jevtrader.common import EASTERN as ET
 from jevtrader.common import canonical, load_strategy, timestamp
-from jevtrader.daemon import ET, Context, due_jobs, run_job
+from jevtrader.daemon import Context, due_jobs, run_job
 from jevtrader.store import Ledger
 
 UA = "Research Person research@example.com"
@@ -105,17 +106,23 @@ class Fakes:
         self.brief_result = {"filings": [{"id": "a"}, {"id": "b"}]}
         self.index_rows = []
         self.notify_result = True
+        self.benchmarks = []
+        self.out_of_time = []
+        self.calibrators = []
 
     def poll(self, ledger, user_agent, *, symbols):
         self.calls.append(("poll", user_agent, symbols))
         return self.poll_result
 
-    def bars(self, ledger, symbols, *, now, feed):
+    def bars(self, ledger, symbols, *, now, feed, benchmark):
         self.calls.append(("bars", list(symbols), now, feed))
+        self.benchmarks.append(benchmark)
         return {"symbols": len(symbols) + 1, "added": 4, "skipped": 1, "errors": []}
 
-    def observe(self, ledger, strategy, *, provider, model, limit):
+    def observe(self, ledger, strategy, *, provider, model, calibrator, limit, out_of_time):
         self.calls.append(("observe", provider, model, limit))
+        self.calibrators.append(calibrator)
+        self.out_of_time.append(out_of_time)
         return self.observe_result
 
     def settle(self, ledger, *, as_of):
@@ -149,7 +156,7 @@ def context(ledger=None, clock=None, fakes=None, config=None, price=None, **chan
     return Context(
         ledger=ledger if ledger is not None else FakeLedger(),
         config=config or conf(),
-        strategy=STRATEGY,
+        strategy=changes.pop("strategy", STRATEGY),
         clock=clock or Clock(et("2026-09-28", 9, 30)),
         poll=fakes.poll,
         bars=fakes.bars,
@@ -418,28 +425,22 @@ class RunJobTests(IsolatedTest):
         with self.assertRaises(ValueError):
             Context(ledger=FakeLedger(), config=conf(), strategy={"version": 1})
 
-    def test_default_adapters_name_the_contract_functions(self):
+    def test_default_adapters_are_the_contract_functions(self):
         ctx = Context(ledger=FakeLedger(), config=conf(), strategy=STRATEGY)
-        self.assertIs(ctx.observe, daemon.pipeline.observe_queue)
-        self.assertIs(ctx.settle, daemon.engine.settle)
-        self.assertIs(ctx.price, daemon.registry_price)
         expected = {
-            "poll": "feeds.poll",
-            "bars": "bars.fetch_forward",
-            "brief": "brief.compose",
-            "render": "brief.render_text",
-            "notify": "notify.macos",
-            "reconcile": "feeds.daily_index",
+            "poll": feeds.poll,
+            "bars": bars.fetch_forward,
+            "observe": daemon.pipeline.observe_queue,
+            "settle": daemon.engine.settle,
+            "brief": brief.compose,
+            "render": brief.render_text,
+            "notify": notify.macos,
+            "reconcile": feeds.daily_index,
+            "price": daemon.registry_price,
         }
         for field, target in expected.items():
             with self.subTest(field=field):
-                self.assertEqual(getattr(ctx, field).__name__, target)
-                module, name = target.split(".")
-                try:
-                    loaded = importlib.import_module(f"jevtrader.{module}")
-                except ImportError:
-                    continue  # built by another stage; the lazy default resolves later
-                self.assertTrue(callable(getattr(loaded, name)))
+                self.assertIs(getattr(ctx, field), target)
 
     def test_brief_counts_all_new_filings_not_only_those_displayed(self):
         fakes = Fakes()
@@ -447,7 +448,7 @@ class RunJobTests(IsolatedTest):
         record = run_job("brief", context(fakes=fakes, config=conf(notify=False)))
         self.assertEqual(record["counts"]["filings"], 40)
 
-    def test_bars_symbols_are_watchlist_then_recent_forward_filings(self):
+    def test_bars_symbols_settle_open_forecasts_then_watchlist_then_recent_filings(self):
         ledger, fakes = FakeLedger(), Fakes()
         now = et("2026-09-28", 16, 30)
         for identity, symbol, mode, seen in (
@@ -462,13 +463,100 @@ class RunJobTests(IsolatedTest):
                 identity,
                 {"id": identity, "symbol": symbol, "mode": mode, "first_seen_at": iso(seen)},
             )
-        record = run_job("bars", context(ledger, Clock(now), fakes))
-        self.assertEqual(fakes.calls, [("bars", ["ABC", "XYZ", "NEW", "MID"], iso(now), "sip")])
-        self.assertEqual(record["counts"], {"symbols": 5, "added": 4, "skipped": 1, "errors": 0})
+
+        def forecast(identity, symbol, age_days, *, benchmark="SPY", mode="forward"):
+            record = {
+                "id": identity,
+                "symbol": symbol,
+                "mode": mode,
+                "decision_at": iso(now - timedelta(days=age_days)),
+                "strategy": {**STRATEGY, "benchmark": benchmark},
+            }
+            ledger.put("forecasts", identity, record)
+
+        # An open forward forecast needs its symbol and its own strategy's benchmark until
+        # it settles, even when its filing fell out of the recent-filings window.
+        forecast("f1", "LATE", 3)
+        forecast("f2", "EARLY", 59, benchmark="QQQ")
+        forecast("f3", "DONE", 5)
+        ledger.put("outcomes", "f3", {"forecast_id": "f3"})
+        forecast("f4", "REPLAY", 5, mode="historical")
+        forecast("f5", "GONE", 61)
+        strategy = {**STRATEGY, "benchmark": "IWM"}
+        record = run_job("bars", context(ledger, Clock(now), fakes, strategy=strategy))
+        symbols = ["IWM", "EARLY", "QQQ", "LATE", "SPY", "ABC", "XYZ", "NEW", "MID"]
+        self.assertEqual(fakes.calls, [("bars", symbols, iso(now), "sip")])
+        self.assertEqual(fakes.benchmarks, ["IWM"])  # the strategy's, not the SPY default
+        self.assertEqual(record["counts"], {"symbols": 10, "added": 4, "skipped": 1, "errors": 0})
         fakes = Fakes()
         record = run_job("bars", context(fakes=fakes, config=conf(bars_source="none")))
         self.assertEqual(record["status"], "skipped")
         self.assertEqual(fakes.calls, [])
+
+    def test_bars_window_covers_a_long_label_horizon(self):
+        ledger, fakes = FakeLedger(), Fakes()
+        now = et("2026-09-28", 16, 30)
+        ledger.put(
+            "forecasts",
+            "f",
+            {
+                "id": "f",
+                "symbol": "SLOW",
+                "mode": "forward",
+                "decision_at": iso(now - timedelta(days=95)),
+                "strategy": STRATEGY,
+            },
+        )
+        ledger.put(
+            "disclosures",
+            "d",
+            {
+                "id": "d",
+                "symbol": "SEEN",
+                "mode": "forward",
+                "first_seen_at": iso(now - timedelta(days=95)),
+            },
+        )
+        for horizon, expected in ((10, []), (60, ["SLOW", "SEEN"])):
+            with self.subTest(horizon=horizon):
+                fakes = Fakes()
+                strategy = {**STRATEGY, "horizon_sessions": horizon}  # 60 sessions: 98 days
+                run_job(
+                    "bars",
+                    context(
+                        ledger, Clock(now), fakes, config=conf(watchlist=[]), strategy=strategy
+                    ),
+                )
+                self.assertEqual(fakes.calls[0][1], ["SPY", *expected])
+
+    def test_observe_starts_no_new_event_after_its_time_budget(self):
+        # A slow local model must not hold up polling; the rest of the queue waits a tick.
+        clock, seen = Clock(et("2026-09-28", 10, 0)), []
+
+        def observe(ledger, strategy, *, out_of_time, **kwargs):
+            seen.append(out_of_time())
+            clock.advance(daemon.OBSERVE_BUDGET_SECONDS - 1)
+            seen.append(out_of_time())
+            clock.advance(1)
+            seen.append(out_of_time())
+            return {"forecasts": [{"id": "f"}], "errors": [], "skipped": {"out_of_time": True}}
+
+        ctx = context(clock=clock)
+        ctx.observe = observe
+        record = run_job("observe", ctx)
+        self.assertEqual(seen, [False, False, True])
+        self.assertEqual((record["status"], record["counts"]["out_of_time"]), ("ok", 1))
+        current = {}
+        daemon.remember(current, record)
+        self.assertTrue(current["pending"]["observe"])  # 1 of 10 done: more is queued
+
+    def test_observe_uses_the_configured_calibrator(self):
+        # Without one every service decision is WATCH and the evidence gate can never move.
+        for calibrator in (None, "ridge-1"):
+            with self.subTest(calibrator=calibrator):
+                fakes = Fakes()
+                run_job("observe", context(fakes=fakes, config=conf(calibrator=calibrator)))
+                self.assertEqual(fakes.calibrators, [calibrator])
 
     def test_observe_with_free_providers_uses_the_default_limit(self):
         for provider, model in (("rules", "rules-v1"), ("local", "gpt-oss:120b")):
@@ -674,6 +762,21 @@ class SpendCapTests(IsolatedTest):
             "a1",
             {"provider": "jev", "requested_model": "m", "attempted_at": "2026-08-20T00:00:00Z"},
         )
+        # A model with no known price any more (e.g. retired) counts at the service's rates.
+        unpriced = self.extraction("2026-09-18T00:00:00Z", 2_000, "openai", 300)
+        unpriced.update(
+            resolved_model="old-2025", spec={"provider": "openai", "requested_model": "old"}
+        )
+        ledger.put("extractions", "e-unpriced", unpriced)
+        ledger.put(
+            "attempts",
+            "a2",
+            {
+                "provider": "openai",
+                "requested_model": "old",
+                "attempted_at": "2026-09-19T00:00:00Z",
+            },
+        )
         prices = {("jev", "m"): (1.0, 4.0), ("openai", "m-2026"): (3.0, 12.0)}
         spent = daemon.month_spend(
             ledger,
@@ -688,6 +791,8 @@ class SpendCapTests(IsolatedTest):
             + 25_001 * 1.0
             + (1_000 * 1.0 + worst_out * 4.0)
             + (worst_in * 1.0 + worst_out * 4.0)
+            + (2_000 * 100.0 + 300 * 100.0)
+            + (worst_in * 100.0 + worst_out * 100.0)
         ) / 1e6
         self.assertAlmostEqual(spent, expected)
 
@@ -701,11 +806,11 @@ class SpendCapTests(IsolatedTest):
                     return {}
                 return {"usd_per_million_input_tokens": 1.5, "usd_per_million_output_tokens": 6.0}
 
-        with patch.object(daemon.importlib, "import_module", return_value=Registry):
+        with patch.object(daemon.registry, "lookup", Registry.lookup):
             self.assertEqual(daemon.registry_price("jev", "jev-1.13.0"), (1.5, 6.0))
             self.assertEqual(daemon.registry_price("openai", "gpt"), (None, None))
             self.assertIsNone(daemon.registry_price("jev", "missing"))
-        with patch.object(daemon.importlib, "import_module", side_effect=ImportError):
+        with patch.object(daemon.registry, "lookup", side_effect=KeyError("jev")):
             self.assertIsNone(daemon.registry_price("jev", "jev-1.13.0"))
         self.assertEqual(daemon.registry_price("jev", "jev-1.13.0"), (None, None))
         self.assertEqual(daemon.registry_price("rules", "rules-v1"), (0.0, 0.0))
@@ -809,14 +914,15 @@ class LoopTests(IsolatedTest):
             ],
         )
 
-    def test_second_writer_is_refused_and_lock_is_released_after_stop(self):
+    def test_second_daemon_is_refused_at_once_and_lock_is_released_after_stop(self):
         lock = self.dir / "daemon.lock"
-        ledger = FakeLedger()
-        with daemon.single_writer(lock):
+        ledger, sleeps = FakeLedger(), []
+        with daemon.single_writer(lock, role="daemon"):
             self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
-            self.assertEqual(lock.read_text(), f"{os.getpid()}\n")
-            with self.assertRaisesRegex(daemon.AlreadyRunning, "already running"):
-                daemon.run_forever(context(ledger), lock_path=lock, sleep=lambda s: None)
+            self.assertEqual(lock.read_text(), f"{os.getpid()} daemon\n")
+            with self.assertRaisesRegex(daemon.AlreadyRunning, "already running") as refused:
+                daemon.run_forever(context(ledger), lock_path=lock, sleep=sleeps.append)
+        self.assertEqual((refused.exception.holder, sleeps), ("daemon", []))
         self.assertEqual(ledger.records, {})
         stop = threading.Event()
         stop.set()
@@ -826,6 +932,61 @@ class LoopTests(IsolatedTest):
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # free again
         finally:
             os.close(handle)
+        with self.assertRaises(ValueError):
+            with daemon.single_writer(lock, role="other"):
+                pass
+
+    def test_daemon_waits_for_a_one_off_job_instead_of_exiting(self):
+        # launchd restarts only failed exits: a clean exit here would leave the service down.
+        lock, stop = self.dir / "daemon.lock", threading.Event()
+        ledger, clock = FakeLedger(), Clock(et("2026-09-28", 10, 0))
+        job = contextlib.ExitStack()
+        job.enter_context(daemon.single_writer(lock, role="job"))  # a terminal `poll`
+        self.addCleanup(job.close)
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                job.close()  # the job finishes
+            elif len(sleeps) > 3:
+                stop.set()
+
+        ctx = context(ledger, clock, config=conf(bars_source="none"))
+        ctx.brief = lambda *a, **k: {"filings": []}
+        daemon.run_forever(ctx, lock_path=lock, sleep=sleep, stop=stop)
+        self.assertEqual(sleeps[:3], [daemon.LOCK_RETRY_SECONDS] * 3)
+        self.assertEqual(len(ledger.prefix("runs", "poll:")), 1)
+        self.assertEqual(daemon.last_run(ledger, "poll")["started_at"], clock())
+
+    def test_a_lock_held_past_the_wait_is_refused_so_launchd_retries(self):
+        lock = self.dir / "daemon.lock"
+        for content, holder in (("123 job\n", "job"), ("123\n", None), ("", None)):
+            with self.subTest(content=content):
+                # Another process's lock; an older version wrote only its pid.
+                handle = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.write(handle, content.encode())
+                    sleeps = []
+                    with self.assertRaises(daemon.AlreadyRunning) as refused:
+                        daemon.run_forever(context(), lock_path=lock, sleep=sleeps.append)
+                finally:
+                    os.close(handle)
+                self.assertEqual(refused.exception.holder, holder)
+                self.assertEqual(sum(sleeps), daemon.LOCK_WAIT_SECONDS)  # waited, then gave up
+        stop, sleeps = threading.Event(), []
+
+        def interrupted(seconds):
+            sleeps.append(seconds)
+            stop.set()  # SIGTERM while waiting
+
+        with daemon.single_writer(lock, role="job"):
+            ledger = FakeLedger()
+            self.assertIsNone(
+                daemon.run_forever(context(ledger), lock_path=lock, sleep=interrupted, stop=stop)
+            )
+        self.assertEqual((sleeps, ledger.records), ([daemon.LOCK_RETRY_SECONDS], {}))
 
     def test_lock_defaults_to_the_app_directory(self):
         stop = threading.Event()
@@ -850,19 +1011,68 @@ class LoopTests(IsolatedTest):
         polls = [r["started_at"] for r in ledger.prefix("runs", "poll:")]
         self.assertEqual(polls, [iso(et("2026-09-28", 10, 0)), iso(et("2026-09-28", 10, 40, 20))])
 
-    def test_no_gap_for_ordinary_ticks_or_slow_jobs(self):
-        clock = Clock(et("2026-09-28", 10, 0))
+    def loop_with_slow_observe(self, start, seconds, *, ticks, jumps=None):
+        clock = Clock(start)
         ledger, fakes = FakeLedger(), Fakes()
         ctx = context(ledger, clock, fakes, config=conf(bars_source="none"))
         ctx.brief = lambda *a, **k: {"filings": []}
 
         def slow_observe(*args, **kwargs):
-            clock.advance(900)  # a slow paid batch is not a coverage gap
+            clock.advance(seconds)  # one slow event, or the Mac asleep mid-request
             return {"forecasts": [], "errors": [], "skipped": {}}
 
         ctx.observe = slow_observe
-        self.run_loop(ctx, clock, ticks=5)
+        self.run_loop(ctx, clock, ticks=ticks, jumps=jumps)
+        gaps = [
+            (r["started_at"], r["finished_at"], r["counts"]["seconds"], r["error"])
+            for r in ledger.prefix("runs", "coverage_gap:")
+        ]
+        return gaps, [r["started_at"] for r in ledger.prefix("runs", "poll:")]
+
+    def test_no_gap_for_ordinary_ticks_or_short_jobs(self):
+        gaps, polls = self.loop_with_slow_observe(et("2026-09-28", 10, 0), 200, ticks=5)
+        self.assertEqual(gaps, [])
+        self.assertEqual(len(polls), 5)
+
+    def test_jobs_that_stall_polling_are_a_coverage_gap(self):
+        # Tuesday afternoon, the busiest filing hours: each batch holds polling for 45 minutes.
+        gaps, polls = self.loop_with_slow_observe(et("2026-09-29", 16, 0), 2700, ticks=2)
+        reason = "Not watching: jobs ran long or the computer slept"
+        self.assertEqual(
+            gaps,
+            [
+                (iso(et("2026-09-29", 16, 0)), iso(et("2026-09-29", 16, 45)), 2700, reason),
+                (
+                    iso(et("2026-09-29", 16, 45, 10)),
+                    iso(et("2026-09-29", 17, 30, 10)),
+                    2700,
+                    reason,
+                ),
+            ],
+        )
+        # Polling catches up at the next tick after each gap.
+        self.assertEqual(polls, [iso(et("2026-09-29", 16, 0)), iso(et("2026-09-29", 16, 45, 10))])
+
+    def test_a_slow_job_and_a_short_sleep_add_up_to_a_gap(self):
+        # 200 s of work, then a sleep 200 s late: neither alone, but polling paused 410 s.
+        gaps, polls = self.loop_with_slow_observe(
+            et("2026-09-28", 10, 0), 200, ticks=2, jumps={1: 200}
+        )
+        self.assertEqual(
+            [gap[:3] for gap in gaps],
+            [(iso(et("2026-09-28", 10, 0)), iso(et("2026-09-28", 10, 6, 50)), 410)],
+        )
+        self.assertEqual(polls[1], iso(et("2026-09-28", 10, 6, 50)))
+
+    def test_polling_backoff_is_not_a_stall(self):
+        clock = Clock(et("2026-09-28", 10, 0))
+        ledger, fakes = FakeLedger(), Fakes()
+        fakes.poll_result = {**fakes.poll_result, "added": [], "stopped": True}  # SEC said wait
+        ctx = context(ledger, clock, fakes, config=conf(bars_source="none"))
+        ctx.brief = lambda *a, **k: {"filings": []}
+        self.run_loop(ctx, clock, ticks=100, tick=10)  # about 17 minutes
         self.assertEqual(ledger.prefix("runs", "coverage_gap:"), [])
+        self.assertEqual(len(ledger.prefix("runs", "poll:")), 2)  # 10:00, then 10:15
 
     def test_startup_after_downtime_records_a_gap_but_not_after_a_quiet_interval(self):
         ledger, fakes = FakeLedger(), Fakes()

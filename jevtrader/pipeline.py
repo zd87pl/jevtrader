@@ -65,12 +65,14 @@ def observe_queue(
     observer: Callable[..., dict] | None = None,
     base_url: str | None = None,
     overrides: dict | None = None,
+    out_of_time: Callable[[], bool] | None = None,
 ) -> dict:
     """Observe one named event or the pending queue; ``observer`` defaults to engine.observe.
 
     ``base_url`` (a local engine's address) and ``overrides`` (config registry declarations)
     are passed to the observer only when given. A replay of one named event is ``adhoc``: the
-    user picked it, possibly knowing its outcome, so it is never evidence.
+    user picked it, possibly knowing its outcome, so it is never evidence. Once
+    ``out_of_time()`` is true, no further event is started (``skipped.out_of_time``).
     """
     check_options(limit=limit, max_scan=max_scan, event=event, as_of=as_of, replay=replay)
     if not model:
@@ -84,6 +86,7 @@ def observe_queue(
         "no_market_data": 0,
         "scan_truncated": False,
         "missing_credentials": False,
+        "out_of_time": False,
     }
     extra: dict = {
         key: value
@@ -118,6 +121,7 @@ def observe_queue(
         max_scan=max_scan,
         transport=transport,
         extra=extra,
+        out_of_time=out_of_time,
     )
 
 
@@ -232,10 +236,15 @@ def _run(
     max_scan: int,
     transport: Transport | None,
     extra: dict,
+    out_of_time: Callable[[], bool] | None = None,
 ) -> dict:
     records, errors, attempted, rejected = [], [], 0, 0
     for event in events:
         if attempted >= limit:
+            break
+        if attempted and out_of_time is not None and out_of_time():
+            # The rest waits for the next batch, so a slow model cannot hold up other work.
+            skipped["out_of_time"] = True
             break
         try:
             result = observer(

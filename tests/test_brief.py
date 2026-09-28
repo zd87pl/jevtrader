@@ -3,8 +3,9 @@
 import json
 import unittest
 from datetime import date, timedelta
+from unittest.mock import patch
 
-from jevtrader import brief, engine
+from jevtrader import brief, daemon, engine
 from jevtrader.common import load_strategy, timestamp
 from jevtrader.market import normalize_bar
 from jevtrader.research import FEATURE_NAMES
@@ -110,6 +111,12 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(len(quotes), 2)
         self.assertLessEqual(sum(map(len, quotes)), brief.CARD_QUOTE_CHARS)
         self.assertTrue(all(len(q) <= brief.MAX_QUOTE_CHARS and q in text for q in quotes))
+
+    def test_a_candidate_not_found_verbatim_is_dropped(self):
+        # The final check is the guarantee: a clipping bug must not invent filing text.
+        self.assertTrue(brief.verified_quotes(TEXT, phrases=["strong demand"]))
+        with patch.object(brief, "_clip", side_effect=lambda sentence, *_: "Altered: " + sentence):
+            self.assertEqual(brief.verified_quotes(TEXT, phrases=["strong demand"]), [])
 
     def test_sentences_with_control_or_bidi_characters_are_never_quoted(self):
         text = (
@@ -243,6 +250,54 @@ class ComposeTests(unittest.TestCase):
                     [f["event_id"] for f in found["filings"]], ["sec-form", "dot-form"]
                 )
                 self.assertEqual(found["symbol"], "BRK-B")
+                self.assertEqual([f["watchlist"] for f in found["filings"]], [False, False])
+                marked = brief.search(self.ledger, now=NOW, ticker=ticker, watchlist=["brk.b"])
+                self.assertEqual([f["watchlist"] for f in marked["filings"]], [True, True])
+        with self.assertRaises(ValueError):
+            brief.search(self.ledger, now=NOW, watchlist="ABC")
+
+    def test_unscored_filings_say_when_there_is_no_market_data(self):
+        # Without bars nothing is ever scored; such a card must not look merely queued.
+        def bar(ticker, mode, available):
+            with patch("jevtrader.market.utc_now", return_value=available):
+                record = normalize_bar(
+                    {
+                        "symbol": ticker,
+                        "session": "2026-03-09",
+                        "open_at": "2026-03-09T14:30:00Z",
+                        "close_at": "2026-03-09T21:00:00Z",
+                        "open": 10,
+                        "high": 11,
+                        "low": 9,
+                        "close": 10.5,
+                        "volume": 1_000,
+                        "available_at": available,
+                    },
+                    mode=mode,
+                )
+            self.ledger.put("bars", record["id"], record)
+
+        bar("ABC", "forward", "2026-03-09T21:20:00Z")
+        bar("DEF", "forward", "2026-03-10T21:20:00Z")  # received after now
+        bar("GHI", "historical", "2026-03-09T21:20:00Z")  # never pairs with a forward filing
+        for index, ticker in enumerate(("ABC", "DEF", "GHI", "XYZ", "SCO")):
+            store(self.ledger, disclosure(ticker, f"2026-03-10T0{index}:00:00Z", symbol=ticker))
+        put_forecast(self.ledger, "f", "SCO", "2026-03-10T04:05:00Z")
+        result = self.compose()
+        reasons = {f["event_id"]: f["unscored_reason"] for f in result["filings"]}
+        self.assertEqual(
+            reasons,
+            {
+                "ABC": None,
+                "DEF": "not scored: no market data for DEF",
+                "GHI": "not scored: no market data for GHI",
+                "XYZ": "not scored: no market data for XYZ",
+                "SCO": None,
+            },
+        )
+        page = brief.render_html(result)
+        self.assertIn('<span class="tag">not scored: no market data for XYZ</span>', page)
+        self.assertIn('<span class="tag">not scored yet</span>', page)
 
     def test_latest_forecast_visible_at_now_is_shown(self):
         event_id = store(self.ledger, disclosure("e", "2026-03-10T01:00:00Z"))
@@ -347,7 +402,7 @@ class HealthTests(unittest.TestCase):
         self.run_record(
             "r1", "bars", "2026-03-10T13:00:00Z", status="failed", error="bad\nthing‮" + "x" * 500
         )
-        self.run_record("r2", "coverage_gap", "2026-03-10T13:10:00Z", status="gap")
+        self.run_record("r2", "coverage_gap", "2026-03-10T13:20:00Z", status="gap")
         self.ledger.put("runs", "junk", {"job": 5, "started_at": "nope"})
         self.ledger.put("runs", "junk2", {"job": "poll", "started_at": "not a time"})
         report = brief.health(self.ledger, now=NOW)
@@ -361,6 +416,43 @@ class HealthTests(unittest.TestCase):
     def test_no_runs_is_idle(self):
         report = brief.health(self.ledger, now=NOW)
         self.assertEqual((report["state"], report["ok"], report["jobs"]), ("idle", False, {}))
+        self.assertEqual((report["stale"], report["stale_note"]), (False, None))
+
+    def test_runs_that_stop_arriving_need_attention_even_if_the_last_ones_were_ok(self):
+        # A dead service leaves its last runs ok; only their age shows that nothing runs.
+        self.run_record("r1", "poll", "2026-03-08T19:00:00Z")
+        self.run_record("r2", "brief", "2026-03-08T19:30:00Z")
+        report = brief.health(self.ledger, now=NOW)
+        self.assertEqual((report["state"], report["ok"]), ("attention", False))
+        self.assertEqual(report["attention"], [brief.SERVICE_ATTENTION])
+        self.assertTrue(report["stale"])
+        self.assertEqual(report["last_run_at"], "2026-03-08T19:30:00.000000Z")
+        self.assertEqual(
+            report["stale_note"], "No background runs for 42 h; is the service running?"
+        )
+        self.assertIn("Check jobs: service.", brief.render_text(self.brief())[1])
+        self.assertIn(report["stale_note"], brief.render_html(self.brief()))
+
+    def test_staleness_counts_from_the_latest_end_and_allows_two_idle_polls(self):
+        # Idle and backed-off polling run every 15 minutes: two of them may pass unseen.
+        start = "2026-03-10T13:00:00Z"
+        self.run_record("r1", "bars", start, finished_at="2026-03-10T13:15:01Z")
+        self.assertFalse(brief.health(self.ledger, now=NOW)["stale"])
+        self.assertTrue(brief.health(self.ledger, now="2026-03-10T13:45:01Z")["stale"])
+        self.assertGreaterEqual(brief.STALE_MINUTES * 60, 2 * daemon.POLL_IDLE_SECONDS)
+        self.assertGreaterEqual(brief.STALE_MINUTES * 60, 2 * daemon.RETRY_SECONDS)
+
+    def test_an_end_after_now_or_none_falls_back_to_the_start(self):
+        self.run_record("r1", "poll", "2026-03-10T12:00:00Z", finished_at="2026-03-10T14:00:00Z")
+        self.run_record("r2", "reconcile", "2026-03-10T12:30:00Z", finished_at=None)
+        report = brief.health(self.ledger, now="2026-03-10T13:30:00Z")
+        self.assertEqual(report["last_run_at"], "2026-03-10T12:30:00.000000Z")
+        self.assertEqual(
+            report["stale_note"], "No background runs for 60 min; is the service running?"
+        )
+
+    def brief(self):
+        return brief.compose(self.ledger, now=NOW, since=None, watchlist=[])
 
 
 class FilingCardTests(unittest.TestCase):
@@ -393,6 +485,24 @@ class FilingCardTests(unittest.TestCase):
         self.assertEqual(card["decisions"], [])
         self.assertEqual(card["notice"], brief.NOTICE)
 
+    def test_card_quotes_share_one_character_budget(self):
+        # Each lexicon sentence fits MAX_QUOTE_CHARS; together they exceed the card's budget.
+        text = (
+            "The company saw strong demand for its water treatment services in every region it "
+            "serves, and management expects that demand to continue through the rest of fiscal "
+            "2026 and beyond. The company raised guidance for fiscal 2026 after record revenue in "
+            "its services segment, citing new multi-year contracts with regional utilities and a "
+            "growing backlog of maintenance work."
+        )
+        event_id = store(
+            self.ledger,
+            disclosure("sec:0000000001-26-000002:ex99.htm", "2026-03-02T21:30:00Z", text=text),
+        )
+        quotes = brief.filing_card(self.ledger, event_id, now=NOW)["quotes"]
+        self.assertEqual(len(quotes), 2)
+        self.assertLessEqual(sum(map(len, quotes)), brief.CARD_QUOTE_CHARS)
+        self.assertTrue(all(len(q) <= brief.MAX_QUOTE_CHARS and q in text for q in quotes))
+
     def test_decisions_newest_first_with_outcome_only_once_matured(self):
         put_forecast(self.ledger, "older", self.event_id, "2026-03-02T21:31:00Z", action="WATCH")
         put_forecast(
@@ -421,12 +531,57 @@ class FilingCardTests(unittest.TestCase):
         self.assertEqual([d["id"] for d in before["decisions"]], ["newer", "older"])
         self.assertIsNone(before["decisions"][0]["outcome"])
         after = brief.filing_card(self.ledger, self.event_id, now="2026-03-17T20:20:00Z")
+        # The move is the stock's, not a result: no position is ever taken.
+        self.assertIn(
+            "stock minus SPY over the label window (no position taken)",
+            brief.render_filing_html(after),
+        )
         matured = after["decisions"][0]["outcome"]
         self.assertAlmostEqual(matured["target"], 0.02)
         self.assertAlmostEqual(matured["net_return"], 0.02 - 0.002)
         self.assertEqual(after["decisions"][0]["features"]["direction"], 0.5)
         early = brief.filing_card(self.ledger, self.event_id, now="2026-03-03T00:00:00Z")
         self.assertEqual([d["id"] for d in early["decisions"]], ["older"])
+
+    def test_decisions_show_the_evidence_basis_frozen_with_them(self):
+        basis = {
+            "key": "rules:rules-v1",
+            "training_cutoff": None,
+            "origin": "builtin",
+            "source": "Fixed lexical rules; nothing is learned",
+        }
+        put_forecast(
+            self.ledger, "labelled", self.event_id, "2026-03-02T21:31:00Z", eligibility_basis=basis
+        )
+        put_forecast(self.ledger, "legacy", self.event_id, "2026-03-02T21:32:00Z")
+        put_forecast(
+            self.ledger,
+            "odd",
+            self.event_id,
+            "2026-03-02T21:33:00Z",
+            eligibility_basis={"origin": "<b>", "training_cutoff": 7, "source": "a\x1bb"},
+        )
+        card = brief.filing_card(self.ledger, self.event_id, now=NOW)
+        found = {d["id"]: d["evidence_basis"] for d in card["decisions"]}
+        self.assertEqual(
+            found,
+            {
+                "labelled": {
+                    "origin": "builtin",
+                    "training_cutoff": None,
+                    "source": "Fixed lexical rules; nothing is learned",
+                },
+                "legacy": None,
+                "odd": {"origin": None, "training_cutoff": None, "source": "a b"},
+            },
+        )
+        page = brief.render_filing_html(card)
+        self.assertIn(
+            "Evidence basis: no training cutoff on record · from the model registry", page
+        )
+        self.assertIn("Evidence basis: no training cutoff on record · origin unknown", page)
+        self.assertEqual(page.count("Evidence basis:"), 2)
+        self.assertNotIn("<b>", page)
 
 
 class RenderTests(unittest.TestCase):
@@ -441,7 +596,7 @@ class RenderTests(unittest.TestCase):
                 disclosure(f"e{index:02d}", "2026-03-10T01:00:00Z", symbol=f"S{index:02d}"),
             )
         self.ledger.put(
-            "runs", "r", {"job": "poll", "started_at": "2026-03-10T13:00:00Z", "status": "error"}
+            "runs", "r", {"job": "poll", "started_at": "2026-03-10T13:40:00Z", "status": "error"}
         )
         composed = brief.compose(
             self.ledger, now=NOW, since=None, watchlist=[f"S{i:02d}" for i in range(40)]
@@ -499,6 +654,36 @@ class RenderTests(unittest.TestCase):
         self.assertIn('href="/filing/odd%3Aid.v1"', page)
         self.assertIn(composed["scoreboard"]["label"], page)
 
+    def test_source_links_are_https_only_and_escaped_inside_the_attribute(self):
+        # source_url is free-form in imported JSONL; a quote must not end the href.
+        breakout = 'https://www.sec.gov/a"onmouseover="x()<i>'
+        store(self.ledger, disclosure("quoted", "2026-03-10T01:00:00Z", source_url=breakout))
+        plain = "http://www.sec.gov/Archives/edgar/data/1/plain.htm"
+        store(self.ledger, disclosure("plain", "2026-03-10T01:01:00Z", source_url=plain))
+        composed = brief.compose(self.ledger, now=NOW, since=None, watchlist=[])
+        escaped = 'href="https://www.sec.gov/a&quot;onmouseover=&quot;x()&lt;i&gt;"'
+        page = brief.render_html(composed)
+        for fragment, links in (
+            (page, 1),
+            (brief.render_filing_html(brief.filing_card(self.ledger, "quoted", now=NOW)), 1),
+            (brief.render_filing_html(brief.filing_card(self.ledger, "plain", now=NOW)), 0),
+        ):
+            self.assertEqual(fragment.count(escaped), links)
+            self.assertNotIn('"onmouseover', fragment)
+            self.assertNotIn("<i>", fragment)
+            self.assertNotIn("http://", fragment)
+        self.assertEqual(page.count("source link unavailable"), 1)  # the http:// filing
+
+    def test_renderers_escape_fields_the_ledger_already_validates(self):
+        # Defense in depth: a symbol reaching a renderer is escaped like any other text.
+        event_id = store(self.ledger, disclosure("e", "2026-03-10T01:00:00Z"))
+        composed = brief.compose(self.ledger, now=NOW, since=None, watchlist=[])
+        card = brief.filing_card(self.ledger, event_id, now=NOW)
+        composed["filings"][0]["symbol"] = card["symbol"] = '<b>Z"'
+        for fragment in (brief.render_html(composed), brief.render_filing_html(card)):
+            self.assertIn('<span class="sym">&lt;b&gt;Z&quot;</span>', fragment)
+            self.assertNotIn("<b>", fragment)
+
     def test_html_links_https_sources_and_formats_numbers(self):
         event_id = store(self.ledger, disclosure("e", "2026-03-10T01:00:00Z"))
         put_forecast(
@@ -514,6 +699,10 @@ class RenderTests(unittest.TestCase):
             'href="https://www.sec.gov/Archives/edgar/data/1/e.htm" rel="noopener noreferrer"', page
         )
         self.assertIn("Expected excess return +1.23%", page)
+        # Beside the action pill, a filer's sentence must never read as this tool's words.
+        self.assertIn(
+            f'<p class="meta">{brief.QUOTE_HEADING}</p><blockquote class="quote">Acme Corp.', page
+        )
         self.assertIn('class="pill a-long"', page)
         self.assertIn("Mon 09 Mar 2026, 21:00 ET", page)
         detail = brief.render_filing_html(brief.filing_card(self.ledger, event_id, now=NOW))

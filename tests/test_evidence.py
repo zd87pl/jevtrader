@@ -338,6 +338,46 @@ class ScoreboardTests(unittest.TestCase):
         chosen = evidence.decisions(records)
         self.assertEqual([f["id"] for f in chosen], ["first"])
 
+    def test_a_replay_never_replaces_a_forward_decision(self):
+        # Decided forward as WATCH; a LONG replay recorded once the outcome was known must not
+        # take its place, however its registry label reads.
+        records = [
+            forecast("forward-watch", action="WATCH", decided="2026-03-02T15:00:00Z"),
+            forecast(
+                "late-replay",
+                action="LONG",
+                decided="2026-03-02T14:00:00Z",
+                recorded="2026-09-01T00:00:00Z",
+                mode="historical",
+                eligibility="no_model_knowledge",
+            ),
+        ]
+        for record in records:
+            record["event_id"] = "same-event"
+        ledger = FakeLedger(records, [outcome("forward-watch", 0.0), outcome("late-replay", 0.9)])
+        board = evidence.scoreboard(ledger, as_of=AS_OF)
+        self.assertEqual((board["calls"], board["counts"]["WATCH"]), (0, 1))
+        self.assertEqual([f["id"] for f in evidence.decisions(records)], ["forward-watch"])
+
+    def test_replays_only_use_the_first_recorded_one_not_the_first_call(self):
+        records = [
+            forecast(
+                "first-pass",
+                action="PASS",
+                mode="historical",
+                recorded="2026-04-01T00:00:00Z",
+            ),
+            forecast(
+                "later-long",
+                action="LONG",
+                mode="historical",
+                recorded="2026-05-01T00:00:00Z",
+            ),
+        ]
+        for record in records:
+            record["event_id"] = "replayed"
+        self.assertEqual([f["id"] for f in evidence.decisions(records)], ["first-pass"])
+
     def test_events_without_calls_use_their_first_forecast(self):
         records = [
             forecast("pass", action="PASS", recorded="2026-03-02T16:00:00Z"),

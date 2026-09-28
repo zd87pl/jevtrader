@@ -11,9 +11,8 @@ import csv
 import math
 from datetime import date
 from statistics import pstdev
-from zoneinfo import ZoneInfo
 
-from .common import instant, number, symbol, timestamp, utc_now
+from .common import EASTERN, instant, number, symbol, timestamp, utc_now
 
 
 def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
@@ -28,8 +27,7 @@ def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
     if instant(result["close_at"]).date().isoformat() != result["session"]:
         raise ValueError("US stock session must match close_at UTC date")
     if any(
-        instant(result[key]).astimezone(ZoneInfo("America/New_York")).date().isoformat()
-        != result["session"]
+        instant(result[key]).astimezone(EASTERN).date().isoformat() != result["session"]
         for key in ("open_at", "close_at")
     ):
         raise ValueError("Open and close must belong to the same US stock session")

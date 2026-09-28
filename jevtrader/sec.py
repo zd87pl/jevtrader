@@ -29,7 +29,8 @@ from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from zoneinfo import ZoneInfo
+
+from .common import EASTERN
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_BULK_BYTES = 10_000_000  # One day's form index or the ticker map; both are single SEC files.
@@ -43,7 +44,6 @@ _EXHIBIT = re.compile(r"(?:ex(?:hibit|h)?)[_.-]*99", re.I)
 _EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 _ACCESSION = re.compile(r"\d{10}-\d{2}-\d{6}", re.A)
 _SYMBOL = re.compile(r"[A-Za-z][A-Za-z0-9.-]{0,14}")
-_EASTERN = ZoneInfo("America/New_York")
 AFTER_HOURS = clock_time(17, 30)  # EDGAR assigns the next business day's filing date from here.
 FORMS = ("8-K", "8-K/A")
 MODES = ("forward", "historical")
@@ -86,7 +86,7 @@ def _published_at(value: object) -> str:
     except ValueError as exc:
         raise SECError("Invalid acceptanceDateTime") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_EASTERN)
+        parsed = parsed.replace(tzinfo=EASTERN)
     return _iso_utc(parsed)
 
 
@@ -102,7 +102,7 @@ def latest_acceptance(value: str) -> datetime:
         return parsed.astimezone(timezone.utc)
     # Both folds, so an ambiguous wall time at the end of daylight saving reads late too.
     readings = [
-        parsed.replace(tzinfo=_EASTERN, fold=fold).astimezone(timezone.utc) for fold in (0, 1)
+        parsed.replace(tzinfo=EASTERN, fold=fold).astimezone(timezone.utc) for fold in (0, 1)
     ]
     if parsed.tzinfo is not None:
         readings.append(parsed.astimezone(timezone.utc))
@@ -519,7 +519,7 @@ def collect_filing(
         # the filing/request budget while looking for another candidate.
         raise SECError("Selected SEC document contains no readable text")
     seen = observed if first_seen is None else _supplied_first_seen(first_seen, row)
-    latest = latest_acceptance(row["acceptance"]).astimezone(_EASTERN)
+    latest = latest_acceptance(row["acceptance"]).astimezone(EASTERN)
     return {
         "id": f"sec:{accession}:{document}",
         "symbol": symbol.upper(),

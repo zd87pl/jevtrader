@@ -8,8 +8,7 @@ research tool, not investment advice, and shows the evidence label.
 
 from __future__ import annotations
 
-import html
-import inspect
+import errno
 import json
 import re
 import sqlite3
@@ -22,7 +21,8 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from . import brief, evidence, paths
-from .common import digest, instant, symbol, timestamp, utc_now
+from .brief import escape
+from .common import instant, symbol, timestamp, utc_now
 from .store import Ledger
 
 DEFAULT_PORT = 8765
@@ -126,64 +126,20 @@ code { font-size: .8rem; overflow-wrap: anywhere; }
 """.lstrip()
 
 
-class ReadOnlyLedger:
-    """Fallback reader for a store without ``readonly``: a mode=ro connection, hashes checked."""
-
-    def __init__(self, path: str | Path):
-        target = Path(path)
-        if not target.is_file():
-            raise ValueError(f"No ledger at {target}; run init first")
-        self.db = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
-        self.db.execute("PRAGMA query_only=ON")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.db.close()
-
-    def _rows(self, sql: str, args: tuple) -> list[dict]:
-        result = []
-        for encoded, fingerprint in self.db.execute(sql, args).fetchall():
-            value = json.loads(encoded)
-            if digest(value) != fingerprint:
-                raise ValueError(f"Corrupted record in {args[0]}")
-            result.append(value)
-        return result
-
-    def get(self, kind: str, identity: str) -> dict | None:
-        rows = self._rows(
-            "SELECT payload, content_hash FROM records WHERE kind=? AND id=?", (kind, identity)
-        )
-        return rows[0] if rows else None
-
-    def all(self, kind: str) -> list[dict]:
-        return self._rows(
-            "SELECT payload, content_hash FROM records WHERE kind=? ORDER BY id", (kind,)
-        )
-
-    def prefix(self, kind: str, prefix: str) -> list[dict]:
-        return self._rows(
-            "SELECT payload, content_hash FROM records WHERE kind=? AND id>=? AND id<? ORDER BY id",
-            (kind, prefix, prefix + "￿"),
-        )
+def _missing(target: Path) -> str:
+    # These views read the service's ledger: setup creates it, and `init` would not help.
+    return f"No ledger at {target}; run `{paths.APP_NAME} setup` first, or check --db"
 
 
-def open_readonly(path: str | Path):
+def open_readonly(path: str | Path) -> Ledger:
     target = Path(path)
     if not target.is_file():
-        raise ValueError(f"No ledger at {target}; run init first")
-    if "readonly" in inspect.signature(Ledger).parameters:
-        return Ledger(target, readonly=True)
-    return ReadOnlyLedger(target)
+        raise ValueError(_missing(target))
+    return Ledger(target, readonly=True)
 
 
 def allowed_hosts(port: int) -> frozenset[str]:
     return frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
-
-
-def _e(value: object) -> str:
-    return html.escape(str(value), quote=True)
 
 
 def _plain(status: int, message: str) -> Response:
@@ -207,14 +163,14 @@ def page(title: str, body: str, evidence_label: str, *, status: int = 200) -> Re
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         '<meta name="color-scheme" content="light dark">'
         '<meta name="referrer" content="no-referrer">'
-        f"<title>{_e(title)} · {_e(paths.APP_NAME)}</title>"
+        f"<title>{escape(title)} · {escape(paths.APP_NAME)}</title>"
         '<link rel="stylesheet" href="/static/app.css"><link rel="icon" href="data:,">'
         "</head><body>"
-        f'<header class="top"><a class="brand" href="/">{_e(paths.APP_NAME)}</a>'
+        f'<header class="top"><a class="brand" href="/">{escape(paths.APP_NAME)}</a>'
         '<nav><a href="/">Brief</a><a href="/scoreboard">Scoreboard</a>'
         '<a href="/health">Health</a></nav></header>'
-        f'<p class="notice"><strong>{_e(brief.NOTICE)}</strong> No orders are placed.'
-        f' <span class="evidence">{_e(evidence_label)}</span></p>'
+        f'<p class="notice"><strong>{escape(brief.NOTICE)}</strong> No orders are placed.'
+        f' <span class="evidence">{escape(evidence_label)}</span></p>'
         f"<main>{body}</main>"
         '<footer class="foot">Numbers are computed by code from the local ledger. '
         "Read-only view; nothing here can change it.</footer>"
@@ -224,12 +180,12 @@ def page(title: str, body: str, evidence_label: str, *, status: int = 200) -> Re
 
 
 def _message(title: str, text: str, evidence_label: str, status: int) -> Response:
-    body = f'<h1>{_e(title)}</h1><p class="muted">{_e(text)}</p><p><a href="/">Back to the brief</a></p>'
+    body = f'<h1>{escape(title)}</h1><p class="muted">{escape(text)}</p><p><a href="/">Back to the brief</a></p>'
     return page(title, body, evidence_label, status=status)
 
 
 def _row(name: str, value: str) -> str:
-    return f'<tr><th>{_e(name)}</th><td class="num">{_e(value)}</td></tr>'
+    return f'<tr><th>{escape(name)}</th><td class="num">{escape(value)}</td></tr>'
 
 
 STATUS_TEXT = {
@@ -257,13 +213,15 @@ def scoreboard_html(board: dict) -> str:
         ("scored events", str(counts["scored_events"])),
         *((f"{action} decisions", str(counts[action])) for action in evidence.ACTIONS),
         (
-            f"all-events mean target ({board['baseline']['events']} events)",
+            # Every matured filing's move, whatever was decided: context, not a result.
+            f"average stock-minus-benchmark move, all {board['baseline']['events']} matured "
+            "filings (not a strategy result)",
             brief.percent(board["baseline"]["mean_target"]),
         ),
         ("forecasts excluded (not evidence)", str(board["excluded_forecasts"])),
     ]
     meanings = "".join(
-        f"<li><strong>{_e(name.replace('_', ' '))}</strong>: {_e(text)}</li>"
+        f"<li><strong>{escape(name.replace('_', ' '))}</strong>: {escape(text)}</li>"
         for name, text in STATUS_TEXT.items()
     )
     gate_rows = [
@@ -275,23 +233,19 @@ def scoreboard_html(board: dict) -> str:
     status = board["status"]
     return (
         "<h1>Scoreboard</h1>"
-        f'<p class="status s-{_e(status)}">{_e(status.replace("_", " ").capitalize())}</p>'
-        f"<p>{_e(board['label'])}</p>"
-        f'<p class="meta">As of {_e(brief.et_time(board["as_of"]))}</p>'
+        f'<p class="status s-{escape(status)}">{escape(status.replace("_", " ").capitalize())}</p>'
+        f"<p>{escape(board['label'])}</p>"
+        f'<p class="meta">As of {escape(brief.et_time(board["as_of"]))}</p>'
         f'<div class="scroll"><table class="kv">{"".join(_row(k, v) for k, v in rows)}</table></div>'
         f"<h2>What the status means</h2><ul>{meanings}</ul>"
         f'<h2>Gate</h2><div class="scroll"><table class="kv">{"".join(_row(k, v) for k, v in gate_rows)}</table></div>'
-        f'<p class="muted">Gate SHA-256 <code>{_e(board["gate_sha256"])}</code></p>'
-        f'<p class="muted">Method: {_e(evidence.METHOD)}. Counts {_e(evidence.ELIGIBILITY_RULE)}.</p>'
+        f'<p class="muted">Gate SHA-256 <code>{escape(board["gate_sha256"])}</code></p>'
+        f'<p class="muted">Method: {escape(evidence.METHOD)}. Counts {escape(evidence.ELIGIBILITY_RULE)}.</p>'
     )
 
 
 def _ago(minutes: int) -> str:
-    if minutes < 90:
-        return f"{minutes} min ago"
-    if minutes < 48 * 60:
-        return f"{minutes // 60} h ago"
-    return f"{minutes // (24 * 60)} days ago"
+    return f"{brief.duration(minutes)} ago"
 
 
 def _detail(run: dict) -> str:
@@ -305,10 +259,10 @@ def health_html(report: dict) -> str:
     else:
         rows = "".join(
             "<tr>"
-            f"<td>{_e(job)}</td>"
-            f'<td class="st-{"ok" if run["status"] in brief.OK_STATUSES else "bad"}">{_e(run["status"])}</td>'
-            f'<td class="num">{_e(_ago(run["age_minutes"]))}</td>'
-            f"<td>{_e(_detail(run))}</td>"
+            f"<td>{escape(job)}</td>"
+            f'<td class="st-{"ok" if run["status"] in brief.OK_STATUSES else "bad"}">{escape(run["status"])}</td>'
+            f'<td class="num">{escape(_ago(run["age_minutes"]))}</td>'
+            f"<td>{escape(_detail(run))}</td>"
             "</tr>"
             for job, run in report["jobs"].items()
         )
@@ -321,9 +275,10 @@ def health_html(report: dict) -> str:
         "attention": "Needs attention: " + ", ".join(report["attention"]) + ".",
         "idle": "The background service has not recorded a run yet.",
     }[report["state"]]
+    stale = f'<p class="st-bad">{escape(report["stale_note"])}</p>' if report["stale_note"] else ""
     return (
-        f"<h1>Health</h1><p>{_e(summary)}</p>"
-        f'<p class="meta">As of {_e(brief.et_time(report["as_of"]))}</p>{table}'
+        f"<h1>Health</h1><p>{escape(summary)}</p>{stale}"
+        f'<p class="meta">As of {escape(brief.et_time(report["as_of"]))}</p>{table}'
     )
 
 
@@ -480,7 +435,14 @@ def serve(
     watchlist: Iterable[str] = (),
     clock: Callable[[], str] = utc_now,
 ) -> None:
-    server = make_server(ledger_path, host=host, port=port, watchlist=watchlist, clock=clock)
+    try:
+        server = make_server(ledger_path, host=host, port=port, watchlist=watchlist, clock=clock)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        raise ValueError(
+            f"Port {port} is in use (another `{paths.APP_NAME} serve`?); pass --port"
+        ) from None
     print(f"Serving http://127.0.0.1:{server.server_address[1]}/ (read-only)", file=sys.stderr)
     try:
         server.serve_forever()

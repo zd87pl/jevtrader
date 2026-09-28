@@ -37,6 +37,7 @@ from . import (
 from . import config as settings
 from .common import instant, timestamp, utc_now
 from .providers import PAID_PROVIDERS
+from .research import VERSION
 from .store import Ledger
 
 HISTORY_PADDING_DAYS = 45  # >= 21 sessions of history before the first backfilled filing
@@ -48,6 +49,10 @@ SEC_REASON = (
     "SEC's fair-access policy asks automated tools to identify themselves with a name and a "
     "contact email. It is sent only to sec.gov, in the User-Agent header, and kept in "
     "config.json on this Mac."
+)
+NO_BARS = (
+    "bars_source is none: filings are collected but never scored (no market data); choose "
+    f"Alpaca bars in `{paths.APP_NAME} setup` or import forward bars yourself"
 )
 PRESETS = (
     ("rules", "fixed word lists; offline and free; no learned knowledge"),
@@ -106,10 +111,12 @@ def lookback(now: str) -> str:
 def run_once(job: str, ledger_path: str, config: dict, strategy: dict, **adapters: Any) -> dict:
     """One daemon job from the command line, recorded like the daemon's own runs."""
     try:
-        with daemon.single_writer():
+        with daemon.single_writer(role="job"):
             with open_ledger(ledger_path) as ledger:
                 return daemon.run_job(job, daemon_context(ledger, config, strategy, **adapters))
-    except daemon.AlreadyRunning:
+    except daemon.AlreadyRunning as exc:
+        if exc.holder != "daemon":
+            raise ValueError(f"{exc}; try again when it finishes") from None
         raise ValueError(
             f"The background service is running and does the {job} job itself; "
             f"see `{paths.APP_NAME} doctor`"
@@ -117,7 +124,11 @@ def run_once(job: str, ledger_path: str, config: dict, strategy: dict, **adapter
 
 
 def run_daemon(ledger_path: str, config: dict, strategy: dict, **adapters: Any) -> dict:
-    """Run until SIGTERM/SIGINT; another running daemon is a clean exit, not a crash."""
+    """Run until SIGTERM/SIGINT; another running daemon is a clean exit, not a crash.
+
+    A one-off job holding the lock is waited for; if it outlasts the wait, AlreadyRunning
+    propagates and the command fails, so launchd (which restarts only failed exits) retries.
+    """
     stop = threading.Event()
     previous = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
     try:
@@ -128,6 +139,8 @@ def run_daemon(ledger_path: str, config: dict, strategy: dict, **adapters: Any) 
             try:
                 daemon.run_forever(ctx, stop=stop)
             except daemon.AlreadyRunning as exc:
+                if exc.holder != "daemon":
+                    raise
                 # launchd restarts only failed exits; a second copy must not loop.
                 print(f"{paths.APP_NAME}: {exc}", file=sys.stderr)
                 return {"stopped": True, "already_running": True}
@@ -190,6 +203,7 @@ def mcp_handlers(
             ticker=arguments.get("symbol"),
             since=arguments.get("since"),
             limit=arguments.get("limit", 10),
+            watchlist=watchlist,
         )
 
     return {
@@ -202,8 +216,6 @@ def mcp_handlers(
 
 
 def _integrity(ledger) -> dict:
-    if not hasattr(ledger, "verify"):
-        return {"ok": None, "detail": "this store cannot verify its chain"}
     result = ledger.verify()
     return {
         "ok": result["ok"],
@@ -228,10 +240,12 @@ def backfill(
     symbols: list[str] | None = None,
     max_filings: int = 500,
     with_bars: bool = False,
+    benchmark: str = bars.BENCHMARK,
     sec_transport: Callable | None = None,
     bars_transport: Callable | None = None,
 ) -> dict:
-    """Historical filings (and optionally bars) into the research ledger, never the forward one."""
+    """Historical filings (and optionally bars, with the strategy's ``benchmark``) into the
+    research ledger, never the forward one."""
     agent = config["sec_user_agent"]
     if not agent:
         raise ValueError(f"Set your SEC name and email first: {paths.APP_NAME} setup")
@@ -269,6 +283,7 @@ def backfill(
                 min(end + timedelta(days=LABEL_PADDING_DAYS), today),
                 transport=bars_transport,
                 feed=config["alpaca_feed"],
+                benchmark=benchmark,
             )
     return result
 
@@ -315,27 +330,41 @@ def doctor(
     local_transport: Callable | None = None,
     home: Path | None = None,
 ) -> dict:
-    """Every check that can fail quietly, in one report; names of keys, never values."""
+    """Every check that can fail quietly, in one report; names of keys, never values.
+
+    A config that does not load skips the checks that read it: their defaults would report
+    problems that are not there.
+    """
     problems: list[str] = []
     notes: list[str] = []
     checks: dict[str, Any] = {}
+    config: dict | None
     try:
         config = settings.load()
         checks["config"] = {"ok": True, "exists": paths.config_path().is_file()}
         if not checks["config"]["exists"]:
             notes.append(f"No config yet; run `{paths.APP_NAME} setup`")
     except ValueError as exc:
-        config = settings.validate({})
+        config = None
         checks["config"] = {"ok": False, "error": str(exc)}
         problems.append(f"Config: {exc}")
-    target = ledger_path or str(settings.ledger_path(config))
-    checks["sec_user_agent"] = {"ok": bool(config["sec_user_agent"])}
-    if not config["sec_user_agent"]:
-        problems.append("SEC name and email are not set; collection is skipped")
-    checks["ledger"] = _ledger_check(target, problems)
-    checks["provider"] = _provider_check(config, problems, local_transport)
-    checks["keys"] = _key_check(config, problems, keychain_runner)
-    checks["service"] = _service_check(launchd_runner, home, notes)
+    skipped = {"ok": None, "skipped": "the config did not load"}
+    target = ledger_path or (str(settings.ledger_path(config)) if config is not None else None)
+    if config is not None:
+        checks["sec_user_agent"] = {"ok": bool(config["sec_user_agent"])}
+        if not config["sec_user_agent"]:
+            problems.append("SEC name and email are not set; collection is skipped")
+    checks["ledger"] = _ledger_check(target, config, problems, notes) if target else skipped
+    if config is None:
+        for name in ("sec_user_agent", "provider", "keys", "bars"):
+            checks[name] = skipped
+    else:
+        checks["provider"] = _provider_check(config, problems, local_transport)
+        checks["keys"] = _key_check(config, problems, keychain_runner)
+        checks["bars"] = {"ok": config["bars_source"] != "none", "source": config["bars_source"]}
+        if config["bars_source"] == "none":
+            problems.append(NO_BARS)
+    checks["service"] = _service_check(launchd_runner, home, problems, notes)
     return {
         "ok": not problems,
         "app_dir": str(paths.app_dir()),
@@ -347,7 +376,7 @@ def doctor(
     }
 
 
-def _ledger_check(target: str, problems: list[str]) -> dict:
+def _ledger_check(target: str, config: dict | None, problems: list[str], notes: list[str]) -> dict:
     try:
         with open_ledger(target, readonly=True) as ledger:
             integrity = ledger.verify()
@@ -356,13 +385,19 @@ def _ledger_check(target: str, problems: list[str]) -> dict:
                 for job, run in daemon.last_runs(ledger).items()
             }
             health = brief.health(ledger, now=utc_now())
+            calibrator = (
+                _calibrator_check(ledger, target, config, problems, notes) if config else None
+            )
     except (ValueError, sqlite3.Error) as exc:
         problems.append(f"Ledger: {exc}")
         return {"ok": False, "error": str(exc)}
     if not integrity["ok"]:
         problems.append(f"Ledger chain: {len(integrity['problems'])} problem(s); run verify")
-    if health["attention"]:
-        problems.append(f"Jobs needing attention: {', '.join(health['attention'])}")
+    jobs = [job for job in health["attention"] if job != brief.SERVICE_ATTENTION]
+    if jobs:
+        problems.append(f"Jobs needing attention: {', '.join(jobs)}")
+    if health["stale"]:
+        problems.append(health["stale_note"])
     return {
         "ok": integrity["ok"],
         "records": integrity["records"],
@@ -371,7 +406,49 @@ def _ledger_check(target: str, problems: list[str]) -> dict:
         "problems": integrity["problems"][:5],
         "health": health["state"],
         "last_runs": runs,
+        "calibrator": calibrator,
     }
+
+
+def _calibrator_check(
+    ledger, target: str, config: dict, problems: list[str], notes: list[str]
+) -> dict:
+    """The configured calibrator must exist here, be current and fit the service's features."""
+    model_id = config["calibrator"]
+    if model_id is None:
+        notes.append(
+            "No calibrator is configured, so every service decision is WATCH and no call counts "
+            "toward the evidence gate. Once enough forward outcomes have matured, fit one on "
+            f"this ledger (`{paths.APP_NAME} --db {target} fit --extractor-key KEY --mode "
+            'forward`), set "calibrator" in config.json and restart the service; see the README'
+        )
+        return {"id": None}
+    model = ledger.get("models", model_id)
+    if model is None:
+        problems.append(
+            f"Calibrator {model_id} is not in {target}; the service's observe runs fail until "
+            "config names a model from `status` on this ledger"
+        )
+        return {"id": model_id, "ok": False}
+    if model.get("version") != VERSION:
+        problems.append(f"Calibrator {model_id} was fit by {model.get('version')}; re-fit it")
+        return {"id": model_id, "ok": False}
+    # The extractor key digests the provider and requested model, so one forecast names them.
+    trained = next(
+        (f for f in ledger.all("forecasts") if f["extractor_key"] == model["extractor_key"]),
+        None,
+    )
+    extraction = ledger.get("extractions", trained["extraction_id"]) if trained else None
+    spec = extraction["spec"] if extraction else {}
+    fitted = (spec.get("provider"), spec.get("requested_model"))
+    service = (config["provider"], settings.resolved_model(config))
+    if extraction and fitted != service:
+        problems.append(
+            f"Calibrator {model_id} was fit on {fitted[0]}:{fitted[1]} features, but the "
+            f"service uses {service[0]}:{service[1]}; every decision would be rejected"
+        )
+        return {"id": model_id, "ok": False}
+    return {"id": model_id, "ok": True, "cutoff": model.get("cutoff")}
 
 
 def _provider_check(config: dict, problems: list[str], transport: Callable | None) -> dict:
@@ -409,18 +486,40 @@ def _key_check(config: dict, problems: list[str], runner: secrets.Runner | None)
     return {"ok": not missing, "present": present, "missing": missing}
 
 
-def _service_check(runner: launchd.Runner | None, home: Path | None, notes: list[str]) -> dict:
+def _service_check(
+    runner: launchd.Runner | None, home: Path | None, problems: list[str], notes: list[str]
+) -> dict:
     try:
         status = launchd.status(runner=runner, home=home)
     except (ValueError, RuntimeError) as exc:
         notes.append(f"Background service: {exc}")
         return {"available": False}
+    log = paths.log_dir() / "daemon.err.log"
+    code = status["last_exit_code"]
+    exited = f" (last exit code {code})" if code not in (None, 0) else ""
     if not status["loaded"]:
-        notes.append(f"The background service is not running; start it with `{paths.APP_NAME} up`")
+        if status["installed"]:
+            problems.append(
+                f"The background service is installed but not loaded; start it with "
+                f"`{paths.APP_NAME} up`"
+            )
+        else:
+            notes.append(
+                f"The background service is not running; start it with `{paths.APP_NAME} up`"
+            )
+    elif status["state"] != "running":
+        state = status["state"] or "in an unknown state"
+        problems.append(f"The background service is loaded but {state}{exited}; see {log}")
+    elif exited:
+        notes.append(f"The background service restarted after an exit{exited}; see {log}")
     return {"available": True, **status}
 
 
 # ---------------------------------------------------------------- setup
+
+
+class _Cancelled(ValueError):
+    """End of input or Ctrl-C at a prompt; setup saves nothing until the last answer."""
 
 
 class _Dialog:
@@ -457,7 +556,7 @@ class _Dialog:
         try:
             return reader(prompt)
         except (EOFError, KeyboardInterrupt):
-            raise ValueError("Setup cancelled; nothing was saved") from None
+            raise _Cancelled("Setup cancelled; nothing was saved") from None
 
 
 def setup(
@@ -471,7 +570,9 @@ def setup(
     program: list[str] | None = None,
     home: Path | None = None,
 ) -> dict:
-    """Interactive onboarding; config is saved only after every answer is valid."""
+    """Interactive onboarding. Keys, config and ledgers are saved only once every answer is
+    in, so a cancelled setup saves nothing; cancelling the final question (start the
+    service?) keeps what was saved and leaves the service stopped."""
     dialog = _Dialog(ask, ask_secret, say)
     try:
         config = settings.load()
@@ -509,14 +610,23 @@ def setup(
     )
     config["notify"] = dialog.yes("Show the brief as a macOS notification", config["notify"])
     config = settings.validate(config)
-    stored = _store_keys(dialog, config, keychain_runner)
+    keys = _ask_keys(dialog, config, keychain_runner)
+    # Every answer is in: from here on things are saved, so no prompt may cancel them.
+    stored = _store_keys(dialog, keys, keychain_runner)
     settings.save(config)
     ledger = settings.ledger_path(config)
     for path in (ledger, paths.research_ledger_path()):
         Ledger(path).close()
     say(f"Saved {paths.config_path()} and created {ledger}.")
+    if config["bars_source"] == "none":
+        say(f"Note: {NO_BARS}.")
     service = None
-    if dialog.yes("Start the background service now", True):
+    try:
+        start = dialog.yes("Start the background service now", True)
+    except ValueError:  # cancelled, or no valid answer: the saved setup stands
+        start = False
+        say(f"The service was not started; start it any time with `{paths.APP_NAME} up`.")
+    if start:
         try:
             service = up(
                 config,
@@ -635,11 +745,14 @@ def _number(value: str) -> float:
         raise ValueError("Enter a number") from None
 
 
-def _store_keys(dialog: _Dialog, config: dict, runner: secrets.Runner | None) -> list[str]:
+def _ask_keys(
+    dialog: _Dialog, config: dict, runner: secrets.Runner | None
+) -> list[tuple[str, str]]:
+    """Key values to store, asked before anything is saved; nothing is stored here."""
     needed = [PROVIDER_KEYS[config["provider"]]] if config["provider"] in PROVIDER_KEYS else []
     if config["bars_source"] == "alpaca":
         needed += list(ALPACA_KEYS)
-    stored = []
+    typed = []
     for name in needed:
         try:
             known = secrets.get(name, runner=runner) is not None
@@ -648,8 +761,16 @@ def _store_keys(dialog: _Dialog, config: dict, runner: secrets.Runner | None) ->
         if known and not dialog.yes(f"{name} is already available; replace it", False):
             continue
         value = dialog.hidden(f"{name} for the Keychain (hidden; blank to skip): ")
-        if not value:
-            continue
+        if value:
+            typed.append((name, value))
+    return typed
+
+
+def _store_keys(
+    dialog: _Dialog, keys: list[tuple[str, str]], runner: secrets.Runner | None
+) -> list[str]:
+    stored = []
+    for name, value in keys:
         try:
             secrets.set(name, value, runner=runner)
         except (RuntimeError, ValueError) as exc:

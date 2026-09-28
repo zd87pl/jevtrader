@@ -1,289 +1,241 @@
-# JEVTrader
+<h1 align="center">JEVTrader</h1>
 
-A small Python research lab for testing whether changes in corporate disclosures help predict subsequent stock returns. It combines JEV semantic features, a ridge regression model, deterministic filters, and an immutable SQLite ledger.
+<p align="center"><strong>Score SEC 8-K filings point-in-time, and see which LLM results can count as evidence.</strong></p>
 
-**This is research software, not a trading bot.** It has no broker connection, order execution, or fill simulator. The optional background service ([Run it for you](#run-it-for-you-macos)) watches filings, records decisions and sends a brief; it never places an order. Paper order plans do not place orders or track a portfolio. No profitable strategy or statistically credible alpha has been established.
+<p align="center">
+Filing text stays on your machine unless you pick a cloud model or a cloud MCP client. No API key to try it. It never places an order.<br>
+Works with Jev, OpenAI, local models (Ollama, LM Studio) or an offline word-list baseline. Jev's training cutoff is undisclosed, so Jev replays never count as evidence; only its live calls can.
+</p>
 
-## Start offline
+<p align="center">
+  <a href="https://github.com/zd87pl/jevtrader/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/zd87pl/jevtrader/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/zd87pl/jevtrader/actions/workflows/ci.yml"><img alt="Python 3.11–3.14" src="https://img.shields.io/badge/python-3.11%E2%80%933.14-3776AB"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+  <a href="#ask-your-agent-read-only-mcp"><img alt="MCP: read-only" src="https://img.shields.io/badge/MCP-read--only-6f42c1"></a>
+  <a href="#what-it-is-and-isnt"><img alt="Orders placed: never" src="https://img.shields.io/badge/orders%20placed-never-lightgrey"></a>
+</p>
 
-Requires Python 3.11 or newer. From the repository directory:
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[dev]'
-python -m jevtrader --db /tmp/NEWdemo.sqlite demo
-pytest
-```
-
-Use a new, empty demo database; the demo refuses to modify a populated ledger. It creates synthetic disclosures and prices, extracts lexical features, fits a model, evaluates events, and prints a paper-plan example.
-
-**The demo deliberately injects a relationship between text and future prices. Its results are a plumbing check, not evidence of alpha.** Its weekday calendar and prices are artificial. Setup, demo, and tests make no paid API calls. Provider integrations are tested with mocked responses, not live service verification.
-
-Only `init`, `demo` and `setup` create a ledger; every other command needs an existing one. Without one, a research command names the service's ledger when setup has created it (use it with `--db`) instead of suggesting an `init` that would make an empty ledger here. Read-only commands (`status`, `show`, `evaluate` and the app views below) open it read-only. Research commands default to `--db data/jevtrader.sqlite`; the app commands in the next section default to the ledger named in the app config.
-
-## Run it for you (macOS)
-
-A background service can do the collecting for you: it watches SEC 8-K filings, fetches completed daily bars, freezes a point-in-time decision for each new filing and sends a calm pre-market brief. A localhost page and a read-only MCP server show the same code-built cards. **It never places orders and it is not investment advice.**
-
-### Install and set up
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/filing-card-dark.png">
+    <img src="docs/assets/filing-card-light.png" width="760" alt="A JEVTrader filing page from the offline demo, clearly marked as a synthetic record: two quotes checked word for word against the filing, then a WATCH decision with 'no calibrated estimate', its evidence basis from the model registry, and the text features behind it, under the banner 'Research tool, not investment advice. No orders are placed.'">
+  </picture>
+  <br><sub>A filing page from the offline demo (synthetic data). Every number is computed by code; the quotes are checked against the filing.</sub>
+</p>
 
 ```sh
-python3 -m venv .venv && source .venv/bin/activate
+git clone https://github.com/zd87pl/jevtrader && cd jevtrader
+python3 -m venv .venv && . .venv/bin/activate   # needs Python 3.11+ (check: python3 --version)
 python -m pip install -e .
-jevtrader setup
+jevtrader --db /tmp/jev-demo.sqlite demo        # offline, no API key, about a second; needs a new file each run
 ```
 
-`setup` asks, one question at a time (press Return to keep the value shown):
+The `python3` that comes with Apple's command line tools is often older than 3.11. If so, install 3.11 or newer from python.org or Homebrew and use it, for example `python3.12 -m venv .venv`.
 
-1. **Your name and email for SEC.** SEC's fair-access policy asks automated tools to identify themselves; the value goes only to sec.gov in the User-Agent header.
-2. **Watchlist** symbols, and whether to score only those or every qualifying 8-K (`all`).
-3. **Text features**: `rules` (fixed word lists, free, offline), `local` (a model served by Ollama or LM Studio on this Mac; setup runs a health check), `jev` or `openai` (paid; they receive selected filing text). Paid presets also ask for a monthly spend cap and the model's prices per million input and output tokens; the cap counts output (reasoning included) at the requested maximum when a response reports no count, and without both prices the service keeps paid extraction off.
-4. **Alpaca bars**: completed daily bars from Alpaca's free market-data API (needs the keys of a free paper account). Without bars nothing can be scored: filings are collected but their cards say `not scored: no market data`, and setup and `doctor` say so.
-5. **Brief time** (New York, weekdays) and whether to show it as a macOS notification.
-6. **Keys** for the choices above, typed hidden and stored in the macOS Keychain. Blank skips.
-7. Whether to **start the service** now (`jevtrader up`).
+> [!IMPORTANT]
+> Research software, not investment advice. **No edge has been established.** JEVTrader contains no broker or order code, and its paper plans are simulations.
 
-Nothing is saved until the last answer is in: cancelling (Ctrl-C or end of input) before then stores no key and writes no file. By the final question, keys, config and both ledgers are saved; cancelling it only leaves the service stopped.
+<p align="center"><a href="#the-problem-llm-backtests-can-score-memory-as-skill">Why</a> · <a href="#how-it-works">How it works</a> · <a href="#try-it-then-try-to-break-it">Try to break it</a> · <a href="#bring-your-own-model">Models</a> · <a href="#ask-your-agent-read-only-mcp">MCP</a> · <a href="#faq">FAQ</a> · <a href="#docs">Docs</a></p>
 
-Settings live in `~/Library/Application Support/jevtrader/` (`config.json`, owner-only), next to `forward.sqlite` (the service's ledger), `research.sqlite` (for backfills) and `logs/`. Set `JEVTRADER_HOME` to an absolute path to use another folder; `up` passes it on to the service. Config holds no secrets. `model_overrides` in `config.json` declares facts the model registry lacks, for example `{"local:qwen3:32b": {"training_cutoff": "2024-10-01"}}` or `{"openai:MODEL": {"usd_per_million_input_tokens": 1.25, "usd_per_million_output_tokens": 10}}`.
+## The problem: LLM backtests can score memory as skill
 
-### The daily loop
+Replay a 2023 filing through a model trained on 2024 data and you are not testing prediction, because the model may already know what happened next. Gao, Jiang & Yan ([arXiv:2512.23847](https://arxiv.org/abs/2512.23847)) measure this directly. The chance that a model has internalized a firm's realized outcome is materially positive throughout its training period and collapses to about zero right after the cutoff, and its forecasts look more accurate exactly where that chance is high. Glasserman & Lin ([arXiv:2309.17322](https://arxiv.org/abs/2309.17322)) add that inside the training window, general knowledge of a company can distort sentiment backtests even more than look-ahead bias does. A backtest that doesn't draw the cutoff line can score memory as skill. JEVTrader is built around four refusals:
 
-| Job | When (New York time) | What it does |
-|---|---|---|
-| `poll` | every 60 s on weekdays 06:00–22:00, else every 15 min | New 8-K/8-K/A filings from SEC's current feed that list Item 7.01 or 8.01 and not 2.02; `first_seen_at` is actual receipt |
-| `bars` | weekdays after 16:30, catching up if missed | Completed sessions (close + 20 min), stamped with actual receipt: the strategy's benchmark, then open forecasts' symbols and benchmarks, the watchlist and recent filers |
-| `observe` | after new filings or bars | One frozen forward decision per new filing with the configured provider; a batch starts no new filing after 2 minutes, so polling keeps up |
-| `settle` | after bars | Next-open to tenth-close labels once they have matured |
-| `brief` | weekdays at your brief time | Notification of the filings first seen since the previous brief (the `brief` command, page and MCP show the last 3 days) |
-| `reconcile` | 22:45 | Compares the day's EDGAR index with what was collected |
+1. **It won't count replays inside a model's training window.** Every forecast gets an evidence label from a registry of published training cutoffs. A replay counts only if the filing is dated more than 92 days after the model's cutoff, or if it came from the word-list baseline, which has no trained model. Live calls always count. The cutoffs are the ones vendors publish; JEVTrader can't check them.
+2. **It won't count a call before costs.** It assumes a 20 bps (0.20%) round trip plus a 20 bps minimum edge, so a `LONG` needs a predicted excess return above 0.40%.
+3. **It won't let history be rewritten quietly.** The ledger is append-only SQLite with a SHA-256 hash chain. Forward filings can only come from the live collector, stamped when each filing is first seen.
+4. **It won't trade.** There is no broker code, paper plans are marked `simulation_only`, and the MCP server has no write tools.
 
-Every run, skip and failure is recorded in the ledger as a `runs` record. If the Mac slept, the service was stopped, or jobs held up polling for more than 5 minutes past its interval, a `coverage_gap` record says so; filings that left SEC's 100-entry feed meanwhile are not reconstructed. `jevtrader poll` and `jevtrader bars` run one job by hand (they refuse while the service or another such job runs); a service starting meanwhile waits up to 10 minutes for them, then exits with an error so launchd tries again. `jevtrader daemon` runs the schedule in the foreground.
+## How it works
 
-### What the brief means
-
-Each card shows the symbol, form and items, when this system first saw the filing, the code-computed action and its reasons, and at most two short quotes copied verbatim from the filing (300 characters per card, never the full text). A sentence that addresses the reader or an AI agent, gives orders or names a tool is never quoted. Quotes are labeled as the company's text. `WATCH` means observation only: **without a fitted calibrator every decision is `WATCH`,** and no call counts toward the evidence gate (see [From WATCH to calls](#from-watch-to-calls)). `LONG`/`SHORT` appear only when the calibrator's predicted excess return clears costs and the minimum edge. A card without a decision says `not scored: no market data` when its symbol has no bars. A filing's outcome is the stock's move minus the benchmark's over the label window; no position is ever taken.
-
-The evidence line comes from a pre-registered gate: it counts matured `LONG`/`SHORT` calls net of assumed costs, with a 90% Student-t interval over decision dates. Status is `collecting` until 100 matured calls, then `supported` (whole interval above zero), `no_edge` (whole interval below +0.10%) or `inconclusive`. The health line names jobs that failed or need attention, and names `service` when no run has been recorded for 30 minutes: the service polls at least every 15 minutes, so silence means it is not running.
-
-### From WATCH to calls
-
-The service decides with the calibrator named in `config.json` (`"calibrator": null` at first). Once enough forward decisions have matured labels (30 by default), fit one on the service's ledger:
-
-```sh
-LEDGER="$HOME/Library/Application Support/jevtrader/forward.sqlite"
-jevtrader --db "$LEDGER" status          # extractor_keys; models once fitted
-jevtrader --db "$LEDGER" fit --extractor-key KEY --mode forward
+```mermaid
+flowchart LR
+    A["SEC 8-K feed<br/>(Items 7.01 / 8.01)"] --> B["First seen<br/>timestamp frozen"]
+    B --> C["Text features<br/>rules · local · Jev · OpenAI"]
+    M["Completed daily bars"] --> D
+    C --> D["Ridge model + cost checks<br/>WATCH · PASS · LONG · SHORT"]
+    D --> E[("Append-only ledger<br/>SHA-256 hash chain")]
+    E --> F["Outcome matures<br/>next open → 10th close vs SPY"]
+    F --> G{"Evidence label<br/>(frozen with the decision)"}
+    G -->|"forward · post_cutoff · no_model_knowledge"| H["Counts toward the gate"]
+    G -->|"contaminated · unknown_cutoff · adhoc_replay · synthetic"| I["Kept, never counted"]
+    E --> J["Brief · localhost page · read-only MCP"]
 ```
 
-Set `"calibrator": "MODEL_ID"` in `config.json` and restart the service (`jevtrader down`, then `jevtrader up`). `doctor` checks that the model is in that ledger, fit by the current evaluator and on the service's provider and model; otherwise the service's observe runs fail and health names them. Forward filings it has not yet decided with this calibrator are decided again when the service next runs: live, at that time, never backdated.
+1. **Watch.** A background service polls SEC's feed of new 8-Ks (the form a US public company files to announce a major event) that list Item 7.01 or 8.01, and skips earnings releases (Item 2.02). It records when each filing was first seen.
+2. **Decide.** Your chosen provider turns the filing into four text features (direction, materiality, novelty, uncertainty). Code adds four market features: reaction, momentum and volatility from completed daily bars, plus an assumed spread. A ridge regression (a regularized linear model) predicts the stock's return relative to SPY, an S&P 500 index fund. Code, not the LLM, then picks the action: `WATCH` (no fitted model yet, so observe only), `PASS` (the prediction doesn't clear costs or a filter), or `LONG`/`SHORT` (the stock is expected to beat or trail SPY over about two weeks).
+3. **Freeze, then score.** The decision is written to the ledger before its outcome exists. Once the outcome matures (next open to the tenth close), it is scored against SPY, net of assumed costs, and it counts only if its evidence label allows. You read the results in a calm pre-market brief, on a read-only page at `127.0.0.1:8765`, or through an MCP client.
 
-### Evidence labels
+<p align="center">
+  <img src="docs/assets/scoreboard.png" width="560" alt="The JEVTrader scoreboard page on localhost, run on the offline demo ledger: status Collecting, 'Collecting evidence: 0 of 100 matured calls', 87 forecasts excluded as not evidence, what each status means, the gate settings and the gate's SHA-256 fingerprint.">
+</p>
 
-Every new forecast records an `eligibility` label from the model registry. Only three labels count as evidence:
+**A scoreboard that can say `no_edge`.** The evidence gate is fixed in advance and fingerprinted, so you can tell if anyone moved the thresholds. It stays `collecting` until 100 evidence-eligible `LONG`/`SHORT` calls have matured. Then it reports `supported` if the whole 90% interval (Student-t, over decision dates) is above zero, `no_edge` if the whole interval is below +0.10%, and `inconclusive` otherwise. Each filing counts once, a replay never replaces a live call, and synthetic data never counts.
 
-| Label | Meaning | Counts |
-|---|---|---|
-| `forward` | Decided live, when the filing was first seen | yes |
-| `no_model_knowledge` | Replay with the `rules` baseline, which learned nothing | yes |
-| `post_cutoff` | Replay of a filing dated more than 92 days after the model's published training cutoff | yes |
-| `contaminated` | Replay of a filing the model may have seen in training | no |
-| `unknown_cutoff` | Replay with a model whose cutoff is undisclosed (JEV) or undeclared | no |
-| `adhoc_replay` | Replay of one filing picked by hand (`--event` with `--replay` or `--as-of`) | no |
-| `synthetic` | Demo data | never |
+## Try it, then try to break it
 
-Each forecast also freezes the registry facts behind its label (`eligibility_basis`: the training cutoff and whether it came from the registry or your config), and the filing page shows them. Each filing counts once: its first recorded forward call (else its first forward forecast); a replay never replaces a forward decision, and a filing with replays only uses the first one recorded. Forecasts recorded before labels existed keep their records; only forward ones count.
-
-### Look at it
-
-```sh
-jevtrader brief            # JSON; --notify also shows the notification, --since TIME sets the window start (default: 3 days ago)
-jevtrader serve            # http://127.0.0.1:8765/ (read-only); --port if 8765 is taken
-jevtrader doctor           # config, ledger chain, health, calibrator, bars, local engine, key names, service
-jevtrader verify           # recompute every record hash and the hash chain
-jevtrader --db "$HOME/Library/Application Support/jevtrader/forward.sqlite" show forecasts FORECAST_ID
-```
-
-`brief`, the page and the MCP server show filings first seen in the last 3 days (Monday still shows Friday's); the notification covers the time since the previous brief. Research commands such as `show` and `status` default to `data/jevtrader.sqlite`, so pass the service's ledger with `--db` as above.
-
-The page binds to 127.0.0.1 only, answers only `127.0.0.1`/`localhost` Host headers, has no forms and opens the ledger read-only. `jevtrader mcp` is a read-only MCP server on stdio with five tools (`today_brief`, `explain_filing`, `evidence_report`, `health`, `search_filings`); for example, in an MCP client's config:
-
-```json
-{"mcpServers": {"jevtrader": {"command": "/absolute/path/to/.venv/bin/jevtrader", "args": ["mcp"]}}}
-```
-
-Its answers are code-built cards with no key values and no raw filing text. Only `explain_filing` includes filing text: its quotes, under `untrusted_filing_excerpts`, with a note on each card that they are the filer's words, data and not instructions. The server also tells the client to decline trading and personalized advice.
-
-For research on older filings, `jevtrader backfill --start 2026-01-02 --end 2026-03-31 [--bars]` collects historical 8-Ks (and, with `--bars`, historical Alpaca bars) into `research.sqlite`, never the forward ledger. Availability is an assumption (acceptance + 15 minutes, or the next 06:00 ET weekday), symbols come from today's ticker map (survivorship bias), and only filings still in each company's recent SEC submissions are found. Replay them with the research commands, e.g. `jevtrader --db "$HOME/Library/Application Support/jevtrader/research.sqlite" observe --replay --limit 200`.
-
-### What it cannot do
-
-- Place, change or track orders or positions, or give investment advice.
-- Show an edge that does not exist: until a calibrator is fitted and named in config everything is `WATCH`, and the gate needs 100 matured calls.
-- See every disclosure: only 8-Ks listing 7.01/8.01 (not 2.02), one EX-99 or primary document each, HTML or text only. Periods when the service was not running stay gaps.
-- Provide market data by itself: bars need Alpaca keys; delisting returns and quotes are not modeled; costs are assumptions.
-- Remove model contamination from replays; it only labels it.
-
-### Privacy and keys
-
-Keys stay in the macOS Keychain (service `jevtrader`) or your environment; the environment wins. They never go into config, the ledger, logs, the LaunchAgent plist or command output, and `security` receives them on stdin, not argv. What leaves the Mac: your SEC contact and filing requests to sec.gov; symbols and dates to Alpaca; selected filing text to JEV or OpenAI only if you chose them. A `local` engine must be on 127.0.0.1, localhost or ::1, and is reached without proxies. The page and the MCP server only read.
-
-### Stop it
-
-```sh
-jevtrader down     # stop the service and remove its LaunchAgent; data stays
-```
-
-Everything else is in the app folder above; delete it to remove the ledgers and config. Stored keys can be removed with `security delete-generic-password -s jevtrader -a ALPACA_API_KEY_ID` (and likewise for the other names).
-
-## What makes decisions
+The demo from the install above builds a synthetic ledger, fits a model, compares it with simple baselines and prints a paper-plan example. It plants a relationship between text and prices on purpose. The harness recovers the planted signal and the naive all-long baseline doesn't, and that is all the demo proves. Even the demo tells you not to believe it:
 
 ```text
-SEC disclosure + earlier observed disclosure
-                   ↓
-JEV / OpenAI / fixed lexical rules → four semantic features
-                   +
-completed stock and benchmark bars → four numerical features
-                   ↓
-ridge model → predicted benchmark-relative return
-                   ↓
-evidence, liquidity, cost and risk checks → WATCH / PASS / LONG / SHORT
-                   ↓
-optional whole-share paper order plan
+"mode": "synthetic",
+"warning": "Artificial signal was injected. Results do not establish alpha.",
 ```
 
-JEV extracts direction, materiality, novelty, and uncertainty. Code calculates reaction, momentum, volatility, and an assumed spread. **JEV's probabilities are not calibrated profit probabilities.** The fitted ridge model estimates subsequent excess return; deterministic code applies the policy. Without a fitted calibrator, forecasts remain `WATCH`.
+Now try to rewrite history. The demo ledger is a throwaway, and you need the `sqlite3` command-line tool:
 
-The `rules` provider is a fixed lexical baseline that ignores strategy questions. OpenAI can extract the same features or propose changes to the three semantic questions. It does not change risk limits, execution assumptions, or the evaluator.
+```console
+$ sqlite3 /tmp/jev-demo.sqlite "DELETE FROM records"
+Error: stepping, Ledger records are immutable (19)
+```
 
-Default research settings: SPY benchmark, 21 visible history sessions, and entry at the next available session open through the tenth session close. Default paper settings are:
-
-| Setting | Default |
-|---|---:|
-| Example account equity | $3,000 |
-| Planned risk per trade | 0.25% ($7.50 at $3,000) |
-| Maximum single position | 15% of equity |
-| Maximum gross exposure | 100% of equity |
-| Maximum positions | 4 |
-| Pause new plans at drawdown | 8% from supplied peak equity |
-| Short plans | Disabled |
-
-These are conservative prototype choices, not optimized settings. Stops, pauses, and planned risk do **not** guarantee a maximum loss: gaps, halts, and short borrow recalls can exceed them. Positions, equity, cash, and peak equity are user-supplied; nothing is synchronized with a broker. A short plan additionally requires an enabled strategy and explicit `--shortable` simulation assumption.
-
-**Paper planning is stateless with respect to your account.** Supply current positions, equity, cash, and peak equity on each invocation. Repeated plans do not reserve cash or create holdings. The 8% pause only reflects drawdown when the correct `--peak-equity` is supplied; omitting it defaults the peak to current equity. This is not a portfolio simulation.
-
-## Ledger and data
+Drop the trigger, turn one `WATCH` into a `LONG` by hand, and ask the ledger to check itself:
 
 ```sh
-python -m jevtrader --db data/research.sqlite init
-python -m jevtrader --db data/research.sqlite status
+sqlite3 /tmp/jev-demo.sqlite <<'SQL'
+DROP TRIGGER records_no_update;
+UPDATE records SET payload = replace(payload, '"action":"WATCH"', '"action":"LONG"')
+ WHERE rowid = (SELECT min(rowid) FROM records
+                WHERE kind = 'forecasts' AND payload LIKE '%"action":"WATCH"%');
+SQL
+jevtrader --db /tmp/jev-demo.sqlite verify     # exits 1
 ```
 
-Records are immutable. Repeating an identical insert is harmless; conflicting content requires a new version ID. Every record is also committed to a SHA-256 hash chain; `python -m jevtrader --db data/research.sqlite verify` recomputes all record hashes and the chain (older ledgers are upgraded to the chain once, on their first read-write open). Repeated SEC collection preserves the original stored `first_seen_at`. Keep synthetic demonstrations separate from real research. Historical LLM extraction can contain knowledge learned after the event; only a newly frozen forward record establishes what this system actually observed at that time.
+```text
+  "ok": false,
+  …
+  "problems": [
+    "Record content does not match its hash: forecasts/…",
+    "Immutability trigger is missing: records_no_update"
+  ]
+```
 
-### Disclosures
+The ledger is tamper-evident, not tamper-proof. Someone with write access could rebuild the whole file with a consistent chain. To catch that, save the chain head somewhere else and check it later with `verify --anchor-seq N --anchor-hash HEX`. Nothing anchors the chain publicly. The 700+ tests run offline: `python -m pip install -e '.[dev]' && pytest`.
 
-`import-disclosures` accepts JSONL: one object per line. Required fields are `id`, `symbol`, `text`, `source_url`, `mode`, `published_at`, and `first_seen_at`. Imported modes are `historical` or `synthetic`; only collection can create forward disclosures. Example historical record:
+## Bring your own model
+
+| Provider | Where filing text goes | Cost | Can replays count as evidence? |
+|---|---|---|---|
+| `rules` (default) | Nowhere: fixed word lists | Free | Yes (`no_model_knowledge`), because there is no trained model |
+| `local` | An Ollama or LM Studio server on loopback only; proxies ignored, redirects refused | Free | For filings more than 92 days after the published cutoff. Built in: gpt-oss 120b/20b, `llama3.3:70b`, `gemma3:27b`. Declare others in config |
+| `jev` | TypeSafe's Jev API, as typed questions | Paid | No. The cutoff is undisclosed, so only live calls count |
+| `openai` | OpenAI Responses API with `store: false` | Paid | Only after a cutoff you declare |
+
+**Local models, honestly.** A local model keeps filing text on loopback and bills nothing, and its replays have a better claim to evidence than a cloud model's. The open-weight models in the registry have published cutoffs, so their post-cutoff replays can count. Jev and OpenAI replays can't without a declared cutoff, and Jev's can't be declared. Setup offers the very large `gpt-oss:120b` by default; if you pulled `gpt-oss:20b`, type that at the Model prompt. The project publishes no hardware requirements. Other OpenAI-compatible loopback servers may work, but setup only suggests Ollama and LM Studio.
+
+The Jev, OpenAI and local-engine integrations are tested against mocked responses, not against the live services. In the background service, paid providers run under a monthly spend cap and stay off until you declare token prices. A failed paid request is recorded and never retried silently.
+
+## Ask your agent (read-only MCP)
+
+`jevtrader mcp` is a stdio MCP server with five tools, all marked `readOnlyHint`:
+
+| Ask your agent | Tool | What comes back |
+|---|---|---|
+| "What 8-Ks came in this morning?" | `today_brief` | Filings first seen in the last 3 days, watchlist first, with code-computed actions and reasons, evidence status and service health |
+| "Walk me through that filing." | `explain_filing` | One card: items, SEC link, each decision with its evidence label, and at most 300 characters of verbatim excerpts under `untrusted_filing_excerpts` |
+| "Any 8-Ks from this company since Monday?" | `search_filings` | Stored filings, most recently seen first |
+| "Is there any evidence yet?" | `evidence_report` | The scoreboard and the gate status |
+| "Is the collector running?" | `health` | Last run of each job, coverage gaps and ledger status |
 
 ```json
-{"id":"example-20260106","symbol":"ABC","published_at":"2026-01-06T21:05:00Z","first_seen_at":"2026-01-06T21:10:00Z","source_url":"https://example.com/disclosures/example-20260106","mode":"historical","text":"The company reports an operating update with specific changes in demand."}
+{"mcpServers": {"jevtrader": {"command": "/absolute/path/to/jevtrader/.venv/bin/jevtrader", "args": ["mcp"]}}}
 ```
 
-```sh
-python -m jevtrader --db data/research.sqlite import-disclosures disclosures.jsonl
-```
+A server can't stop a model from making things up. What this one does is make the figures and quotes it hands over checkable against the ledger and the SEC source link. The server tells the client to decline trading and personalized advice, and calling a tool that doesn't exist, such as `place_order`, gets `Unknown tool`. It reads the service's ledger by default; put `--db PATH` before `mcp` to read another. The brief and search hide the demo's synthetic filings, so on the demo ledger the honest answer to "what came in?" is "nothing yet"; `explain_filing` still opens one by id, labelled synthetic. Any stdio MCP client should work (protocol versions 2024-11-05 to 2025-11-25), but no specific client app has been tested yet. See [docs/mcp.md](docs/mcp.md).
 
-For public SEC data, provide your real contact-bearing User-Agent; no SEC API key is needed:
+## Run it on real filings
 
-```sh
-export SEC_USER_AGENT='Your Name your-real-contact@your-domain.com'
-python -m jevtrader --db data/forward.sqlite collect --cik 0000320193 --symbol AAPL --limit 5
-```
+On macOS, `jevtrader setup` asks for your SEC contact, a watchlist, a text provider, market-data keys and a brief time, and stores keys in the Keychain. `jevtrader up` then starts a background service that polls SEC, fetches daily bars, freezes decisions and sends a pre-market brief (08:45 New York time by default). `jevtrader down` stops it, and your data stays.
 
-Collection accepts 8-K/8-K/A filings listing 7.01 or 8.01 while excluding Item 2.02. It prefers one EX-99 HTML/text exhibit and marks primary-document fallbacks. Filename/link heuristics cannot guarantee an exhibit's type or that content is non-earnings. Unknown item metadata is excluded; PDFs and complete attachment coverage are unsupported. Requests are bounded and rate-limited; external links and redirects are not followed.
+- **Scoring needs daily bars.** They come from Alpaca's free market-data API, using the keys of a free paper account. Nothing trades through Alpaca. Without bars, cards say `not scored: no market data`.
+- **Expect weeks of `WATCH`.** Every decision is `WATCH` until at least 30 forward outcomes have matured and you fit a calibrator (the ridge model) and name it in config. The gate needs 100 matured `LONG`/`SHORT` calls after that.
+- **Linux** runs the CLI, research commands, brief, page and MCP server, with keys from environment variables, but has no service installer yet. **Windows is not supported.**
 
-`published_at` is SEC acceptance time, **not guaranteed public availability**. The collector records actual receipt as `first_seen_at`. Polling an old filing now does not create a historical forward observation or reconstruct what a historical observer had seen.
+The full guide is in [docs/service.md](docs/service.md).
 
-### Raw session bars
+## What it is, and isn't
 
-Supply raw, unadjusted OHLCV for each stock **and SPY**, with actual session timestamps and explicit time zones. CSV example:
+| JEVTrader is | JEVTrader is not |
+|---|---|
+| A point-in-time research lab for SEC 8-Ks (Items 7.01/8.01, not earnings) | A trading bot. It has no broker, no order routing and no position tracking |
+| A way to score filing text with a word-list baseline, local models, Jev or OpenAI | Proof that any of them predicts returns. **No edge has been established** |
+| A labeller of possible model memorization in replays | A cure for it. It labels contamination; it does not remove it |
+| A hash-chained local ledger you can check with `jevtrader verify` | Tamper-proof or publicly anchored. It is tamper-evident |
+| Event-level, benchmark-relative evaluation against simple baselines | A portfolio backtester with equity curves or Sharpe ratios |
+| Read-only cards in a brief, on localhost and over MCP | Investment advice, or real-time. It uses completed daily bars |
 
-```csv
-symbol,session,open_at,close_at,open,high,low,close,volume,split_ratio,cash_dividend,available_at
-ABC,2026-01-06,2026-01-06T14:30:00Z,2026-01-06T21:00:00Z,100,103,99,102,1000000,1,0,2026-01-06T21:01:00Z
-SPY,2026-01-06,2026-01-06T14:30:00Z,2026-01-06T21:00:00Z,600,603,598,602,50000000,1,0,2026-01-06T21:01:00Z
-```
+## FAQ
 
-These two rows illustrate format only. Observations need at least 21 aligned prior sessions; labels need the full future horizon. Use the correct UTC offset for daylight saving and actual early-close times.
+<details><summary><strong>Does it make money?</strong></summary>
 
-```sh
-python -m jevtrader --db data/research.sqlite import-bars bars.csv --mode historical
-python -m jevtrader --db data/forward.sqlite import-bars completed-bars.csv --mode forward
-```
+Unknown. **No edge has been established.** The demo's strong-looking numbers come from a signal planted on purpose. On real filings, JEVTrader reports `supported` only after 100 evidence-eligible calls have matured and cleared the gate net of costs, and it is just as able to report `no_edge`. Nothing it shows is investment advice.
+</details>
 
-Historical `available_at` defaults to session close if omitted: that is an assumption, not verified receipt. Forward imports ignore supplied availability and stamp actual import time. Importing past bars today cannot make them visible to yesterday's decision. Use a separate database when changing provenance; immutable bar IDs identify symbol/session.
+<details><summary><strong>Why is every decision <code>WATCH</code>?</strong></summary>
 
-`split_ratio` means new shares per prior share at that session's open; default 1. `cash_dividend` is cash per **post-split** share on the ex-date; default 0. Labels credit dividends only when the position was held before that open and carry split-adjusted share counts. Do not supply adjusted prices and then apply corporate actions again. Prior cash dividends are not reinvested in holding-period labels.
+Until at least 30 forward decisions have matured outcomes (the default) and you fit a calibrator and name it in config, there is nothing honest to calibrate against. Expect weeks to months of collection before any `LONG` or `SHORT`, and longer before the gate can decide.
+</details>
 
-## Observe, label, and evaluate
+<details><summary><strong>Why don't my Jev or OpenAI replays count?</strong></summary>
 
-Begin with the free offline rules baseline:
+Jev's training cutoff is undisclosed, so every Jev replay is labelled `unknown_cutoff`, and config can't declare one. OpenAI models have no built-in cutoffs. You can declare one in `model_overrides`, and replays of filings dated more than 92 days after it can then count. A declared cutoff can't be set earlier than a published one.
+</details>
 
-```sh
-python -m jevtrader --db data/research.sqlite observe --replay --provider rules --model rules-v1 --limit 200
-python -m jevtrader --db data/research.sqlite settle
-python -m jevtrader --db data/research.sqlite status
-```
+<details><summary><strong>What leaves my machine?</strong></summary>
 
-Replay uses each disclosure's first-seen timestamp and remains historical. `--as-of TIMESTAMP --event ID` is another explicit replay. Without either, `observe` decides only collected forward disclosures at the current time; pending historical and synthetic records are skipped (counted under `skipped.requires_replay`) rather than paired with today's market, and naming one with `--event` alone is reported under `errors` (exit status 1). Observation excludes future documents and unavailable bars. Features and provider responses are cached; historical repeats at the same decision time are idempotent. Forward decisions include the time required to finish extraction.
+Your SEC contact and filing requests go to sec.gov, and symbols and dates go to Alpaca for bars. Filing text goes to TypeSafe or OpenAI only if you choose `jev` or `openai`; with `rules` or `local` it stays on your machine. If you connect a cloud-hosted MCP client, it receives the short excerpts that `explain_filing` returns. Keys come from environment variables or the macOS Keychain and are never written to config, the ledger or logs.
+</details>
 
-Pass `--provider local` (default model `gpt-oss:120b`) to use a local engine at the config's `local_base_url`. Nothing is billed: an engine that is down stops the run without recording an attempt, while a model that answers invalidly twice is recorded under `attempts` like a failed paid request and later queued runs skip it.
+<details><summary><strong>What can fool the gate?</strong></summary>
 
-Extraction sends at most 40,000 characters: the start of the current document, with up to 10,000 characters reserved for the start of the previous one; any budget the current document leaves unused also goes to the previous one. A truncated extraction records its `text_excerpt` sizes; the ledger and the extraction cache key keep the full collected text. Queued events whose symbol or benchmark has fewer stored bars than `min_history_sessions` are skipped up front (counted under `skipped.no_market_data`). Other events rejected by local checks (too little history at decision time, stale data, a calibrator that cannot score them) are reported under `errors` without blocking later events or counting against `--limit`; a run stops scanning after `--max-scan` (default 200) such rejections and reports `skipped.scan_truncated`. With a paid provider, a failed or interrupted request stops the run because it may have been billed. The failure is recorded under `attempts` (`status` lists them under `failed_attempts`; inspect one with `show attempts ID`), and later queued runs skip that event for the same provider, model and questions (counted under `skipped.failed_before`) unless you pass `--retry-failed` or name it with `--event`; once such a retry succeeds, the event is queued normally again.
+Several things, which is why [Contributing](#contributing-try-to-fool-it) asks you to find more:
 
-Forward and replay observations remain separate. If an extractor has records in multiple modes, `fit` and `evaluate` require an explicit `--mode forward`, `--mode historical`, or `--mode synthetic`; a backdated replay cannot replace a forward observation in that cohort.
+- **Self-reported cutoffs.** Labels trust the training cutoffs that vendors publish. Names match exactly, so a fine-tune or renamed build gets `unknown_cutoff`, but a wrong published cutoff would mislabel replays.
+- **Overlapping windows.** Calls on nearby dates share market moves over their 10-session windows. The interval groups calls by decision date, not by overlap, so it understates uncertainty.
+- **Many tries.** Within one ledger each filing counts once, as its first recorded call, so re-scoring can't swap in a better call. Across ledgers, providers, question sets or autoresearch trials, trying many and keeping the best inflates false `supported` results.
+- **Backfills.** On a research ledger, word-list replays of backfilled filings are labelled `no_model_knowledge` and count, even though backfills use assumed availability times and today's ticker list (survivorship bias).
+- **Costs.** The 20 bps round trip is an assumption, not an observed fill.
+</details>
 
-Use the actual extractor key printed by `status`; model schemas and resolved provider models must match:
+<details><summary><strong>What is Jev, and why "Trader" if it never trades?</strong></summary>
 
-```sh
-EXTRACTOR_KEY='paste-extractor-key-from-status'
-python -m jevtrader --db data/research.sqlite fit --extractor-key "$EXTRACTOR_KEY" --cutoff 2026-09-01T00:00:00Z
-python -m jevtrader --db data/research.sqlite evaluate --extractor-key "$EXTRACTOR_KEY" --before 2026-09-01T00:00:00Z
-```
+Jev is TypeSafe AI's typed-decision model and one of four text providers here; the default is the offline word-list baseline. JEVTrader studies trading decisions: it records point-in-time calls and can draft stateless paper plans, but it has no way to execute them. Similarly named projects exist, and some of them do place orders. This one can't.
+</details>
 
-Choose cutoffs appropriate to your dataset. Only labels received strictly before the training cutoff enter training. Thirty samples is a **computational minimum, not evidence of an edge**. Walk-forward evaluation freezes each test-block model and excludes overlapping, not-yet-mature training labels. It compares semantic-plus-numerical features against numerical-only, semantic-direction, and all-long baselines. The report key `semantic` applies to JEV, OpenAI, or rules features, depending on the chosen extractor.
+## Docs
 
-To use JEV or OpenAI, explicitly choose the provider/model and export `TYPESAFE_API_KEY` or `OPENAI_API_KEY` (or store it in the Keychain with `jevtrader setup`; commands that can use keys read it from there). `.env.example` documents variables; `.env` files are **not automatically loaded**. A key is needed only for extractions that are not already cached; without one, `observe` stops at the first such event with exit status 2, still printing the forecasts it already recorded, with that event under `errors` and `skipped.missing_credentials` set. These commands can incur provider charges and send selected disclosure text to that provider:
+| Doc | What's in it |
+|---|---|
+| [Running the service](docs/service.md) | macOS setup, the daily job schedule, reading a brief card, going from `WATCH` to calls, privacy and keys, Linux notes, stopping |
+| [Evidence labels and the gate](docs/evidence.md) | All seven labels, `eligibility_basis`, the 92-day buffer, declaring cutoffs, how filings are counted, gate statistics |
+| [Research workflow](docs/research-workflow.md) | observe → settle → fit → evaluate, providers and keys, calibrators, paper plans, bounded question research, backfills |
+| [Ledger and data formats](docs/data-and-ledger.md) | Immutability, the hash chain, `verify` and anchors, disclosure JSONL, SEC collection, bar CSV, splits and dividends |
+| [MCP server](docs/mcp.md) | Tools, output rules, client configuration |
+| [Limitations](docs/limitations.md) | What it cannot do, what the numbers do not establish, what can fool the gate |
 
-```sh
-python -m jevtrader --db data/forward.sqlite observe --provider jev --model jev-1.13.0 --limit 5
-# Alternative: --provider openai --model YOUR_AVAILABLE_OPENAI_MODEL
-```
+## Roadmap: planned, not built
 
-Once a compatible model exists, pass `--calibrator MODEL_ID` on new observations. Its cutoff must precede the decision; training events cannot be scored as new events, and synthetic-trained models cannot score real disclosures. Models fit before the current evaluator (`ridge-event-v2`) are refused, as are paper plans for forecasts they scored; re-fit them with `fit` (`status` shows each model's `version`). Without `--event`, the queue leaves out events the model can never score and counts them under `skipped.calibrator_ineligible`: its training events, real events for a synthetic-trained model and, with `--replay` (which decides at first sight), events first seen at or before its cutoff. A live run decides now, so it also scores forward events collected before the cutoff. Inspect returned forecast IDs and plan a simulation only:
+None of this exists yet, and no dates are promised. Today JEVTrader installs from source only.
 
-```sh
-python -m jevtrader --db data/forward.sqlite paper-plan --forecast FORECAST_ID --equity 3000 --cash 3000 --peak-equity 3000
-python -m jevtrader --db data/forward.sqlite show forecasts FORECAST_ID
-```
+- [ ] A PyPI release, so `pipx install jevtrader` works
+- [ ] A fixture ledger, so the brief and pages can be previewed without weeks of collection
+- [ ] A public weekly evidence-gate status from a real forward ledger: aggregate only, never per-ticker calls, published whatever it says, including `no_edge`
+- [ ] A Linux background service (systemd user unit), and Windows support for the CLI
+- [ ] Optional external anchoring of the ledger's chain head
 
-## Bounded question research
+## Contributing: try to fool it
 
-This adapts autoresearch's experiment pattern; it does not run Karpathy's GPU-training repository. First build enough matured baseline observations. With the default training floor, the development universe needs at least 40 events, and purging must leave at least 10 evaluated events.
+The most valuable bug report here is a way to make JEVTrader count something it shouldn't. That could be a replay that slips into the evidence, a backdated forward record, a missing cost, or a quote that isn't verbatim. [Open an issue](https://github.com/zd87pl/jevtrader/issues) with the steps to reproduce it.
 
-```sh
-python -m jevtrader --db data/research.sqlite autoresearch --provider jev --model jev-1.13.0 --proposal-model YOUR_AVAILABLE_OPENAI_MODEL --development-until 2026-09-01T00:00:00Z --rounds 3
-```
+Also welcome: a model's published training cutoff with its source, reports from MCP clients and local engines that work (or don't), a Linux service unit, Windows support for the CLI, docs and screenshots.
 
-The first round evaluates the baseline; later rounds ask OpenAI to change only question text/name. The ledger locks the development cutoff, baseline, provider, model, and event universe. Before locking, it rejects a universe that mixes real and synthetic events or that purging would leave with fewer than 10 evaluated events. Missing API keys fail before the research settings are locked or any trial or proposal budget is reserved (with `--rounds` above 1, both the OpenAI key and the extraction provider's key are checked first); a completed trial is returned again without keys. A completed trial is reused only if the current evaluator (`ridge-event-v2`) scored it; running one scored by an earlier evaluator uses a new trial slot. A paid proposal that fails local strategy validation is recorded as `proposal_rejected` with its response and still counts as a proposal attempt; `autoresearch` lists it under `rejected_proposals`, and that round produces no trial. The limit is **five candidate trials per ledger, at most 200 events each**, plus at most **four proposal API attempts**, including failures and manual `propose` calls. Failed started trials are retained and are not automatically retried, even under a later evaluator. This bounds calls, not a dollar amount. The resolved provider model is pinned; changes during comparison are rejected. `experiment` tests a candidate JSON; `propose` writes a candidate from a completed development trial. Run either with `--help` for arguments.
+Before opening a PR, install the dev extra (`python -m pip install -e '.[dev]'`) and run `ruff check . && ruff format --check . && pytest`. The suite refuses network, Keychain and launchctl access, so it runs offline. To try your own questions, copy `jevtrader/default_strategy.json`, edit it and pass it before the command, for example `jevtrader --strategy my-strategy.json up`. The watchlist lives in `config.json`, not in the strategy file.
 
-The development winner is never automatically promoted. All adaptive results remain development results; freeze a chosen version and collect new forward observations before judging it. Repeatedly changing questions against the same holdout contaminates that holdout.
+If you think LLM backtests should say what the model might have memorized, a star helps other people find this one.
 
-## What the numbers do not establish
+## Disclaimer
 
-- Evaluation reports **event-level benchmark-relative returns**, not portfolio P&L, an executable hedged portfolio, an equity curve, or Sharpe. Events overlap and are not independent. The research comparison omits paper sizing and several policy gates.
-- Spread, slippage, commissions, and borrow costs are configurable assumptions, not observed quotes or actual fills. Event evaluation uses fixed round-trip basis points and excludes dollar commissions and short borrow costs; paper plans include configured commissions and borrow estimates. Paper plans use the stored reference price, not a live executable quote. Short results are conditional on borrow availability and costs.
-- No exchange calendar, delisting-return feed, point-in-time universe, or market-data subscription is bundled. Stock/benchmark gaps are checked against each other, but sessions missing from **both** can remain undetected. Delistings and missing future data remain unresolved; inspect unresolved counts instead of silently treating those events as losses, wins, or exclusions.
-- Historical text may be contaminated by model pretraining. Chronological splits cannot remove that contamination, survivorship bias, bad timestamps, revised source data, or repeated-search overfitting.
-- More trials or more complex models do not establish statistical validity. The next useful evidence is a frozen strategy observed forward with realistic data, costs, and a comparison against simple alternatives.
+JEVTrader is research software, provided under the MIT License without warranty. It is not investment, financial, legal or tax advice, and nothing it outputs is a recommendation to buy, sell or hold any security. `LONG`, `SHORT`, `WATCH` and `PASS` are research labels. No edge has been established, and past or simulated results are not indicative of future returns. Paper plans are simulations: stops and pauses do not guarantee a maximum loss, and costs are assumptions, not observed fills. Provider integrations are tested against mocked responses. You are responsible for your own decisions, and for following SEC's fair-access policy and your data providers' terms. Jev is a model by TypeSafe AI; JEVTrader is an independent project, not affiliated with or endorsed by TypeSafe AI. Other product names belong to their owners.
+
+## License
+
+[MIT](LICENSE) © 2026 Zygmunt Dyras

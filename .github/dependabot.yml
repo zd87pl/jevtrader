@@ -5,3 +5,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # Python: pyproject.toml ranges and the exact CI pins in
+  # requirements/test-constraints.txt.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

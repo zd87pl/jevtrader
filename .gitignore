@@ -10,4 +10,5 @@ dist/
 data/
 *.sqlite*
 *.db
-
+.coverage
+.mypy_cache/

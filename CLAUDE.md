@@ -22,21 +22,22 @@ The plan to grow it into an Evidence Engine is [ADR-0001](docs/adr/0001-evidence
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate   # first; .venv/ is gitignored (.gitignore:1)
-python -m pip install -e '.[dev]'            # pytest and ruff (pyproject.toml:15)
-python -m pip install mypy==1.20.1           # the version CI pins; not in the dev extra yet (P0-21)
+python -m pip install -e '.[dev]' -c requirements/test-constraints.txt   # pytest, pytest-cov, pytest-timeout, ruff, mypy
 ruff check . && ruff format --check .
-python -m pytest -q                          # about 5 s: 742 tests, 1313 subtests, offline
-mypy jevtrader --ignore-missing-imports      # 9 known errors; CI fails above 9 (.github/workflows/ci.yml:36-41)
+python -m pytest -q                          # about 7 s, offline; CI adds --cov-fail-under=95 and a 300 s timeout
+mypy jevtrader --ignore-missing-imports      # 0 errors; CI fails on any change from its exact baseline
+python tools/secret_scan.py                  # offline secret scan; CI also runs it with --canary
 JEVTRADER_HOME="$(mktemp -d)" python -m jevtrader --db "$(mktemp -d)/demo.sqlite" demo   # synthetic demo, never evidence
 ```
 
 - **Use a virtual environment.** Homebrew's Python and many Linux distributions mark the system interpreter as externally managed (PEP 668), so `pip install` outside a venv fails there.
 - **`python -m jevtrader` works without installing the package** when run from the repo root, as `docs/data-and-ledger.md:68` does. The bare `jevtrader` command exists only after `pip install -e .`.
 
-CI runs three jobs (`.github/workflows/ci.yml`):
-- **Lint:** ruff 0.15.9 and mypy on Python 3.14.
-- **Tests:** ubuntu with Python 3.11 to 3.14, and macOS with 3.11 and 3.14.
-- **Wheel smoke test:** runs the demo from a clean venv.
+CI runs four jobs (`.github/workflows/ci.yml`):
+- **Lint and types:** ruff 0.15.9, and mypy 1.20.1 on Python 3.14 against an exact baseline of 0.
+- **Tests:** ubuntu with Python 3.11 to 3.14 and macOS with 3.11 and 3.14, with a 95% coverage floor and a hang timeout.
+- **Secret scan and dependency audit:** `tools/secret_scan.py` (with a canary self-check) and `pip-audit`.
+- **Wheel smoke test:** on ubuntu and macOS, runs the demo from a clean venv.
 
 **Keep manual runs out of the real app directory.** Set `JEVTRADER_HOME` to a temporary directory so config, ledgers and the lock stay out of it (`jevtrader/paths.py:10-21`).
 
@@ -76,7 +77,7 @@ Never write code or tests that go around these guards.
 - **Typing.**
   - Annotate every new function.
   - Code in `jevtrader/contracts/` and the trusted core (`pit`, `validate`, `trials`, `risk`, `execution`) must pass `mypy --strict`.
-  - Elsewhere, never raise the mypy error count.
+  - Elsewhere, keep mypy at 0 errors.
   - At module boundaries, use TypedDicts or frozen dataclasses, not bare `dict`.
 - **Time.**
   - Store instants as UTC ISO strings ending in `Z`, and parse them with `common.instant` (`jevtrader/common.py:22-31`), which rejects naive values.

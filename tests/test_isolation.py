@@ -79,7 +79,7 @@ class GuardTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "run 'osascript'"):
                 notify.macos("title", "body")
         with self.assertRaisesRegex(AssertionError, "a real system command"):
-            secrets._run(["/usr/bin/security", "find-generic-password"])
+            secrets.run(["/usr/bin/security", "find-generic-password"])
         with patch.dict(os.environ):
             os.environ.pop("OPENAI_API_KEY", None)
             self.assertIsNone(secrets.get("OPENAI_API_KEY"))  # the Keychain reads as absent

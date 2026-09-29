@@ -123,7 +123,7 @@ class NoOrderRouteTests(unittest.TestCase):
             ):
                 url = f"https://{host}{path}?{urlencode({'symbol': 'AAPL', 'qty': '1'})}"
                 with self.subTest(url=url), self.assertRaises(bars.BarsError):
-                    bars._validate_url(url)
+                    bars.validate_url(url)
 
 
 class GuardSelfTests(unittest.TestCase):

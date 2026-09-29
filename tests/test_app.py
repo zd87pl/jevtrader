@@ -162,8 +162,8 @@ class TempHome(unittest.TestCase):
             os.environ.pop(name)
         # Also under plain unittest (no conftest): never the real Keychain or launchctl.
         for patcher in (
-            patch.object(app.secrets, "_keychain_available", return_value=False),
-            patch.object(app.launchd, "_run", side_effect=AssertionError("real launchctl")),
+            patch.object(app.secrets, "keychain_available", return_value=False),
+            patch.object(app.launchd, "run", side_effect=AssertionError("real launchctl")),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)

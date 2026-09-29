@@ -354,7 +354,7 @@ class ObserveQueueTests(unittest.TestCase):
         transport = MagicMock(return_value=response)
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json") as network,
+            patch("jevtrader.providers.post_json") as network,
         ):
             result = self.queue(
                 replay=True, provider="jev", model="jev-1.13.0", transport=transport

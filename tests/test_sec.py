@@ -160,7 +160,7 @@ class CollectorTests(unittest.TestCase):
             sec._published_at("2026-07-01")
 
     def test_invalid_inputs_never_make_a_request(self):
-        with patch.object(sec, "_transport") as transport:
+        with patch.object(sec, "urlopen") as transport:
             for kwargs in [
                 {"cik": "../1"},
                 {"cik": "0"},
@@ -215,7 +215,7 @@ class CollectorTests(unittest.TestCase):
             "https://www.sec.gov:443/Archives/edgar/data/123456/000012345626000001/ex99.htm",
         ]:
             with self.subTest(url=url), self.assertRaises(sec.SECError):
-                sec._validate_url(url)
+                sec.validate_url(url)
         with self.assertRaises(sec.SECError):
             sec._NoRedirects().redirect_request(None, None, 302, "", {}, "https://evil.test")
 
@@ -433,7 +433,7 @@ class FeedURLTests(unittest.TestCase):
             "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR4/form.20261231.idx",
         ]:
             with self.subTest(url=url):
-                sec._validate_url(url)
+                sec.validate_url(url)
 
     def test_near_miss_feed_ticker_and_index_urls_are_blocked(self):
         feed = self.FEED.format(100)
@@ -471,7 +471,7 @@ class FeedURLTests(unittest.TestCase):
             BASE + "d\u00e9x99.htm",
         ]:
             with self.subTest(url=url), self.assertRaises(sec.SECError):
-                sec._validate_url(url)
+                sec.validate_url(url)
 
     def test_bulk_reads_have_their_own_byte_bound(self):
         url = "https://www.sec.gov/files/company_tickers.json"

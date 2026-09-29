@@ -204,10 +204,10 @@ class EndToEndTests(unittest.TestCase):
                     "ALPACA_API_SECRET_KEY": "test-secret-key",
                 },
             ),
-            patch.object(secrets, "_keychain_available", return_value=False),
+            patch.object(secrets, "keychain_available", return_value=False),
             patch.object(sec, "_DEFAULT_LIMITER", quiet),
             patch.object(bars, "_LIMITER", bars._RateLimiter(lambda: 0.0, lambda _: None)),
-            patch.object(sec, "_utc_now", self.clock.moment),
+            patch.object(sec, "utc_now", self.clock.moment),
             # Every module that stamps receipt or decision time reads the same fake clock.
             patch("jevtrader.engine.utc_now", self.clock),
             patch("jevtrader.market.utc_now", self.clock),

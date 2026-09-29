@@ -128,7 +128,7 @@ class UrlTests(GuardedTestCase):
             (config.DEFAULTS["local_base_url"], config.DEFAULTS["local_base_url"]),
         ):
             with self.subTest(url=url):
-                self.assertEqual(local._base_url(url), expected)
+                self.assertEqual(local.normalize_base_url(url), expected)
 
     def test_anything_that_could_leave_the_machine_is_rejected_before_a_request(self):
         rejected = (
@@ -179,7 +179,7 @@ class UrlTests(GuardedTestCase):
             transport = Mock(return_value=completion())
             with self.subTest(url=url):
                 with self.assertRaises(providers.ProviderInputError):
-                    local._base_url(url)
+                    local.normalize_base_url(url)
                 with self.assertRaises(providers.ProviderInputError):
                     local.extract("m", "text", "", QUESTIONS, base_url=url, transport=transport)
                 with self.assertRaises(providers.ProviderInputError):
@@ -190,7 +190,7 @@ class UrlTests(GuardedTestCase):
         with patch("urllib.request.build_opener") as opener:
             for url in ("http://example.com/v1/models", "http://127.0.0.1@evil.com/v1"):
                 with self.subTest(url=url), self.assertRaises(providers.ProviderInputError):
-                    local._http_json(url, None, "", 5)
+                    local.http_json(url, None, "", 5)
         opener.assert_not_called()
 
     def test_constants_agree_with_config(self):
@@ -199,7 +199,7 @@ class UrlTests(GuardedTestCase):
         self.assertEqual(local.LOOPBACK_HOSTS, frozenset({"127.0.0.1", "localhost", "::1"}))
 
     def test_config_accepts_exactly_the_urls_the_engine_accepts(self):
-        # One rule in local._base_url: config once kept its own host list and accepted paths
+        # One rule in local.normalize_base_url: config once kept its own host list and accepted paths
         # the engine then refused at request time.
         for url in (
             "http://LOCALHOST:1234/v1/",
@@ -212,7 +212,7 @@ class UrlTests(GuardedTestCase):
         ):
             with self.subTest(url=url):
                 try:
-                    expected = local._base_url(url)
+                    expected = local.normalize_base_url(url)
                 except providers.ProviderInputError:
                     with self.assertRaisesRegex(ValueError, "local_base_url"):
                         config.validate({"local_base_url": url})
@@ -657,7 +657,7 @@ class DefaultTransportTests(unittest.TestCase):
     def test_post_has_no_proxy_no_redirect_and_no_key(self):
         patcher, opener, response = self.open_with(body=b'{"ok": true}')
         with patcher as build:
-            result = local._http_json(CHAT, {"model": "m"}, "sk-sensitive", 7.5)
+            result = local.http_json(CHAT, {"model": "m"}, "sk-sensitive", 7.5)
         self.assertEqual(result, {"ok": True})
         handlers = build.call_args.args
         proxy = [h for h in handlers if isinstance(h, local.urllib.request.ProxyHandler)]
@@ -678,7 +678,7 @@ class DefaultTransportTests(unittest.TestCase):
     def test_get_when_payload_is_none(self):
         patcher, opener, _ = self.open_with(body=json.dumps(listing("m")).encode())
         with patcher:
-            self.assertEqual(local._http_json(f"{BASE}/models", None, "", 5), listing("m"))
+            self.assertEqual(local.http_json(f"{BASE}/models", None, "", 5), listing("m"))
         request = opener.open.call_args.args[0]
         self.assertEqual(request.get_method(), "GET")
         self.assertIsNone(request.data)
@@ -687,7 +687,7 @@ class DefaultTransportTests(unittest.TestCase):
     def test_http_errors_keep_only_the_status(self):
         patcher, _, _ = self.open_with(error=http_error(500))
         with patcher, self.assertRaises(providers.ProviderError) as caught:
-            local._http_json(CHAT, {}, "", 5)
+            local.http_json(CHAT, {}, "", 5)
         self.assertNotIsInstance(caught.exception, local.EngineUnreachable)
         self.assertIn("500", str(caught.exception))
         self.assertNotIn("sensitive", str(caught.exception))
@@ -706,7 +706,7 @@ class DefaultTransportTests(unittest.TestCase):
                 patcher,
                 self.assertRaises(local.EngineUnreachable) as caught,
             ):
-                local._http_json(CHAT, {}, "", 5)
+                local.http_json(CHAT, {}, "", 5)
             self.assertIn(text, str(caught.exception))
             self.assertNotIn("sensitive", str(caught.exception))
 
@@ -724,7 +724,7 @@ class DefaultTransportTests(unittest.TestCase):
                 patcher,
                 self.assertRaises(providers.ProviderValidationError),
             ):
-                local._http_json(CHAT, {}, "", 5)
+                local.http_json(CHAT, {}, "", 5)
 
 
 class _Engine(http.server.BaseHTTPRequestHandler):

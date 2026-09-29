@@ -22,13 +22,13 @@ _VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=:-]{0,511}")
 Runner = Callable[..., Any]  # runner(argv: list[str], input: str | None) -> .returncode, .stdout
 
 
-def _run(argv: list[str], input: str | None = None) -> subprocess.CompletedProcess:
+def run(argv: list[str], input: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv, input=input, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
     )
 
 
-def _keychain_available() -> bool:
+def keychain_available() -> bool:
     return sys.platform == "darwin" and os.path.exists(SECURITY)
 
 
@@ -62,9 +62,9 @@ def get(name: str, *, runner: Runner | None = None) -> str | None:
     if os.environ.get(name):
         return os.environ[name]
     if runner is None:
-        if not _keychain_available():
+        if not keychain_available():
             return None
-        runner = _run
+        runner = run
     return _lookup(name, runner)
 
 
@@ -100,9 +100,9 @@ def export_to_environ(names: Iterable[str] = KNOWN, *, runner: Runner | None = N
     """Fill unset variables from the Keychain; returns the names loaded, never values."""
     names = [_name(name) for name in names]
     if runner is None:
-        if not _keychain_available():
+        if not keychain_available():
             return []
-        runner = _run
+        runner = run
     loaded = []
     for name in names:
         if os.environ.get(name):
@@ -115,6 +115,12 @@ def export_to_environ(names: Iterable[str] = KNOWN, *, runner: Runner | None = N
 
 
 def _require_keychain(name: str) -> Runner:
-    if not _keychain_available():
+    if not keychain_available():
         raise ValueError(f"The macOS Keychain is unavailable here; export {name} instead")
-    return _run
+    return run
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_run = run
+_keychain_available = keychain_available

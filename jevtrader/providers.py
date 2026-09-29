@@ -145,7 +145,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _post_json(url: str, payload: dict, api_key: str, timeout: float) -> dict:
+def post_json(url: str, payload: dict, api_key: str, timeout: float) -> dict:
     request = urllib.request.Request(
         url,
         data=_json_text(payload).encode("utf-8"),
@@ -180,7 +180,7 @@ def _post_json(url: str, payload: dict, api_key: str, timeout: float) -> dict:
 
 def _request(transport: Transport | None, url: str, payload: dict, key: str) -> dict:
     try:
-        raw = (transport or _post_json)(url, payload, key, REQUEST_TIMEOUT)
+        raw = (transport or post_json)(url, payload, key, REQUEST_TIMEOUT)
     except ProviderError:
         raise
     except Exception:
@@ -513,3 +513,8 @@ def propose_strategy(
     result.update(proposed)
     _strategy(result)
     return result
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_post_json = post_json

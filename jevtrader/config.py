@@ -168,7 +168,7 @@ def _loopback_url(value: object) -> str:
         raise ValueError("local_base_url must be text")
     try:
         # The engine's own rule, so config never accepts a URL the engine would refuse.
-        return local._base_url(value)
+        return local.normalize_base_url(value)
     except ValueError:
         raise ValueError(
             "local_base_url must be http(s) on 127.0.0.1, localhost or [::1] with a plain path "

@@ -485,7 +485,7 @@ class EngineTests(unittest.TestCase):
         paid = {"provider": "jev", "model": "jev-1.13.0"}
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("jevtrader.providers._post_json") as post,
+            patch("jevtrader.providers.post_json") as post,
             self.assertRaises(MissingCredentials),
         ):
             self.observe(**paid)
@@ -493,7 +493,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.ledger.all("attempts"), [])
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json", side_effect=ProviderError("HTTP error 500")),
+            patch("jevtrader.providers.post_json", side_effect=ProviderError("HTTP error 500")),
             self.assertRaises(ProviderError),
         ):
             self.observe(**paid)
@@ -521,7 +521,7 @@ class EngineTests(unittest.TestCase):
             with (
                 self.subTest(provider),
                 patch.dict("os.environ", {"TYPESAFE_API_KEY": "test", "OPENAI_API_KEY": "test"}),
-                patch("jevtrader.providers._post_json", return_value=response),
+                patch("jevtrader.providers.post_json", return_value=response),
             ):
                 self.event(provider, index=20 + index)
                 with self.assertRaises(error):

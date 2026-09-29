@@ -182,7 +182,7 @@ class FeedsCase(unittest.TestCase):
         for patcher in [
             patch.dict(os.environ, {paths.HOME_ENV: self.home.name}),
             patch.object(sec, "_DEFAULT_LIMITER", limiter),
-            patch.object(sec, "_utc_now", lambda: self.now),
+            patch.object(sec, "utc_now", lambda: self.now),
         ]:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -365,7 +365,7 @@ class DailyIndexTests(FeedsCase):
             with self.subTest(day=day):
                 url = feeds._index_url(day)
                 self.assertIn(f"/{day.year}/{quarter}/form.{day:%Y%m%d}.idx", url)
-                sec._validate_url(url)
+                sec.validate_url(url)
 
     def test_weekends_make_no_request_and_missing_index_is_empty(self):
         self.assertEqual(feeds.daily_index(UA, date(2026, 9, 26), transport=self.net.transport), [])

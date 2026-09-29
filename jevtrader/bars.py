@@ -114,7 +114,7 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def _urlopen(url: str, headers: dict[str, str], timeout: float) -> bytes:
+def urlopen(url: str, headers: dict[str, str], timeout: float) -> bytes:
     request = Request(url, headers=headers)
     with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
         if response.geturl() != url:
@@ -142,7 +142,7 @@ class _RateLimiter:
 _LIMITER = _RateLimiter(time.monotonic, time.sleep)
 
 
-def _validate_url(url: str) -> None:
+def validate_url(url: str) -> None:
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -199,13 +199,13 @@ class _Client:
 
     def get(self, host: str, path: str, params: dict[str, str]) -> object:
         url = f"https://{host}{path}?{urlencode(params)}"
-        _validate_url(url)
+        validate_url(url)
         if self.remaining <= 0:
             raise BarsError(f"Alpaca request budget of {MAX_REQUESTS} per call exhausted")
         self.remaining -= 1
         _LIMITER.acquire()
         try:
-            payload = (self.transport or _urlopen)(url, dict(self.headers), REQUEST_TIMEOUT)
+            payload = (self.transport or urlopen)(url, dict(self.headers), REQUEST_TIMEOUT)
         except BarsError:
             raise
         except HTTPError as error:
@@ -722,3 +722,9 @@ def _store(ledger, row: dict, session: dict, action: dict, mode: str, result: di
         added = False  # Another writer stored it first; its receipt is kept.
     result["added" if added else "skipped"] += 1
     return None
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_urlopen = urlopen
+_validate_url = validate_url

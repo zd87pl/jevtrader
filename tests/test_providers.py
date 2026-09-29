@@ -314,7 +314,7 @@ class ProviderTests(unittest.TestCase):
             patch("urllib.request.build_opener", return_value=opener),
             self.assertRaises(providers.ProviderError) as caught,
         ):
-            providers._post_json(providers.JEV_ENDPOINT, {"test": True}, "test-secret", 30)
+            providers.post_json(providers.JEV_ENDPOINT, {"test": True}, "test-secret", 30)
         opener.open.assert_called_once()
         self.assertNotIn("test-secret", str(caught.exception))
         self.assertIn("429", str(caught.exception))
@@ -330,7 +330,7 @@ class ProviderTests(unittest.TestCase):
                 patch("urllib.request.build_opener", return_value=opener),
                 self.assertRaises(providers.ProviderValidationError),
             ):
-                providers._post_json(providers.JEV_ENDPOINT, {}, "test-secret", 30)
+                providers.post_json(providers.JEV_ENDPOINT, {}, "test-secret", 30)
             self.assertEqual(opener.open.call_args.kwargs["timeout"], 30)
 
     def test_proposer_preserves_policy_and_reports_metadata(self):

@@ -67,9 +67,9 @@ def _offline_system(monkeypatch, tmp_path):
         if name in SCRUBBED_ENV or _SECRET_NAME.search(name):
             monkeypatch.delenv(name)
 
-    monkeypatch.setattr(secrets, "_keychain_available", lambda: False)
-    monkeypatch.setattr(secrets, "_run", refuse_command)
-    monkeypatch.setattr(launchd, "_run", refuse_command)
+    monkeypatch.setattr(secrets, "keychain_available", lambda: False)
+    monkeypatch.setattr(secrets, "run", refuse_command)
+    monkeypatch.setattr(launchd, "run", refuse_command)
 
     # Every other route to a program or the network ends here: Popen (wrappers such as env and
     # sh -c included), os.system, posix_spawn, exec*, spawn*, DNS, TCP and UDP. Loopback servers

@@ -14,6 +14,17 @@ from zoneinfo import ZoneInfo
 # US equity sessions and EDGAR dates are defined in New York time.
 EASTERN = ZoneInfo("America/New_York")
 
+# The documented minimum for each cost the gate nets (R2, invariant I-2; ADR-0002). A floor
+# is a sanity bound, not an estimate: the default strategy charges 4 to 12 times these. A
+# strategy below any of them is rejected, and a forecast frozen with one never counts.
+# Moving a floor changes what may count as evidence, so it needs an ADR.
+COST_FLOOR: dict[str, float] = {
+    "spread_bps": 2.0,  # quoted spread, charged once per round trip
+    "slippage_bps_per_side": 1.0,  # charged on entry and on exit
+    "short_borrow_bps_annual": 25.0,  # general-collateral borrow, shorts only
+    "min_edge_bps": 5.0,  # required margin above costs before a call is made
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -138,6 +149,26 @@ def validate_strategy(data: dict) -> None:
         raise ValueError("Require at least 21 history sessions and 10 training events")
     if data["ridge_alpha"] <= 0 or data["max_market_age_hours"] <= 0:
         raise ValueError("ridge_alpha and max_market_age_hours must be positive")
+    for key, floor in COST_FLOOR.items():
+        if data[key] < floor:
+            raise ValueError(f"{key} is below the documented cost floor of {floor:g} (ADR-0002)")
+
+
+def meets_cost_floor(strategy: object) -> bool:
+    """True only when every floored cost is a finite number at or above its floor.
+
+    It reads frozen records, so anything it cannot prove (a missing strategy or cost, text,
+    a boolean, NaN) fails: a call without provable costs never counts (R2).
+    """
+    if not isinstance(strategy, dict):
+        return False
+    for key, floor in COST_FLOOR.items():
+        value = strategy.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(value) or value < floor:
+            return False
+    return True
 
 
 def round_trip_bps(strategy: dict, *, short: bool = False) -> float:

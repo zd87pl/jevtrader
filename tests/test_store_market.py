@@ -1,13 +1,16 @@
 """Point-in-time ledger and market-label tests with local synthetic fixtures."""
 
 import copy
+import csv
 import sqlite3
+import tempfile
 import unittest
 from datetime import date, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from jevtrader.common import canonical, digest, timestamp
-from jevtrader.market import normalize_bar, outcome, snapshot
+from jevtrader.market import import_bars, normalize_bar, outcome, snapshot
 from jevtrader.store import Ledger
 
 
@@ -420,6 +423,59 @@ class MarketTests(unittest.TestCase):
         self.history(count=4, mode="historical")
         forecast = self.forecast(mode="forward")
         self.assertIsNone(outcome(self.ledger, forecast, f"{DAYS[3]}T22:00:00Z"))
+
+
+class ImportBarsTests(unittest.TestCase):
+    """``import_bars`` (market.py): all-or-nothing, idempotent, first receipt kept (P0-20)."""
+
+    def setUp(self):
+        self.ledger = Ledger(":memory:")
+        self.addCleanup(self.ledger.db.close)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "bars.csv"
+
+    def write(self, rows):
+        with self.path.open("w", newline="", encoding="utf-8") as target:
+            writer = csv.DictWriter(target, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        return str(self.path)
+
+    def test_import_counts_new_bars_and_reimport_is_a_no_op(self):
+        path = self.write([raw_bar("ABC", day) for day in DAYS[:3]])
+        self.assertEqual(import_bars(self.ledger, path), 3)
+        self.assertEqual(import_bars(self.ledger, path), 0)
+        stored = self.ledger.get("bars", f"ABC:{DAYS[0]}")
+        self.assertEqual(stored["mode"], "historical")
+        self.assertEqual(stored["available_at"], timestamp(f"{DAYS[0]}T21:01:00Z"))
+        self.assertEqual(self.ledger.counts()["bars"], 3)
+
+    def test_one_invalid_row_rejects_the_whole_file(self):
+        rows = [raw_bar("ABC", DAYS[0]), raw_bar("ABC", DAYS[1], low=500)]
+        with self.assertRaisesRegex(ValueError, "Inconsistent OHLC range"):
+            import_bars(self.ledger, self.write(rows))
+        self.assertEqual(self.ledger.counts(), {})
+
+    def test_invalid_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Invalid bar mode"):
+            import_bars(self.ledger, self.write([raw_bar()]), mode="live")
+        self.assertEqual(self.ledger.counts(), {})
+
+    def test_changed_historical_bar_is_an_immutable_conflict(self):
+        import_bars(self.ledger, self.write([raw_bar(price=100.0)]))
+        with self.assertRaisesRegex(ValueError, "Immutable record conflict"):
+            import_bars(self.ledger, self.write([raw_bar(price=101.0)]))
+
+    def test_forward_reimport_keeps_the_first_receipt_time(self):
+        path = self.write([raw_bar()])
+        first, later = f"{DAYS[0]}T21:05:00Z", f"{DAYS[0]}T23:00:00Z"
+        with patch("jevtrader.market.utc_now", return_value=first):
+            self.assertEqual(import_bars(self.ledger, path, mode="forward"), 1)
+        with patch("jevtrader.market.utc_now", return_value=later):
+            self.assertEqual(import_bars(self.ledger, path, mode="forward"), 0)
+        stored = self.ledger.get("bars", f"ABC:{DAYS[0]}")
+        self.assertEqual((stored["mode"], stored["available_at"]), ("forward", first))
 
 
 if __name__ == "__main__":

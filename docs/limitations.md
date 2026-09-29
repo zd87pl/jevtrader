@@ -34,7 +34,7 @@ The gate is fixed in advance and fingerprinted, which stops thresholds from movi
 - **Overlapping windows.** Each outcome runs from the next open to the tenth close, so calls made on nearby dates share market moves. The interval treats each decision date as one observation; it does not model that overlap, so it understates uncertainty.
 - **Many tries.** Within one ledger each filing counts once, as its first recorded call, so re-scoring can't swap in a better call. Nothing links separate ledgers, though: trying several providers, question sets or autoresearch trials and keeping the best-looking scoreboard inflates the chance of a false `supported`.
 - **Backfills.** On a research ledger, `rules` replays of backfilled filings are labelled `no_model_knowledge` and count toward that ledger's gate, even though backfills use assumed availability times (acceptance + 15 minutes, or the next 06:00 ET weekday), symbols from today's ticker map (survivorship bias), and only filings still in each company's recent SEC submissions. The rules baseline's word lists were also chosen by hand, with today's knowledge.
-- **Costs.** The default 20 bps round trip and 300 bps a year of short borrow are assumptions, not observed fills.
+- **Costs.** The default 20 bps round trip and 300 bps a year of short borrow are assumptions, not observed fills. The [cost floor](adr/0002-cost-floor.md) only rules out near-free trading; a strategy at the floor is not realistic either.
 
 If you find another way to make it count something it shouldn't, please [open an issue](https://github.com/zd87pl/jevtrader/issues).
 

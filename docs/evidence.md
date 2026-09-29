@@ -77,6 +77,7 @@ The gate is fixed in advance and fingerprinted. Nothing is registered with an ou
 
 - **What counts.** Matured `LONG`/`SHORT` calls whose labels are `forward`, `post_cutoff` or `no_model_knowledge`, one decision per filing as above. `WATCH` and `PASS` make no call.
 - **Net return.** Sign × (stock return minus benchmark return from the next open to the tenth close) minus the assumed round-trip cost. Shorts also pay the assumed borrow cost.
+- **Cost floor.** A strategy with any cost below its floor is rejected, and a call frozen with such costs never counts ([ADR-0002](adr/0002-cost-floor.md)). The floors are 2 bps of spread, 1 bp of slippage per side, 25 bps a year of short borrow and a 5 bps minimum edge. They are sanity bounds, not estimates; the defaults are 4 to 12 times higher.
 - **Interval.** A Student-t interval on per-decision-date mean net returns (decision dates in New York time), so calls made on the same day count once.
 - **Status.** `collecting` until 100 calls have matured. Then `supported` if the whole interval is above zero, `no_edge` if the whole interval is below +0.10%, and `inconclusive` otherwise (including when the calls fall on fewer than 2 decision dates).
 - **Context, not a result.** The scoreboard also shows the average stock-minus-benchmark move of every matured, evidence-eligible filing, whatever was decided, and how many forecasts were excluded as not evidence.

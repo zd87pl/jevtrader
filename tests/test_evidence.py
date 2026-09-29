@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import fmean, stdev
 
 from jevtrader import evidence
-from jevtrader.common import canonical, load_strategy, round_trip_bps
+from jevtrader.common import COST_FLOOR, canonical, load_strategy, round_trip_bps
 from jevtrader.store import Ledger
 
 STRATEGY = load_strategy()
@@ -412,6 +412,113 @@ class ScoreboardTests(unittest.TestCase):
         board = evidence.scoreboard(ledger, as_of=AS_OF)
         self.assertEqual(board["calls"], 1)
         self.assertAlmostEqual(board["mean_net_return"], 0.015 - LONG_COST)
+
+
+FREE = {
+    **STRATEGY,
+    "spread_bps": 0.0,
+    "slippage_bps_per_side": 0.0,
+    "short_borrow_bps_annual": 0.0,
+    "min_edge_bps": 0.0,
+}
+
+
+class CostFloorEvidenceTests(unittest.TestCase):
+    """R2 (invariant I-2): a call frozen with costs below the floor never counts (ADR-0002)."""
+
+    def test_zero_cost_call_never_counts(self):
+        # The Phase 0 probe: a zero-cost LONG with a +1% target used to score +1.00% net.
+        free = forecast("free", strategy=FREE)
+        self.assertFalse(evidence.is_evidence(free))
+        board = evidence.scoreboard(FakeLedger([free], [outcome("free", 0.01)]), as_of=AS_OF)
+        self.assertEqual(board["calls"], 0)
+        self.assertEqual(board["counts"]["scored_events"], 0)
+        self.assertEqual(board["excluded_forecasts"], 1)
+        self.assertIsNone(board["mean_net_return_per_call"])
+
+    def test_each_cost_below_its_floor_excludes_the_call(self):
+        for key, floor in COST_FLOOR.items():
+            with self.subTest(key=key):
+                below = forecast("below", strategy={**STRATEGY, key: math.nextafter(floor, 0)})
+                at = forecast("at", strategy={**STRATEGY, key: floor})
+                ledger = FakeLedger([below, at], [outcome("below", 0.01), outcome("at", 0.01)])
+                board = evidence.scoreboard(ledger, as_of=AS_OF)
+                self.assertFalse(evidence.is_evidence(below))
+                self.assertTrue(evidence.is_evidence(at))
+                self.assertEqual((board["calls"], board["excluded_forecasts"]), (1, 1))
+
+    def test_calls_without_provable_costs_never_count(self):
+        missing = {k: v for k, v in STRATEGY.items() if k != "spread_bps"}
+        cases = {
+            "no strategy": forecast("a", strategy=None),
+            "missing cost": forecast("b", strategy=missing),
+            "text cost": forecast("c", strategy={**STRATEGY, "slippage_bps_per_side": "5"}),
+            "nan cost": forecast("d", strategy={**STRATEGY, "min_edge_bps": float("nan")}),
+        }
+        for name, record in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(evidence.is_evidence(record))
+        board = evidence.scoreboard(
+            FakeLedger(list(cases.values()), [outcome(f["id"], 0.01) for f in cases.values()]),
+            as_of=AS_OF,
+        )
+        self.assertEqual((board["calls"], board["excluded_forecasts"]), (0, len(cases)))
+
+    def test_a_forecast_without_a_strategy_key_is_not_evidence(self):
+        record = forecast("bare")
+        del record["strategy"]
+        self.assertFalse(evidence.is_evidence(record))
+
+    def test_a_sub_floor_decision_is_not_replaced_by_a_later_forecast(self):
+        # The floor applies after one decision per event is chosen, so dropping a sub-floor
+        # first call can never promote a later forecast of the same event into the gate.
+        cases = {
+            "first forward call": ("forward", "forward"),
+            "first replay": ("historical", "post_cutoff"),
+        }
+        for name, (mode, label) in cases.items():
+            with self.subTest(name=name):
+                shared = dict(mode=mode, event_id="shared", eligibility=label)
+                first = forecast("first", strategy=FREE, **shared)
+                later = forecast("later", recorded=iso(START + timedelta(hours=1)), **shared)
+                ledger = FakeLedger(
+                    [first, later], [outcome("first", 0.01), outcome("later", 0.01)]
+                )
+                board = evidence.scoreboard(ledger, as_of=AS_OF)
+                self.assertTrue(evidence.is_evidence(later))
+                self.assertEqual(board["calls"], 0)
+                self.assertEqual(board["counts"]["scored_events"], 0)
+                self.assertEqual(board["excluded_forecasts"], 1)
+
+    def test_net_return_is_withheld_below_the_floor(self):
+        free = forecast("free", strategy=FREE)
+        self.assertIsNone(evidence.net_return(free, outcome("free", 0.01)))
+        self.assertIsNone(evidence.net_return(forecast("bare", strategy=None), outcome("b", 0.01)))
+        self.assertAlmostEqual(
+            evidence.net_return(forecast("default"), outcome("default", 0.01)), 0.01 - LONG_COST
+        )
+
+    def test_eligible_filter_cannot_readmit_a_sub_floor_call(self):
+        ledger = FakeLedger([forecast("free", strategy=FREE)], [outcome("free", 0.01)])
+        board = evidence.scoreboard(ledger, as_of=AS_OF, eligible=lambda _: True)
+        self.assertEqual(board["calls"], 0)
+
+    def test_floor_leaves_the_gate_and_default_costs_unchanged(self):
+        board = evidence.scoreboard(FakeLedger(), as_of=AS_OF)
+        self.assertEqual(board["gate_sha256"], GATE_SHA256)
+        self.assertIn("cost floor", board["eligibility_rule"])
+        self.assertTrue(evidence.is_evidence(forecast("default")))
+        self.assertEqual(LONG_COST, 0.002)
+        self.assertAlmostEqual(SHORT_COST, (20 + 300 * 10 / 252) / 10_000)
+
+    def test_old_ledger_with_a_sub_floor_forecast_still_verifies(self):
+        ledger = Ledger(":memory:")
+        self.addCleanup(ledger.db.close)
+        ledger.put("forecasts", "free", forecast("free", strategy=FREE, eligibility="forward"))
+        ledger.put("outcomes", "free", outcome("free", 0.01))
+        self.assertTrue(ledger.verify()["ok"])
+        board = evidence.scoreboard(ledger, as_of=AS_OF)
+        self.assertEqual((board["calls"], board["excluded_forecasts"]), (0, 1))
 
 
 if __name__ == "__main__":

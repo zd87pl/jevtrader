@@ -432,7 +432,10 @@ _HANDLERS: dict[str, Callable[[Context, str], tuple[dict, list]]] = {
 def _user_agent(ctx: Context) -> str:
     agent = ctx.config["sec_user_agent"]
     if not agent:
-        raise _Skip("sec_user_agent is not set; run setup with your name and email")
+        raise _Skip(
+            "sec_user_agent is not set; declare a contact for SEC with setup "
+            "(a dedicated alias is recommended)"
+        )
     return agent
 
 

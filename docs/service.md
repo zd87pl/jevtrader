@@ -25,7 +25,7 @@ jevtrader setup
 
 `setup` asks, one question at a time (press Return to keep the value shown):
 
-1. **Your name and email for SEC.** SEC's fair-access policy asks automated tools to identify themselves; the value goes only to sec.gov in the User-Agent header.
+1. **A contact for SEC.** SEC's fair-access policy asks automated tools to declare a contact. Use a dedicated alias (for example `jevtrader sec-alias@your-domain.example`) rather than your personal name or address. The value is kept in `config.json` and goes only to sec.gov in the User-Agent header. There is no default.
 2. **Watchlist** symbols, and whether to score only those or every qualifying 8-K (`all`).
 3. **Text features**: `rules` (fixed word lists, free, offline), `local` (a model served by Ollama or LM Studio on this Mac; setup runs a health check), `jev` or `openai` (paid; they receive selected filing text). With `local`, setup asks for the engine URL (Ollama `:11434/v1`, LM Studio `:1234/v1`) and then the model; the default model is `gpt-oss:120b`, so type `gpt-oss:20b` (or whatever your engine serves) if that is what you pulled. Paid presets also ask for a monthly spend cap and the model's prices per million input and output tokens; the cap counts output (reasoning included) at the requested maximum when a response reports no count, and without both prices the service keeps paid extraction off.
 4. **Alpaca bars**: completed daily bars from Alpaca's free market-data API (needs the keys of a free paper account; nothing trades through Alpaca). Without bars nothing can be scored: filings are collected but their cards say `not scored: no market data`, and setup and `doctor` say so.

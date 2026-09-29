@@ -46,8 +46,9 @@ PROVIDER_KEYS = {"jev": "TYPESAFE_API_KEY", "openai": "OPENAI_API_KEY"}
 ALPACA_KEYS = ("ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
 MAX_SETUP_TRIES = 5
 SEC_REASON = (
-    "SEC's fair-access policy asks automated tools to identify themselves with a name and a "
-    "contact email. It is sent only to sec.gov, in the User-Agent header, and kept in "
+    "SEC's fair-access policy asks automated tools to declare a contact. Use a dedicated "
+    "alias, such as 'jevtrader sec-alias@your-domain.example', rather than a personal "
+    "address. It is sent only to sec.gov, in the User-Agent header, and kept in "
     "config.json on this Mac."
 )
 NO_BARS = (
@@ -248,7 +249,7 @@ def backfill(
     research ledger, never the forward one."""
     agent = config["sec_user_agent"]
     if not agent:
-        raise ValueError(f"Set your SEC name and email first: {paths.APP_NAME} setup")
+        raise ValueError(f"Declare a contact for SEC first: {paths.APP_NAME} setup")
     if Path(ledger_path).resolve() == settings.ledger_path(config).resolve():
         raise ValueError("backfill writes historical records; use the research ledger")
     if symbols is None and config["universe"] == "watchlist":
@@ -310,7 +311,7 @@ def up(
 ) -> dict:
     """Install and start the LaunchAgent; setup must have created the ledger first."""
     if not config["sec_user_agent"]:
-        raise ValueError(f"Run `{paths.APP_NAME} setup` first: the SEC name and email are not set")
+        raise ValueError(f"Run `{paths.APP_NAME} setup` first: no contact for SEC is declared")
     open_ledger(ledger_path).close()
     return launchd.install(program, runner=runner, home=home)
 
@@ -353,7 +354,7 @@ def doctor(
     if config is not None:
         checks["sec_user_agent"] = {"ok": bool(config["sec_user_agent"])}
         if not config["sec_user_agent"]:
-            problems.append("SEC name and email are not set; collection is skipped")
+            problems.append("No contact for SEC is declared; collection is skipped")
     checks["ledger"] = _ledger_check(target, config, problems, notes) if target else skipped
     if config is None:
         for name in ("sec_user_agent", "provider", "keys", "bars"):
@@ -582,7 +583,7 @@ def setup(
     say(f"{paths.APP_NAME} setup. Research tool, not investment advice; it never places orders.")
     say(SEC_REASON)
     config["sec_user_agent"] = dialog.text(
-        "Your name and email for SEC",
+        "A contact for SEC (a dedicated alias is recommended)",
         config["sec_user_agent"],
         lambda value: _checked(config, "sec_user_agent", value, required=True),
     )

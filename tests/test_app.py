@@ -636,7 +636,7 @@ class ServiceTests(TempHome):
             app.backfill(forward, config, date(2026, 1, 5), date(2026, 1, 6))
         with self.assertRaisesRegex(ValueError, "watchlist is empty"):
             app.backfill(str(self.dir / "r.sqlite"), config, date(2026, 1, 5), date(2026, 1, 6))
-        with self.assertRaisesRegex(ValueError, "SEC name"):
+        with self.assertRaisesRegex(ValueError, "contact for SEC"):
             app.backfill("r", settings.validate({}), date(2026, 1, 5), date(2026, 1, 6))
 
     def test_backfill_scans_the_watchlist_unless_symbols_or_universe_all_say_otherwise(self):
@@ -682,7 +682,7 @@ class DoctorTests(TempHome):
         report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain())
         self.assertFalse(report["ok"])
         text = " ".join(report["problems"])
-        self.assertIn("SEC name and email", text)
+        self.assertIn("contact for SEC", text)
         self.assertIn("run `jevtrader setup` first", text)
         self.assertIn("setup", " ".join(report["notes"]))
         self.assertFalse(report["checks"]["service"]["loaded"])
@@ -749,7 +749,7 @@ class DoctorTests(TempHome):
         self.assertTrue(report["ok"], report["problems"])
 
     def test_an_invalid_config_is_the_only_problem_and_skips_what_reads_it(self):
-        # Defaults would add a spurious "SEC name and email are not set".
+        # Defaults would add a spurious "No contact for SEC is declared".
         paths.config_path().parent.mkdir(parents=True)
         # A missing comma, not a trailing one: Python 3.13 reports trailing commas
         # at a different position than 3.11/3.12 do.
@@ -1194,6 +1194,86 @@ class DaemonCommandTests(TempHome):
             self.assertNotEqual(main(["daemon"]), 0)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("one-off jevtrader job is running", stderr.getvalue())
+
+
+class SecContactTests(TempHome):
+    """P0-03 (#7): ask for a declared contact for SEC, recommend an alias, keep it in config."""
+
+    ALIAS = "jevtrader sec-alias@example.com"
+
+    def test_there_is_no_default_contact(self):
+        self.assertEqual(settings.validate({})["sec_user_agent"], "")
+
+    def test_setup_asks_for_a_contact_for_sec_and_recommends_an_alias(self):
+        prompts, said = [], []
+
+        def ask(prompt):
+            prompts.append(prompt)
+            raise EOFError
+
+        with self.assertRaises(ValueError):
+            app.setup(ask=ask, say=said.append, keychain_runner=FakeKeychain())
+        self.assertIn("contact for SEC", prompts[0])
+        self.assertNotIn("name", prompts[0].lower())
+        self.assertIn("alias", app.SEC_REASON)
+        self.assertNotIn("name", app.SEC_REASON.lower())
+        self.assertIn(app.SEC_REASON, said)
+
+    def test_missing_contact_messages_never_ask_for_a_name(self):
+        report = app.doctor(launchd_runner=FakeLaunchctl(), keychain_runner=FakeKeychain())
+        problems = " ".join(report["problems"])
+        self.assertIn("contact for SEC", problems)
+        self.assertNotIn("name and email", problems)
+        with self.assertRaises(ValueError) as caught:
+            app.backfill(
+                str(self.dir / "r.sqlite"),
+                settings.validate({}),
+                date(2025, 1, 2),
+                date(2025, 1, 3),
+            )
+        self.assertIn("contact for SEC", str(caught.exception))
+        self.assertNotIn("name", str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            settings.validate({"sec_user_agent": "no contact here"})
+        self.assertNotIn("Your Name", str(caught.exception))
+        self.assertIn("alias", str(caught.exception))
+
+    def run_collect(self, *extra):
+        db = self.dir / "forward.sqlite"
+        Ledger(db).close()
+        err = io.StringIO()
+        with (
+            patch("jevtrader.cli.collect_disclosures", return_value=[]) as collect,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            code = main(["--db", str(db), "collect", "--cik", "1", "--symbol", "ABC", *extra])
+        return code, collect, err.getvalue()
+
+    def test_collect_reads_the_contact_from_config_not_argv(self):
+        settings.save({"sec_user_agent": self.ALIAS})
+        code, collect, err = self.run_collect()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(collect.call_args.kwargs["user_agent"], self.ALIAS)
+        self.assertEqual(err, "")
+
+    def test_collect_user_agent_flag_is_deprecated_with_a_warning(self):
+        code, collect, err = self.run_collect("--user-agent", self.ALIAS)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(collect.call_args.kwargs["user_agent"], self.ALIAS)
+        self.assertIn("deprecated", err)
+        self.assertIn("config", err)
+
+    def test_docs_ask_for_a_contact_and_recommend_an_alias(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in (".env.example", "docs/service.md", "docs/data-and-ledger.md"):
+            text = (root / name).read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertNotIn("Your Name", text)
+                self.assertNotIn("name and email", text)
+                self.assertNotIn('--user-agent "', text)
+        for name in ("docs/service.md", "docs/data-and-ledger.md"):
+            self.assertIn("alias", (root / name).read_text(encoding="utf-8"), name)
 
 
 if __name__ == "__main__":

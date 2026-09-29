@@ -131,7 +131,10 @@ def _user_agent(value: object) -> str:
         or any(ord(c) < 32 or ord(c) == 127 for c in value)
         or not _EMAIL.search(value)
     ):
-        raise ValueError("sec_user_agent must be 'Your Name you@example.com' (at most 250 chars)")
+        raise ValueError(
+            "sec_user_agent must be a contact for SEC with an email address, ideally a "
+            "dedicated alias such as 'jevtrader sec-alias@example.com' (at most 250 chars)"
+        )
     return value
 
 

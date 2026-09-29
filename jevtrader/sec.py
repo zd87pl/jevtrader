@@ -198,7 +198,9 @@ class _SECClient:
             or "\n" in user_agent
             or not _EMAIL.search(user_agent)
         ):
-            raise SECError("Provide an explicit SEC User-Agent containing your contact email")
+            raise SECError(
+                "Declare a contact for SEC with an email address (an alias is recommended)"
+            )
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= 60:
             raise SECError("timeout must be between 0 and 60 seconds")
         self.user_agent = user_agent

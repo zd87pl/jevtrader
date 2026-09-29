@@ -663,6 +663,7 @@ class DailyBarsTests(AlpacaTestCase):
 
     def test_session_comes_from_the_midnight_stamp(self):
         winter, summer = date(2026, 1, 6), date(2026, 7, 7)
+        self.clock("2027-01-01T00:00:00.000000Z")  # P0-15: every requested session has settled.
         stamps = {
             "ET winter": (stamp(winter), winter),
             "ET summer": (stamp(summer), summer),
@@ -1204,7 +1205,8 @@ class FetchHistoricalTests(AlpacaTestCase):
         )
         bar = self.stored("ABC")["2026-03-09"]
         self.assertEqual(bar["mode"], "historical")
-        self.assertEqual(bar["available_at"], bar["close_at"])
+        # P0-15: historical availability is close + SETTLE_DELAY, not the close itself.
+        self.assertEqual(instant(bar["available_at"]), instant(bar["close_at"]) + bars.SETTLE_DELAY)
         self.assertEqual(
             fake.queries("/v2/calendar"), [{"start": "2026-02-23", "end": "2026-03-13"}]
         )
@@ -1252,6 +1254,55 @@ class FetchHistoricalTests(AlpacaTestCase):
         self.assertGreater(len(fake.queries("/v2/stocks/bars")), 1)
         prices = [bar["close"] for bar in self.stored("ABC").values()]
         self.assertTrue(all(math.isfinite(p) for p in prices))
+
+
+class BarAvailabilityParityTests(AlpacaTestCase):
+    """P0-15: historical bars become visible no earlier than a forward run could store them."""
+
+    def test_one_settle_delay_shared_by_forward_and_historical_paths(self):
+        from jevtrader import market
+
+        self.assertIs(bars.SETTLE_DELAY, market.SETTLE_DELAY)
+        self.assertEqual(market.SETTLE_DELAY, timedelta(minutes=20))
+
+    def test_historical_bars_available_at_close_plus_settle_delay(self):
+        bars.fetch_historical(
+            self.ledger, ["ABC"], date(2026, 3, 9), date(2026, 3, 13), transport=self.market()
+        )
+        for bar in self.stored("ABC").values():
+            with self.subTest(session=bar["session"]):
+                self.assertEqual(
+                    instant(bar["available_at"]), instant(bar["close_at"]) + bars.SETTLE_DELAY
+                )
+
+    def test_daily_bars_refuses_a_session_that_may_be_unfinished(self):
+        fake = self.market()
+        # 16:19 EDT: the Friday session closed but has not settled for 20 minutes.
+        self.clock("2026-03-13T20:19:59.000000Z")
+        with self.assertRaisesRegex(bars.BarsError, "unfinished"):
+            bars.daily_bars(["ABC"], date(2026, 3, 9), date(2026, 3, 13), transport=fake)
+        with self.assertRaisesRegex(bars.BarsError, "unfinished"):
+            bars.daily_bars(["ABC"], date(2026, 3, 9), date(2026, 3, 16), transport=fake)
+        self.assertEqual(fake.calls, [])
+        result = bars.daily_bars(["ABC"], date(2026, 3, 9), date(2026, 3, 12), transport=fake)
+        self.assertEqual(result["ABC"][-1]["session"], "2026-03-12")
+
+    def test_daily_bars_settle_boundary_is_inclusive(self):
+        self.clock("2026-03-13T20:20:00.000000Z")  # exactly 16:00 EDT + 20 minutes
+        result = bars.daily_bars(
+            ["ABC"], date(2026, 3, 9), date(2026, 3, 13), transport=self.market()
+        )
+        self.assertEqual(result["ABC"][-1]["session"], "2026-03-13")
+
+    def test_daily_bars_boundary_uses_eastern_time_across_dst(self):
+        # 2026-03-06 is before the DST change (EST, UTC-5): 16:20 EST is 21:20Z.
+        fake = self.market()
+        self.clock("2026-03-06T21:19:59.000000Z")
+        with self.assertRaisesRegex(bars.BarsError, "unfinished"):
+            bars.daily_bars(["ABC"], date(2026, 3, 2), date(2026, 3, 6), transport=fake)
+        self.clock("2026-03-06T21:20:00.000000Z")
+        result = bars.daily_bars(["ABC"], date(2026, 3, 2), date(2026, 3, 6), transport=fake)
+        self.assertEqual(result["ABC"][-1]["session"], "2026-03-06")
 
 
 if __name__ == "__main__":

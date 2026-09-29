@@ -2,8 +2,9 @@
 
 A session is stored only once its close is at least 20 minutes old, and a stored bar
 is never replaced: the first receipt is kept. Forward bars carry their actual receipt
-time. Historical bars assume availability at the session close — an assumption, not
-a verified receipt — and belong in a separate research ledger. Prices are raw
+time. Historical bars assume availability at close + SETTLE_DELAY, the earliest a
+forward run could have stored them (ADR-0003) — an assumption, not a verified
+receipt — and belong in a separate research ledger. Prices are raw
 (adjustment=raw); forward/reverse splits and cash dividends ride on the first session
 on or after their ex-date. Stock dividends, spin-offs and mergers are not applied, and
 an action Alpaca records only after a bar was stored cannot be added to it later.
@@ -30,7 +31,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from . import __version__, paths
 from .common import EASTERN, instant, ledger_file, symbol, timestamp, utc_now
-from .market import normalize_bar
+from .market import SETTLE_DELAY, normalize_bar
 
 DATA_HOST = "data.alpaca.markets"
 CALENDAR_HOST = "paper-api.alpaca.markets"
@@ -40,7 +41,6 @@ BENCHMARK = "SPY"
 # IEX volume is a small slice of consolidated volume and would break liquidity gates.
 FEEDS = ("sip",)
 ACTION_TYPES = "forward_split,reverse_split,cash_dividend"
-SETTLE_DELAY = timedelta(minutes=20)
 REQUEST_INTERVAL = 0.3  # The free tier allows 200 requests per minute.
 REQUEST_TIMEOUT = 30.0
 MAX_REQUESTS = 1_000
@@ -360,9 +360,16 @@ def daily_bars(
     feed: str = "sip",
     transport: Transport | None = None,
 ) -> dict[str, list[dict]]:
-    """Raw daily OHLCV per requested symbol, sorted by session; the newest may be unfinished."""
+    """Raw daily OHLCV per requested symbol, sorted by session.
+
+    Refuses an ``end`` whose session may be unfinished: every session through ``end``
+    must be at least SETTLE_DELAY past the latest regular close (16:00 New York).
+    """
     names = _names(symbols)
     start, end = _dates(start, end)
+    latest_close = datetime(end.year, end.month, end.day, 16, tzinfo=EASTERN)
+    if instant(utc_now()) < latest_close + SETTLE_DELAY:
+        raise BarsError(f"Session {end} may be unfinished; request only settled sessions")
     feed = _feed(feed)
     result: dict[str, list[dict]] = {name: [] for name in names}
     if not names:

@@ -92,7 +92,7 @@ python -m jevtrader --db data/research.sqlite import-bars bars.csv --mode histor
 python -m jevtrader --db data/forward.sqlite import-bars completed-bars.csv --mode forward
 ```
 
-Historical `available_at` defaults to session close if omitted: that is an assumption, not verified receipt. Forward imports ignore supplied availability and stamp actual import time. Importing past bars today cannot make them visible to yesterday's decision. Use a separate database when changing provenance; immutable bar IDs identify symbol/session.
+Historical `available_at` defaults to session close plus 20 minutes (`SETTLE_DELAY`, the earliest a forward run could store the bar; ADR-0003) if omitted: that is an assumption, not verified receipt. Forward imports ignore supplied availability and stamp actual import time. Importing past bars today cannot make them visible to yesterday's decision. Use a separate database when changing provenance; immutable bar IDs identify symbol/session.
 
 `split_ratio` means new shares per prior share at that session's open; default 1. `cash_dividend` is cash per **post-split** share on the ex-date; default 0. Labels credit dividends only when the position was held before that open and carry split-adjusted share counts. Do not supply adjusted prices and then apply corporate actions again. Prior cash dividends are not reinvested in holding-period labels.
 

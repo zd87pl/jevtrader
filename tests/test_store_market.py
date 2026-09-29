@@ -425,6 +425,40 @@ class MarketTests(unittest.TestCase):
         self.assertIsNone(outcome(self.ledger, forecast, f"{DAYS[3]}T22:00:00Z"))
 
 
+class HistoricalAvailabilityTests(unittest.TestCase):
+    """P0-15: a replay never sees a bar before close + SETTLE_DELAY unless a receipt says so."""
+
+    def test_historical_default_is_close_plus_settle_delay(self):
+        value = normalize_bar(raw_bar(available_at=None), mode="historical")
+        self.assertEqual(value["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
+        empty = normalize_bar(raw_bar(available_at=""), mode="historical")
+        self.assertEqual(empty["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
+
+    def test_snapshot_boundary_at_settle_delay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with Ledger(Path(folder) / "l.sqlite") as ledger:
+                for name, price in (("ABC", 100.0), ("SPY", 500.0)):
+                    for day in DAYS[:22]:
+                        row = normalize_bar(
+                            raw_bar(name, day, price=price, available_at=None), mode="historical"
+                        )
+                        ledger.put("bars", row["id"], row)
+                strategy = {
+                    "benchmark": "SPY",
+                    "min_history_sessions": 21,
+                    "max_market_age_hours": 96,
+                    "spread_bps": 5,
+                }
+                early = snapshot(
+                    ledger, "ABC", f"{DAYS[21]}T21:19:59Z", strategy, mode="historical"
+                )
+                self.assertEqual(early["session"], DAYS[20])
+                equal = snapshot(
+                    ledger, "ABC", f"{DAYS[21]}T21:20:00Z", strategy, mode="historical"
+                )
+                self.assertEqual(equal["session"], DAYS[21])
+
+
 class ImportBarsTests(unittest.TestCase):
     """``import_bars`` (market.py): all-or-nothing, idempotent, first receipt kept (P0-20)."""
 

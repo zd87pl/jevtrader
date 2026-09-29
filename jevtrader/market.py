@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import csv
 import math
-from datetime import date
+from datetime import date, timedelta
 from statistics import pstdev
 from typing import Any
 
 from .common import EASTERN, instant, number, symbol, timestamp, utc_now
+
+# A forward bar is stored no sooner than this after its close (invariant I-15, ADR-0003).
+# Historical bars without a receipt assume the same delay, so replays see no bar earlier
+# than a forward run could have.
+SETTLE_DELAY = timedelta(minutes=20)
 
 
 def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
@@ -49,9 +54,16 @@ def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
     if result["split_ratio"] <= 0:
         raise ValueError("split_ratio must be positive")
     # Actual receipt time is mandatory for forward use. Replayed bars stay labeled historical.
-    result["available_at"] = (
-        utc_now() if mode == "forward" else timestamp(row.get("available_at") or result["close_at"])
-    )
+    # Without a receipt, a historical bar is assumed available at close + SETTLE_DELAY
+    # (ADR-0003); synthetic bars keep the close.
+    if mode == "forward":
+        result["available_at"] = utc_now()
+    elif row.get("available_at"):
+        result["available_at"] = timestamp(row["available_at"])
+    elif mode == "historical":
+        result["available_at"] = timestamp((instant(result["close_at"]) + SETTLE_DELAY).isoformat())
+    else:
+        result["available_at"] = result["close_at"]
     if instant(result["available_at"]) < instant(result["close_at"]):
         raise ValueError("A completed bar cannot be available before close")
     result["id"] = f"{result['symbol']}:{result['session']}"

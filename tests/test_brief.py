@@ -5,7 +5,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from jevtrader import brief, daemon, engine
+from jevtrader import brief, cohorts, daemon, engine
 from jevtrader.common import load_strategy, timestamp
 from jevtrader.market import normalize_bar
 from jevtrader.research import FEATURE_NAMES
@@ -744,6 +744,8 @@ class EngineRecordTests(unittest.TestCase):
         self.addCleanup(ledger.db.close)
         days = seed_market(ledger)
         seen = f"{days[25]}T21:30:00Z"
+        # #35: an imported replay keeps its registry label only in a pre-registered cohort.
+        cohorts.register(ledger, "c", event_ids=["hist"], rule="fixture", now=seen)
         event_id = store(ledger, disclosure("hist", seen, mode="historical"))
         forecast = engine.observe(ledger, event_id, STRATEGY, as_of=seen)
         engine.settle(ledger, as_of=f"{days[39]}T22:00:00Z")

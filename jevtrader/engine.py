@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import registry
+from . import cohorts, registry
 from .common import digest, instant, round_trip_bps, timestamp, utc_now, validate_strategy
 from .market import outcome, snapshot
 from .providers import (
@@ -226,6 +226,14 @@ def observe(
     label, basis = _eligibility(
         provider, extraction["resolved_model"], mode, event["published_at"], overrides, adhoc=adhoc
     )
+    # Every historical disclosure was imported or backfilled, so the user chose it; its replay
+    # counts only when a cohort listing it was registered before it entered the ledger.
+    if (
+        mode == "historical"
+        and registry.counts_as_evidence(label)
+        and cohorts.preregistered(ledger, event_id) is None
+    ):
+        label = cohorts.LABEL
     record = {
         "id": identity,
         "event_id": event_id,

@@ -16,6 +16,7 @@ from .pit import Clock, Instant, knowledge_time
 
 KINDS = {
     "attempts",
+    "cohorts",
     "disclosures",
     "bars",
     "extractions",
@@ -547,6 +548,13 @@ class Ledger:
         if digest(result) != row[1]:
             raise ValueError(f"Corrupted record: {kind}/{identity}")
         return result
+
+    def sequence(self, kind: str, identity: str) -> int | None:
+        """The record's position in the hash chain: which of two records was appended first."""
+        row = self.db.execute(
+            "SELECT seq FROM chain WHERE kind=? AND id=?", (kind, identity)
+        ).fetchone()
+        return None if row is None else int(row[0])
 
     def all(self, kind: str) -> list[dict]:
         rows = self.db.execute(

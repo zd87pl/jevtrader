@@ -5,7 +5,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from jevtrader import engine, registry
+from jevtrader import cohorts, engine, registry
 from jevtrader.common import digest, load_strategy, round_trip_bps, timestamp
 from jevtrader.market import normalize_bar, outcome
 from jevtrader.providers import (
@@ -176,6 +176,8 @@ class EngineTests(unittest.TestCase):
 
     def test_replay_freezes_its_evidence_basis_and_hand_picked_replays_never_count(self):
         self.populate()
+        # #35: only a pre-registered cohort keeps its registry label.
+        cohorts.register(self.ledger, "c", event_ids=["current"], rule="fixture", now=self.at(0))
         self.event("previous", index=17, text="Business was unchanged.")
         current = self.event()
         result = self.observe()
@@ -201,6 +203,39 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(adhoc["eligibility"], "adhoc_replay")
         self.assertFalse(registry.counts_as_evidence(adhoc["eligibility"]))
+
+    def test_replay_of_an_unregistered_import_is_not_evidence(self):
+        # #35: a user could import only filings that were followed by moves.
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], cohorts.LABEL)
+        self.assertFalse(registry.counts_as_evidence(result["eligibility"]))
+
+    def test_replay_of_a_preregistered_cohort_keeps_its_registry_label(self):
+        self.populate()
+        cohorts.register(
+            self.ledger,
+            "feb",
+            event_ids=["current", "previous"],
+            rule="Every fixture filing",
+            now=self.at(0),
+        )
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], "no_model_knowledge")
+        self.assertEqual(cohorts.preregistered(self.ledger, "current"), "feb")
+        adhoc = self.observe(index=21, adhoc=True)
+        self.assertEqual(adhoc["eligibility"], "adhoc_replay")
+
+    def test_cohort_rule_leaves_forward_and_non_evidence_labels_alone(self):
+        self.populate()
+        self.event()
+        with patch.object(registry, "eligibility", return_value="contaminated"):
+            result = self.observe()
+        self.assertEqual(result["eligibility"], "contaminated")
 
     def test_replay_the_registry_cannot_label_is_never_evidence(self):
         self.populate()

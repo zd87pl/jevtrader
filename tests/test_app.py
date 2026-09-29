@@ -1279,6 +1279,13 @@ class SecContactTests(TempHome):
         self.assertEqual(collect.call_args.kwargs["user_agent"], self.ALIAS)
         self.assertEqual(err, "")
 
+    def test_collect_falls_back_to_the_environment_contact(self):
+        with patch.dict(os.environ, {"SEC_USER_AGENT": "lab alias@example.test"}):
+            code, collect, err = self.run_collect()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(collect.call_args.kwargs["user_agent"], "lab alias@example.test")
+        self.assertNotIn("deprecated", err)
+
     def test_collect_user_agent_flag_is_deprecated_with_a_warning(self):
         code, collect, err = self.run_collect("--user-agent", self.ALIAS)
         self.assertEqual(code, 0, err)

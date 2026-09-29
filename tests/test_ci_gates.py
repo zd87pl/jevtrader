@@ -31,6 +31,12 @@ def _pytest_command() -> str:
     return lines[0]
 
 
+class NoSoftGateTests(unittest.TestCase):
+    def test_no_step_or_job_may_fail_softly(self) -> None:
+        # continue-on-error turns any gate (mypy, pytest, audit) into a warning.
+        self.assertNotIn("continue-on-error", WORKFLOW)
+
+
 class DevExtraTests(unittest.TestCase):
     def test_dev_extra_declares_the_gate_tools(self) -> None:
         dev = " ".join(PYPROJECT["project"]["optional-dependencies"]["dev"])
@@ -81,6 +87,14 @@ class MypyBaselineTests(unittest.TestCase):
     def test_mypy_step_reads_the_summary_line(self) -> None:
         # A run that prints no summary did not finish checking.
         self.assertIn("Found", _step("mypy"))
+
+    def test_mypy_status_is_captured_right_after_mypy(self) -> None:
+        # "status=0" or a command in between would make every run look clean.
+        lines = [line.strip() for line in _step("mypy").splitlines()]
+        runs = [i for i, line in enumerate(lines) if line.startswith("mypy jevtrader")]
+        self.assertEqual(len(runs), 1, lines)
+        self.assertEqual(lines[runs[0] + 1], "status=$?")
+        self.assertEqual(lines[runs[0] + 2], "set -e")
 
     def test_mypy_baseline_is_zero(self) -> None:
         # P0-23 (#27): the package type-checks clean, so no error is tolerated.

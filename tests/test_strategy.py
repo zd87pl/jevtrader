@@ -96,6 +96,8 @@ class CostFloorTests(unittest.TestCase):
             "missing borrow": without("short_borrow_bps_annual"),
             "string cost": changed(spread_bps="10"),
             "boolean cost": changed(min_edge_bps=True),
+            # True == 1 == the slippage floor, so only the bool check can reject it.
+            "boolean cost at its floor": changed(slippage_bps_per_side=True),
             "nan cost": changed(slippage_bps_per_side=float("nan")),
             "infinite cost": changed(short_borrow_bps_annual=float("inf")),
             "negative cost": changed(min_edge_bps=-20.0),

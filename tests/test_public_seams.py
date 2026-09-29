@@ -5,6 +5,7 @@ can keep the seams without rewriting tests. The old private names stay as aliase
 until every caller has migrated; patching an alias has no effect on the code.
 """
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -57,6 +58,63 @@ class AliasPatchTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertTrue(alias_patches(source))
         self.assertEqual(alias_patches('patch.object(secrets, "run")'), [])
+
+
+PACKAGE = TESTS.parent / "jevtrader"
+
+
+def alias_uses(source: str, module: str) -> list[str]:
+    """Package code that calls or reads a private seam alias instead of the public seam.
+
+    ``module`` is the short name of the module holding ``source``; its own alias
+    assignment (``_x = x``) is the one allowed reference.
+    """
+    found = []
+    tree = ast.parse(source)
+    allowed = {
+        id(target)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+    }
+    for seam_module, names in SEAMS.items():
+        short = seam_module.__name__.rsplit(".", 1)[-1]
+        privates = set(names.values())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in privates and short == module:
+                if id(node) not in allowed:
+                    found.append(f"{module}:{node.lineno} {node.id}")
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr in privates
+                and isinstance(node.value, ast.Name)
+                and node.value.id == short
+            ):
+                found.append(f"{module}:{node.lineno} {short}.{node.attr}")
+    return found
+
+
+class AliasUseTests(unittest.TestCase):
+    def test_package_code_never_goes_through_a_private_alias(self):
+        # Patching the public seam must reach every call site (P0-26).
+        found = [
+            hit
+            for path in sorted(PACKAGE.rglob("*.py"))
+            for hit in alias_uses(path.read_text(encoding="utf-8"), path.stem)
+        ]
+        self.assertEqual(found, [])
+
+    def test_detector_catches_planted_alias_uses(self):
+        for module, source in (
+            ("sec", "validate_url = 1\n_validate_url = validate_url\n_validate_url(u)\n"),
+            ("local", "def f():\n    return _base_url(u)\n"),
+            ("config", "import local\nlocal._base_url(v)\n"),
+            ("app", "sec._transport(r)\n"),
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(alias_uses(source, module))
+        self.assertEqual(alias_uses("_validate_url = validate_url\n", "sec"), [])
+        self.assertEqual(alias_uses("local.normalize_base_url(v)\n", "config"), [])
 
 
 class PublicSeamTests(unittest.TestCase):

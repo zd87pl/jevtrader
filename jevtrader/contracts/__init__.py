@@ -6,7 +6,8 @@ package must pass ``mypy --strict``. No ``from __future__ import annotations``:
 it hides ``NotRequired`` from ``__required_keys__``.
 """
 
-from typing import Any, Literal, NotRequired, TypedDict, get_type_hints
+import types
+from typing import Any, Literal, NotRequired, TypedDict, Union, get_args, get_origin, get_type_hints
 
 Mode = Literal["historical", "forward", "synthetic"]
 
@@ -103,10 +104,35 @@ class Outcome(TypedDict):
     recorded_at: str
 
 
+def _matches(value: Any, hint: Any) -> bool:
+    """Shallow type check: containers by kind only, ``bool`` never counts as a number."""
+    origin = get_origin(hint)
+    if hint is Any:
+        return True
+    if origin is Literal:
+        return any(type(value) is type(arg) and value == arg for arg in get_args(hint))
+    if origin is Union or origin is types.UnionType:
+        return any(_matches(value, arg) for arg in get_args(hint))
+    if hint is type(None):
+        return value is None
+    if origin is not None:
+        return isinstance(value, origin)
+    if isinstance(value, bool):
+        return hint is bool
+    if hint is float:
+        return isinstance(value, (int, float))
+    return isinstance(value, hint)
+
+
 def conforms(contract: type, record: dict[str, Any]) -> list[str]:
-    """Key-level problems of ``record`` against a TypedDict ``contract``; empty if none."""
+    """Key and shallow type problems of ``record`` against a TypedDict ``contract``."""
     required: frozenset[str] = getattr(contract, "__required_keys__")
-    declared = set(get_type_hints(contract))
+    hints = get_type_hints(contract)
     problems = [f"missing key: {key}" for key in sorted(required - set(record))]
-    problems += [f"undeclared key: {key}" for key in sorted(set(record) - declared)]
+    problems += [f"undeclared key: {key}" for key in sorted(set(record) - set(hints))]
+    problems += [
+        f"wrong type: {key}"
+        for key in sorted(set(record) & set(hints))
+        if not _matches(record[key], hints[key])
+    ]
     return problems

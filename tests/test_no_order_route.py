@@ -59,6 +59,19 @@ def _route_of(text: str) -> str:
     return re.sub(r"^[a-z]+://[^/]*", "", text.strip(), flags=re.IGNORECASE)
 
 
+def _fold(node: ast.AST) -> str:
+    """The string a concatenation or f-string builds, with "{}" for unknown parts."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _fold(node.left) + _fold(node.right)
+    if isinstance(node, ast.FormattedValue):
+        return _fold(node.value)
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_fold(value) for value in node.values)
+    return "{}"
+
+
 def violations(name: str, source: str) -> list[str]:
     """Broker hosts and order, position or account routes named in one source file."""
     found = []
@@ -68,11 +81,27 @@ def violations(name: str, source: str) -> list[str]:
             line = source.count("\n", 0, match.start()) + 1
             found.append(f"{name}:{line}: broker host {host}")
     if name.endswith(".py"):
+        tree = ast.parse(source)
         strings = [
             (node.lineno, node.value)
-            for node in ast.walk(ast.parse(source))
+            for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         ]
+        # Routes assembled from pieces ("/v2/" + "orders", f"{base}/v2/{kind}") are folded,
+        # with "{}" standing in for any part that is not a string literal.
+        strings += [
+            (node.lineno, _fold(node))
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.BinOp, ast.JoinedStr))
+        ]
+        if name != "bars.py":
+            # The exempt host may not leave bars.py under its constant's name either.
+            found += [
+                f"{name}:{node.lineno}: exempt calendar host reused"
+                for node in ast.walk(tree)
+                if (isinstance(node, ast.Name) and node.id == "CALENDAR_HOST")
+                or (isinstance(node, ast.Attribute) and node.attr == "CALENDAR_HOST")
+            ]
     else:
         strings = [(number, line) for number, line in enumerate(source.splitlines(), 1)]
         strings = [
@@ -170,6 +199,25 @@ class GuardSelfTests(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertTrue(violations("feeds.py", source))
+
+    def test_catches_routes_built_by_concatenation(self):
+        for source in (
+            'url = "https://" + HOST + "/v2/" + "orders"\n',
+            'url = BASE + "/v2/" + kind + "/" + "positions"\n',
+            "url = f\"{BASE}/v2/{'acc' + 'ount'}\"\n",
+            'url = "/v2/" + "acc" + "ount"\n',
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(violations("feeds.py", source))
+
+    def test_calendar_host_constant_stays_in_bars(self):
+        for source in (
+            'url = "https://" + bars.CALENDAR_HOST + "/v2/" + "orders"\n',
+            "from .bars import CALENDAR_HOST\nhost = CALENDAR_HOST\n",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(violations("web.py", source))
+        self.assertEqual(violations("bars.py", "url = CALENDAR_HOST\n"), [])
 
     def test_exemption_is_bound_to_one_file(self):
         source = 'CALENDAR_HOST = "paper-api.alpaca.markets"\n'

@@ -38,6 +38,33 @@ class ConformsTests(unittest.TestCase):
         self.assertIn("missing key: event_id", problems)
         self.assertIn("undeclared key: surprise", problems)
 
+    def test_reports_wrong_field_types(self) -> None:
+        # The contract must not drift from what the ledger writes (a float stored as text).
+        extraction = dict(RECORDS["extractions"][0])
+        forecast = dict(RECORDS["forecasts"][0])
+        outcome = dict(RECORDS["outcomes"][0])
+        cases = [
+            (contracts.Extraction, extraction, "direction", "x"),
+            (contracts.Extraction, extraction, "direction", True),
+            (contracts.Extraction, extraction, "input_tokens", 1.5),
+            (contracts.Extraction, extraction, "raw", []),
+            (contracts.Forecast, forecast, "mode", "live"),
+            (contracts.Forecast, forecast, "action", "BUY"),
+            (contracts.Forecast, forecast, "features", "0.1"),
+            (contracts.Forecast, forecast, "calibrator_id", 3),
+            (contracts.Outcome, outcome, "horizon_sessions", True),
+        ]
+        for contract, base, key, value in cases:
+            with self.subTest(key=key, value=value):
+                record = {**base, key: value}
+                self.assertEqual(contracts.conforms(contract, record), [f"wrong type: {key}"])
+
+    def test_accepts_optional_none_and_whole_number_floats(self) -> None:
+        forecast = {**RECORDS["forecasts"][0], "calibrator_id": None, "expected_return": None}
+        self.assertEqual(contracts.conforms(contracts.Forecast, forecast), [])
+        extraction = {**RECORDS["extractions"][0], "direction": 0}
+        self.assertEqual(contracts.conforms(contracts.Extraction, extraction), [])
+
     def test_optional_keys_may_be_absent(self) -> None:
         record = dict(RECORDS["extractions"][0])
         record.pop("text_excerpt", None)

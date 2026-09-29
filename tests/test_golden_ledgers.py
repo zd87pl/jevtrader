@@ -80,15 +80,19 @@ def test_golden_v1_migrates_and_verifies_to_the_pinned_head(tmp_path):
     with Ledger(path) as ledger:
         report = ledger.verify()
         head = ledger.head()
+        identity = ledger.identity()
+    # Schema 3 (ADR-0005): the migration adds a creation record and keeps the schema-2 chain.
+    assert isinstance(identity, str) and len(identity) == 32
     assert report == {
         "ok": True,
         "records": 4,
         "chain_length": 4,
         "head": GOLDEN_HEAD["chain_hash"],
+        "identity": identity,
         "problems": [],
     }
     assert head == GOLDEN_HEAD
-    assert rows(path, "PRAGMA user_version") == [(2,)]
+    assert rows(path, "PRAGMA user_version") == [(3,)]
     assert rows(path, RECORDS) == expected_records()
     assert [row[1:3] for row in rows(path, CHAIN)] == CHAIN_ORDER
     with Ledger(path, readonly=True) as ledger:
@@ -108,6 +112,7 @@ def test_golden_v2_verifies_read_only_and_matches_the_migrated_v1_chain(tmp_path
             "records": 4,
             "chain_length": 4,
             "head": GOLDEN_HEAD["chain_hash"],
+            "identity": None,
             "problems": [],
         }
     assert rows(v2, CHAIN) == rows(v1, CHAIN)

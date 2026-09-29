@@ -11,10 +11,11 @@ from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 from jevtrader.bars import normalize_bar
 from jevtrader.common import canonical, digest
+from jevtrader import store
+from jevtrader.pit import knowledge_time
 from jevtrader.store import Ledger
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -135,11 +136,36 @@ def build_v1(path: Path) -> None:
 
 
 def build_v2(path: Path) -> None:
-    """A schema-2 ledger written by the current code, with the golden recorded_at times."""
-    times = iter(row[3] for row in GOLDEN_ROWS)
-    with patch("jevtrader.store.utc_now", side_effect=lambda: next(times)), Ledger(path) as led:
-        for kind, identity, payload, _ in GOLDEN_ROWS:
-            led.put(kind, identity, payload)
+    """A schema-2 ledger as the schema-2 code wrote it, with the golden recorded_at times.
+
+    Schema 3 (ADR-0005) changed the link formula for new ledgers, so this restates the
+    schema-2 write path: the store's schema-2 DDL, the schema-2 link and the as_of index.
+    """
+    db = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        db.execute("BEGIN")
+        for statement in (*store._SCHEMA, *store._KNOWLEDGE_SCHEMA):
+            db.execute(statement)
+        head = store.GENESIS
+        for kind, identity, payload, recorded_at in GOLDEN_ROWS:
+            content_hash = digest(payload)
+            db.execute(
+                "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+                (kind, identity, canonical(payload), content_hash, recorded_at),
+            )
+            known = knowledge_time(kind, payload, recorded_at).iso()
+            db.execute("INSERT INTO knowledge VALUES (?, ?, ?)", (kind, identity, known))
+            link = store.link_hash(head, kind, identity, content_hash)
+            db.execute(
+                "INSERT INTO chain (kind, id, content_hash, prev_hash, chain_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, identity, content_hash, head, link),
+            )
+            head = link
+        db.execute("PRAGMA user_version=2")
+        db.execute("COMMIT")
+    finally:
+        db.close()
 
 
 def dump_sql(path: Path) -> str:

@@ -32,8 +32,18 @@ V1_SCHEMA = """
 
 
 def expected_link(prev: str, kind: str, identity: str, payload: dict) -> str:
-    """Independent restatement of the documented chain formula."""
+    """Independent restatement of the documented schema-2 chain formula."""
     preimage = f"{prev}|{kind}|{identity}|{digest(payload)}"
+    return hashlib.sha256(preimage.encode()).hexdigest()
+
+
+def expected_v3_link(prev: str, kind: str, identity: str, payload: dict, ledger: Ledger) -> str:
+    """The schema-3 formula (ADR-0005): the schema-2 preimage plus recorded_at and the root."""
+    recorded_at, root = ledger.db.execute(
+        "SELECT recorded_at, (SELECT root FROM ledger_identity) FROM records WHERE kind=? AND id=?",
+        (kind, identity),
+    ).fetchone()
+    preimage = f"{prev}|{kind}|{identity}|{digest(payload)}|{recorded_at}|{root}"
     return hashlib.sha256(preimage.encode()).hexdigest()
 
 
@@ -98,14 +108,23 @@ class ChainTests(unittest.TestCase):
         self.ledger = Ledger(":memory:")
         self.addCleanup(self.ledger.db.close)
 
-    def test_new_ledger_is_schema_two_with_an_empty_chain(self):
-        self.assertEqual(self.ledger.db.execute("PRAGMA user_version").fetchone()[0], 2)
-        self.assertEqual(SCHEMA_VERSION, 2)
+    def test_new_ledger_is_schema_three_with_an_empty_chain(self):
+        # Schema 3 since ADR-0005 (was schema 2).
+        self.assertEqual(self.ledger.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(SCHEMA_VERSION, 3)
         self.assertEqual(GENESIS, "0" * 64)
         self.assertEqual(self.ledger.head(), {"seq": 0, "chain_hash": GENESIS})
+        identity = self.ledger.identity()
         self.assertEqual(
             self.ledger.verify(),
-            {"ok": True, "records": 0, "chain_length": 0, "head": GENESIS, "problems": []},
+            {
+                "ok": True,
+                "records": 0,
+                "chain_length": 0,
+                "head": GENESIS,
+                "identity": identity,
+                "problems": [],
+            },
         )
         triggers = {
             name
@@ -113,15 +132,15 @@ class ChainTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='trigger'"
             )
         }
-        self.assertEqual(triggers, set(TRIGGERS))
+        self.assertEqual(triggers, set(TRIGGERS) | store.IDENTITY_TRIGGERS)
 
     def test_put_links_each_record_to_the_previous_head(self):
         first, second = {"score": 0.25}, {"nested": {"reason": "new fact"}, "score": -1}
         self.assertTrue(self.ledger.put("forecasts", "a", first))
         self.assertTrue(self.ledger.put("bars", "ABC:2026-01-05", second))
         rows = chain_rows(self.ledger)
-        one = expected_link(GENESIS, "forecasts", "a", first)
-        two = expected_link(one, "bars", "ABC:2026-01-05", second)
+        one = expected_v3_link(GENESIS, "forecasts", "a", first, self.ledger)
+        two = expected_v3_link(one, "bars", "ABC:2026-01-05", second, self.ledger)
         self.assertEqual(
             rows,
             [
@@ -130,7 +149,7 @@ class ChainTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.ledger.head(), {"seq": 2, "chain_hash": two})
-        self.assertEqual(link_hash(one, "bars", "ABC:2026-01-05", digest(second)), two)
+        self.assertNotEqual(link_hash(one, "bars", "ABC:2026-01-05", digest(second)), two)
         result = self.ledger.verify()
         self.assertEqual((result["ok"], result["chain_length"], result["head"]), (True, 2, two))
 
@@ -304,6 +323,7 @@ class VerifyTests(unittest.TestCase):
                 "records": 3,
                 "chain_length": 3,
                 "head": self.ledger.head()["chain_hash"],
+                "identity": self.ledger.identity(),
                 "problems": [],
             },
         )
@@ -413,7 +433,7 @@ class VerifyTests(unittest.TestCase):
         )
         self.ledger.db.execute(
             "UPDATE chain SET content_hash=?, chain_hash=? WHERE seq=3",
-            (digest(changed), expected_link(prev, "forecasts", "c", changed)),
+            (digest(changed), expected_v3_link(prev, "forecasts", "c", changed, self.ledger)),
         )
         self.restore_triggers()
         self.assertTrue(self.ledger.verify()["ok"])
@@ -568,7 +588,7 @@ class OpenModeTests(FileCase):
         self.assertEqual(reader.head(), writer.head())
 
     def test_unsupported_versions_fail_closed_in_every_mode(self):
-        for version in (3, 99, -1):
+        for version in (4, 99, -1):
             path = self.dir / f"v{version}.sqlite"
             make_v1(
                 path, [("runs", "r1", {"job": "poll"}, "2026-01-01T00:00:00Z")], version=version
@@ -595,8 +615,8 @@ class MigrationTests(FileCase):
         make_v1(self.path, self.ROWS)
         before = raw(self.path, "SELECT * FROM records ORDER BY kind, id")
         ledger = self.ledger()
-        self.assertEqual(ledger.version, 2)
-        self.assertEqual(raw(self.path, "PRAGMA user_version"), [(2,)])
+        self.assertEqual(ledger.version, 3)
+        self.assertEqual(raw(self.path, "PRAGMA user_version"), [(3,)])
         order = [("bars", "z"), ("attempts", "q"), ("bars", "a"), ("forecasts", "b")]
         payloads = {(kind, identity): payload for kind, identity, payload, _ in self.ROWS}
         expected, prev = [], GENESIS
@@ -637,7 +657,7 @@ class MigrationTests(FileCase):
     def test_partially_initialized_version_zero_file_is_migrated(self):
         make_v1(self.path, self.ROWS[:1], version=0)
         ledger = self.ledger(create=False)
-        self.assertEqual(raw(self.path, "PRAGMA user_version"), [(2,)])
+        self.assertEqual(raw(self.path, "PRAGMA user_version"), [(3,)])
         self.assertEqual(ledger.verify()["chain_length"], 1)
 
     def test_failed_migration_leaves_the_v1_ledger_untouched(self):

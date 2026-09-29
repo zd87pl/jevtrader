@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -26,7 +27,8 @@ KINDS = {
     "runs",
 }
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+CHAINED_VERSION = 2  # the first schema with a hash chain
 GENESIS = "0" * 64
 MAX_PROBLEMS = 100
 TRIGGERS = frozenset(
@@ -77,6 +79,33 @@ _SCHEMA = (
     BEGIN SELECT RAISE(ABORT, 'Ledger chain must match a stored record'); END""",
 )
 
+# Schema 3 (ADR-0005): one creation record per ledger. Its root enters every later link.
+IDENTITY_FIELDS = (
+    "nonce",
+    "created_at",
+    "migrated_from",
+    "legacy_seq",
+    "legacy_head",
+    "legacy_recorded_at",
+)
+IDENTITY_TRIGGERS = frozenset(
+    {"ledger_identity_no_update", "ledger_identity_no_delete", "ledger_identity_single"}
+)
+_IDENTITY_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS ledger_identity (
+        nonce TEXT NOT NULL, created_at TEXT NOT NULL, migrated_from INTEGER NOT NULL,
+        legacy_seq INTEGER NOT NULL, legacy_head TEXT NOT NULL,
+        legacy_recorded_at TEXT NOT NULL, root TEXT NOT NULL
+    )""",
+    """CREATE TRIGGER IF NOT EXISTS ledger_identity_no_update BEFORE UPDATE ON ledger_identity
+    BEGIN SELECT RAISE(ABORT, 'Ledger identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS ledger_identity_no_delete BEFORE DELETE ON ledger_identity
+    BEGIN SELECT RAISE(ABORT, 'Ledger identity is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS ledger_identity_single BEFORE INSERT ON ledger_identity
+    WHEN EXISTS (SELECT 1 FROM ledger_identity)
+    BEGIN SELECT RAISE(ABORT, 'Ledger identity is immutable'); END""",
+)
+
 # A derived, rebuildable index for as_of reads (ADR-0004). It is outside the hash chain;
 # as_of recomputes every returned row's knowledge time, so a stale or edited index can hide
 # a row but never leak one known after the requested instant.
@@ -89,9 +118,37 @@ _KNOWLEDGE_SCHEMA = (
 )
 
 
-def link_hash(prev_hash: str, kind: str, identity: str, content_hash: str) -> str:
-    # Hashes are fixed-width hex and kinds contain no "|", so the preimage is unambiguous.
-    return hashlib.sha256(f"{prev_hash}|{kind}|{identity}|{content_hash}".encode()).hexdigest()
+def link_hash(
+    prev_hash: str,
+    kind: str,
+    identity: str,
+    content_hash: str,
+    recorded_at: str | None = None,
+    root: str | None = None,
+) -> str:
+    """The schema-2 link, or with ``recorded_at`` and ``root`` the schema-3 link (ADR-0005)."""
+    # Hashes are fixed-width hex and kinds and timestamps contain no "|", so the preimage is
+    # unambiguous.
+    preimage = f"{prev_hash}|{kind}|{identity}|{content_hash}"
+    if recorded_at is not None or root is not None:
+        preimage += f"|{recorded_at}|{root}"
+    return hashlib.sha256(preimage.encode()).hexdigest()
+
+
+def new_nonce() -> str:
+    """128 random bits, the identity of a new or upgraded ledger."""
+    return secrets.token_hex(16)
+
+
+def identity_root(fields: dict) -> str:
+    return hashlib.sha256(
+        canonical({name: fields[name] for name in IDENTITY_FIELDS}).encode()
+    ).hexdigest()
+
+
+def legacy_recorded_at(rows: list[tuple[str, str, str]]) -> str:
+    """SHA-256 over ``[[kind, id, recorded_at], ...]`` of the pre-upgrade chain, in seq order."""
+    return hashlib.sha256(canonical([list(row) for row in rows]).encode()).hexdigest()
 
 
 class Ledger:
@@ -130,7 +187,7 @@ class Ledger:
 
     def _open(self, create: bool) -> int:
         version = self._user_version()
-        if version not in (0, 1, SCHEMA_VERSION):
+        if version not in (0, 1, CHAINED_VERSION, SCHEMA_VERSION):
             raise ValueError(f"Unsupported ledger schema {version}")
         if (self.readonly or not create) and not self._has_table("records"):
             raise ValueError(f"No ledger at {self.path}; run init first")
@@ -181,17 +238,64 @@ class Ledger:
             version = self._user_version()
             if version == SCHEMA_VERSION:
                 return
-            if version not in (0, 1):
+            if version not in (0, 1, CHAINED_VERSION):
                 raise ValueError(f"Unsupported ledger schema {version}")
-            for statement in _SCHEMA:
-                self.db.execute(statement)
-            rows = self.db.execute(
-                "SELECT kind, id, content_hash FROM records ORDER BY recorded_at, kind, id"
-            ).fetchall()
-            head = GENESIS
-            for kind, identity, content_hash in rows:
-                head = self._link(kind, identity, content_hash, head)
+            if version < CHAINED_VERSION:
+                for statement in _SCHEMA:
+                    self.db.execute(statement)
+                rows = self.db.execute(
+                    "SELECT kind, id, content_hash FROM records ORDER BY recorded_at, kind, id"
+                ).fetchall()
+                head = GENESIS
+                for kind, identity, content_hash in rows:
+                    head = self._link(kind, identity, content_hash, head)
+            self._create_identity(version)
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _create_identity(self, migrated_from: int) -> None:
+        """Write the schema-3 creation record over the chain as it stands (ADR-0005)."""
+        for statement in _IDENTITY_SCHEMA:
+            self.db.execute(statement)
+        seq, head = self._chain_head()
+        legacy = self.db.execute(
+            "SELECT c.kind, c.id, r.recorded_at FROM chain c "
+            "JOIN records r ON r.kind=c.kind AND r.id=c.id ORDER BY c.seq"
+        ).fetchall()
+        fields = {
+            "nonce": new_nonce(),
+            "created_at": self.now(),
+            "migrated_from": migrated_from,
+            "legacy_seq": seq,
+            "legacy_head": head,
+            "legacy_recorded_at": legacy_recorded_at(legacy),
+        }
+        self.db.execute(
+            "INSERT INTO ledger_identity VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (*(fields[name] for name in IDENTITY_FIELDS), identity_root(fields)),
+        )
+
+    def _identity_rows(self) -> list[dict]:
+        if not self._has_table("ledger_identity"):
+            return []
+        columns = (*IDENTITY_FIELDS, "root")
+        query = f"SELECT {', '.join(columns)} FROM ledger_identity ORDER BY rowid"
+        return [dict(zip(columns, row, strict=True)) for row in self.db.execute(query)]
+
+    def identity(self) -> str | None:
+        """The ledger's nonce (ADR-0005); None before schema 3 or when the row is missing."""
+        if self.version < SCHEMA_VERSION:
+            return None
+        rows = self._identity_rows()
+        return rows[0]["nonce"] if rows else None
+
+    def _root(self) -> str | None:
+        rows = self._identity_rows() if self.version >= SCHEMA_VERSION else []
+        return rows[0]["root"] if rows else None
+
+    def _chain_head(self) -> tuple[int, str]:
+        query = "SELECT seq, chain_hash FROM chain ORDER BY seq DESC LIMIT 1"
+        found = self.db.execute(query).fetchone()
+        return (0, GENESIS) if found is None else (found[0], found[1])
 
     def _user_version(self) -> int:
         return self.db.execute("PRAGMA user_version").fetchone()[0]
@@ -213,8 +317,19 @@ class Ledger:
                 self.db.execute("ROLLBACK")
             raise
 
-    def _link(self, kind: str, identity: str, content_hash: str, prev_hash: str) -> str:
-        result = link_hash(prev_hash, kind, identity, content_hash)
+    def _link(
+        self,
+        kind: str,
+        identity: str,
+        content_hash: str,
+        prev_hash: str,
+        recorded_at: str | None = None,
+        root: str | None = None,
+    ) -> str:
+        if root is None:
+            result = link_hash(prev_hash, kind, identity, content_hash)
+        else:
+            result = link_hash(prev_hash, kind, identity, content_hash, recorded_at, root)
         self.db.execute(
             "INSERT INTO chain (kind, id, content_hash, prev_hash, chain_hash) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -257,18 +372,19 @@ class Ledger:
                 (kind, identity, encoded, content_hash, recorded_at),
             )
             self._index(kind, identity, knowledge_time(kind, payload, recorded_at))
-            self._link(kind, identity, content_hash, self.head()["chain_hash"])
+            root = self._root()
+            if root is None:
+                raise ValueError("Ledger identity is missing; run verify")
+            prev = self.head()["chain_hash"]
+            self._link(kind, identity, content_hash, prev, recorded_at, root)
         return True
 
     def head(self) -> dict:
         """The latest chain entry; publishing it lets anyone later detect a rewritten history."""
-        if self.version < SCHEMA_VERSION:
+        if self.version < CHAINED_VERSION:
             raise ValueError(self._unchained())
-        query = "SELECT seq, chain_hash FROM chain ORDER BY seq DESC LIMIT 1"
-        found = self.db.execute(query).fetchone()
-        if found is None:
-            return {"seq": 0, "chain_hash": GENESIS}
-        return {"seq": found[0], "chain_hash": found[1]}
+        seq, chain_hash = self._chain_head()
+        return {"seq": seq, "chain_hash": chain_hash}
 
     def _unchained(self) -> str:
         return (
@@ -283,8 +399,12 @@ class Ledger:
             or type(anchor.get("seq")) is not int
             or anchor["seq"] < 0
             or not isinstance(anchor.get("chain_hash"), str)
+            or not isinstance(anchor.get("identity", ""), str)
         ):
-            raise ValueError("Anchor must be a head() result: {'seq': int, 'chain_hash': hex}")
+            raise ValueError(
+                "Anchor must be a head() result: {'seq': int, 'chain_hash': hex}, "
+                "optionally with 'identity': str"
+            )
         # One read transaction: a writer committing mid-scan (the service writes on every
         # poll) must not look like a chain entry without its record.
         snapshot = not self.db.in_transaction
@@ -298,39 +418,80 @@ class Ledger:
 
     def _verify(self, anchor: dict | None) -> dict:
         problems: list[str] = []
-        recorded = self._verify_records(problems)
-        if self.version < SCHEMA_VERSION or not self._has_table("chain"):
+        recorded, stamps = self._verify_records(problems)
+        if self.version < CHAINED_VERSION or not self._has_table("chain"):
             problems.append(
-                self._unchained() if self.version < SCHEMA_VERSION else "Chain table is missing"
+                self._unchained() if self.version < CHAINED_VERSION else "Chain table is missing"
             )
             return _report(len(recorded), 0, GENESIS, problems)
         present = {
             name
             for (name,) in self.db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
         }
+        expected = TRIGGERS | IDENTITY_TRIGGERS if self.version >= SCHEMA_VERSION else TRIGGERS
         problems.extend(
-            f"Immutability trigger is missing: {name}" for name in sorted(TRIGGERS - present)
+            f"Immutability trigger is missing: {name}" for name in sorted(expected - present)
         )
-        length, head = self._verify_chain(recorded, problems)
+        found = self._verify_identity(problems) if self.version >= SCHEMA_VERSION else None
+        nonce = None if found is None else found["nonce"]
+        length, head = self._verify_chain(recorded, stamps, found, problems)
         if anchor is not None:
-            self._verify_anchor(anchor, problems)
-        return _report(len(recorded), length, head, problems)
+            self._verify_anchor(anchor, nonce, problems)
+        return _report(len(recorded), length, head, problems, nonce)
 
-    def _verify_records(self, problems: list[str]) -> dict[tuple[str, str], str]:
-        recorded = {}
+    def _verify_identity(self, problems: list[str]) -> dict | None:
+        """Check the schema-3 creation record (ADR-0005); return it, or None when missing."""
+        rows = self._identity_rows()
+        if not rows:
+            problems.append("Ledger identity is missing")
+            return None
+        if len(rows) > 1:
+            problems.append(f"Ledger identity must be one row, found {len(rows)}")
+        found = rows[0]
+        if identity_root(found) != found["root"]:
+            problems.append("Ledger identity does not match its root")
+        seq = found["legacy_seq"]
+        row = self.db.execute("SELECT chain_hash FROM chain WHERE seq=?", (seq,)).fetchone()
+        if (GENESIS if seq == 0 else row and row[0]) != found["legacy_head"]:
+            problems.append(f"Ledger identity does not match the chain head at seq {seq}")
+        legacy = self.db.execute(
+            "SELECT c.kind, c.id, r.recorded_at FROM chain c "
+            "JOIN records r ON r.kind=c.kind AND r.id=c.id WHERE c.seq<=? ORDER BY c.seq",
+            (seq,),
+        ).fetchall()
+        if legacy_recorded_at(legacy) != found["legacy_recorded_at"]:
+            problems.append("Legacy recorded_at digest does not match the ledger identity")
+        return found
+
+    def _verify_records(
+        self, problems: list[str]
+    ) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], str]]:
+        recorded, stamps = {}, {}
         rows = self.db.execute(
-            "SELECT kind, id, payload, content_hash FROM records ORDER BY kind, id"
+            "SELECT kind, id, payload, content_hash, recorded_at FROM records ORDER BY kind, id"
         )
-        for kind, identity, encoded, content_hash in rows:
+        for kind, identity, encoded, content_hash, recorded_at in rows:
             recorded[(kind, identity)] = content_hash
+            stamps[(kind, identity)] = recorded_at
             if not _intact(encoded, content_hash):
                 problems.append(f"Record content does not match its hash: {kind}/{identity}")
-        return recorded
+        return recorded, stamps
 
     def _verify_chain(
-        self, recorded: dict[tuple[str, str], str], problems: list[str]
+        self,
+        recorded: dict[tuple[str, str], str],
+        stamps: dict[tuple[str, str], str],
+        found: dict | None,
+        problems: list[str],
     ) -> tuple[int, str]:
         prev, last, length, chained = GENESIS, 0, 0, set()
+        # Schema 2 links up to the creation record; schema-3 links after it (ADR-0005). In a
+        # schema-3 ledger without its identity every link is held to the schema-3 formula.
+        if self.version < SCHEMA_VERSION:
+            legacy_seq, root = None, ""
+        else:
+            legacy_seq = 0 if found is None else found["legacy_seq"]
+            root = "" if found is None else found["root"]
         rows = self.db.execute(
             "SELECT seq, kind, id, content_hash, prev_hash, chain_hash FROM chain ORDER BY seq"
         )
@@ -338,7 +499,14 @@ class Ledger:
             where = f"chain seq {seq} ({kind}/{identity})"
             if prev_hash != prev:
                 problems.append(f"Chain link is broken at {where}")
-            if stored != link_hash(prev_hash, kind, identity, content_hash):
+            stamp = stamps.get((kind, identity))
+            if legacy_seq is None or seq <= legacy_seq:
+                expected = link_hash(prev_hash, kind, identity, content_hash)
+            elif stamp is None:  # no record to take recorded_at from; reported below
+                expected = stored
+            else:
+                expected = link_hash(prev_hash, kind, identity, content_hash, stamp, root)
+            if stored != expected:
                 problems.append(f"Chain hash does not match its contents at {where}")
             if (kind, identity) not in recorded:
                 problems.append(f"Chain entry has no record: {where}")
@@ -358,13 +526,15 @@ class Ledger:
             )
         return length, prev
 
-    def _verify_anchor(self, anchor: dict, problems: list[str]) -> None:
+    def _verify_anchor(self, anchor: dict, nonce: str | None, problems: list[str]) -> None:
         seq = anchor["seq"]
         row = self.db.execute("SELECT chain_hash FROM chain WHERE seq=?", (seq,)).fetchone()
         if seq and row is None:
             problems.append(f"Anchored head seq {seq} is not in the chain")
         elif (row[0] if seq else GENESIS) != anchor["chain_hash"]:
             problems.append(f"Chain differs from the anchored head at seq {seq}")
+        if "identity" in anchor and anchor["identity"] != nonce:
+            problems.append("Ledger identity differs from the anchored identity")
 
     def get(self, kind: str, identity: str) -> dict | None:
         row = self.db.execute(
@@ -490,7 +660,9 @@ def _intact(encoded: str, content_hash: str) -> bool:
         return False
 
 
-def _report(records: int, length: int, head: str, problems: list[str]) -> dict:
+def _report(
+    records: int, length: int, head: str, problems: list[str], identity: str | None = None
+) -> dict:
     if len(problems) > MAX_PROBLEMS:
         hidden = len(problems) - MAX_PROBLEMS
         problems = [*problems[:MAX_PROBLEMS], f"... and {hidden} more problems"]
@@ -499,5 +671,6 @@ def _report(records: int, length: int, head: str, problems: list[str]) -> dict:
         "records": records,
         "chain_length": length,
         "head": head,
+        "identity": identity,
         "problems": problems,
     }

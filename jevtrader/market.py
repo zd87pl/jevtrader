@@ -11,6 +11,7 @@ import csv
 import math
 from datetime import date
 from statistics import pstdev
+from typing import Any
 
 from .common import EASTERN, instant, number, symbol, timestamp, utc_now
 
@@ -18,7 +19,7 @@ from .common import EASTERN, instant, number, symbol, timestamp, utc_now
 def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
     if mode not in {"forward", "historical", "synthetic"}:
         raise ValueError("Invalid bar mode")
-    result = {"symbol": symbol(row.get("symbol", "")), "mode": mode}
+    result: dict[str, Any] = {"symbol": symbol(row.get("symbol", "")), "mode": mode}
     result["session"] = date.fromisoformat(row["session"]).isoformat()
     for key in ("open_at", "close_at"):
         result[key] = timestamp(row[key])

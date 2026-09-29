@@ -82,6 +82,10 @@ class MypyBaselineTests(unittest.TestCase):
         # A run that prints no summary did not finish checking.
         self.assertIn("Found", _step("mypy"))
 
+    def test_mypy_baseline_is_zero(self) -> None:
+        # P0-23 (#27): the package type-checks clean, so no error is tolerated.
+        self.assertRegex(_step("mypy"), r"MYPY_BASELINE: 0\n")
+
 
 if __name__ == "__main__":
     unittest.main()

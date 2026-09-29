@@ -13,7 +13,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from typing import Callable
+from typing import Any, Callable
 
 
 MAX_TEXT_CHARS = 40_000
@@ -205,7 +205,7 @@ def _result(features: dict, raw: dict, model: str, tokens: int, has_previous: bo
         raise ProviderValidationError(
             "Feature output must contain exactly direction, materiality, novelty, uncertainty"
         )
-    result = {
+    result: dict[str, Any] = {
         name: _number(features[name], name, -1.0 if name == "direction" else 0.0)
         for name in sorted(_FEATURE_KEYS)
     }

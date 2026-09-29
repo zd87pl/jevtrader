@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 # US equity sessions and EDGAR dates are defined in New York time.
@@ -58,7 +59,7 @@ def number(value: object, name: str, *, minimum: float | None = None) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
     try:
-        result = float(value)
+        result = float(cast(Any, value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(result) or (minimum is not None and result < minimum):

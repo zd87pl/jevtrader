@@ -32,9 +32,9 @@ jobs:
       - run: ruff format --check .
       - name: mypy (exact baseline, fails on crashes)
         env:
-          # Known errors in older modules. The count must match exactly: lower it
-          # in the change that fixes one, so the number never drifts silently.
-          MYPY_BASELINE: 9
+          # The package type-checks clean (P0-23). The count must match exactly,
+          # so the number never drifts silently.
+          MYPY_BASELINE: 0
         run: |
           set +e
           mypy jevtrader --ignore-missing-imports > mypy.log 2>&1

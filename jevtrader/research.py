@@ -41,7 +41,8 @@ def _time(value: Any, name: str) -> datetime:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError(f"{name} must be a UTC ISO timestamp") from exc
-    if result.tzinfo is None or result.utcoffset().total_seconds() != 0:
+    offset = result.utcoffset()  # None exactly when the value is naive
+    if offset is None or offset.total_seconds() != 0:
         raise ValueError(f"{name} must have a UTC offset")
     return result.astimezone(timezone.utc)
 

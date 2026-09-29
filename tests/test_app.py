@@ -30,6 +30,7 @@ from jevtrader import (
     pipeline,
     providers,
     registry,
+    sec,
     web,
 )
 from jevtrader import config as settings
@@ -1237,6 +1238,27 @@ class SecContactTests(TempHome):
             settings.validate({"sec_user_agent": "no contact here"})
         self.assertNotIn("Your Name", str(caught.exception))
         self.assertIn("alias", str(caught.exception))
+
+    def test_daemon_client_and_up_never_ask_for_a_name(self):
+        messages = []
+        with self.assertRaises(Exception) as caught:
+            daemon._user_agent(SimpleNamespace(config={"sec_user_agent": ""}))
+        messages.append(str(caught.exception))
+        with self.assertRaises(sec.SECError) as caught:
+            sec.collect_disclosures("320193", "AAPL", user_agent="no email")
+        messages.append(str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            app.up(
+                settings.validate({}),
+                ledger_path=str(self.dir / "u.sqlite"),
+                program=["jevtrader"],
+                runner=FakeLaunchctl(),
+            )
+        messages.append(str(caught.exception))
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertIn("contact for SEC", message)
+                self.assertNotIn("name", message.lower())
 
     def run_collect(self, *extra):
         db = self.dir / "forward.sqlite"

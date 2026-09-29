@@ -14,6 +14,7 @@ import importlib.util
 import os
 import re
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,11 @@ SCRUBBED_ENV = frozenset(
     {*secrets.KNOWN, "SEC_USER_AGENT", "OPENAI_MODEL", "XDG_DATA_HOME", "PYTHONSTARTUP"}
 )
 _SECRET_NAME = re.compile(r"^APCA_|^IB_|_API_KEY$|_API_KEY_ID$|_SECRET(_KEY)?$|_TOKEN$|PASSWORD")
+
+
+def scrubbed_names(environ: Mapping[str, str]) -> list[str]:
+    """The variables in ``environ`` that every test runs without: keys, contact, credentials."""
+    return [name for name in environ if name in SCRUBBED_ENV or _SECRET_NAME.search(name)]
 
 
 class Violations(list):
@@ -63,9 +69,8 @@ def _offline_system(monkeypatch, tmp_path):
     def refuse_command(*_args, **_kwargs):
         raise refuse("run a real system command")
 
-    for name in list(os.environ):
-        if name in SCRUBBED_ENV or _SECRET_NAME.search(name):
-            monkeypatch.delenv(name)
+    for name in scrubbed_names(os.environ):
+        monkeypatch.delenv(name)
 
     monkeypatch.setattr(secrets, "keychain_available", lambda: False)
     monkeypatch.setattr(secrets, "run", refuse_command)

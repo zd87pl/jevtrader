@@ -34,6 +34,7 @@ def _canaries() -> dict[str, str]:
         "slack-token": "xo" + "xb-" + "1234567890-" + "abcdefghij",
         "private-key": "-----BEGIN " + "RSA PRIVATE" + " KEY-----",
         "alpaca-secret": "APCA_API_" + 'SECRET_KEY="' + "Ab1Cd2" * 7 + '"',
+        "typesafe-key": "TYPESAFE_" + 'API_KEY="' + "Tz9Qw8" * 5 + '"',
     }
 
 
@@ -62,6 +63,16 @@ class RuleTests(unittest.TestCase):
             "export OPENAI_API_KEY=your-key-here\n"
         )
         self.assertEqual(self.scan.scan_text(clean), [])
+
+    def test_the_apps_own_alpaca_name_is_caught(self) -> None:
+        # The app reads ALPACA_API_SECRET_KEY (.env.example, bars.py), not only APCA_*.
+        for name in ("ALPACA_API_" + "SECRET_KEY", "APCA_API_" + "SECRET_KEY"):
+            with self.subTest(name=name):
+                hits = self.scan.scan_text(f"{name}={'Ab1Cd2' * 7}\n")
+                self.assertEqual([hit.rule for hit in hits], ["alpaca-secret"])
+
+    def test_empty_env_example_placeholders_stay_clean(self) -> None:
+        self.assertEqual(self.scan.scan_text((ROOT / ".env.example").read_text()), [])
 
     def test_allow_marker_silences_one_line_only(self) -> None:
         secret = _canaries()["aws-access-key-id"]

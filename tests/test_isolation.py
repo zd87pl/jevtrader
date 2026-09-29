@@ -230,6 +230,95 @@ class GuardTests(unittest.TestCase):
             self.assertNotIn(name, os.environ)
         self.assertFalse([name for name in os.environ if name.endswith("_API_KEY")])
 
+    def test_scrub_removes_planted_credentials_and_keeps_the_rest(self):
+        # The host usually lacks these, so the check above alone would pass vacuously.
+        from conftest import scrubbed_names
+
+        planted = {
+            name: "x"
+            for name in (
+                *secrets.KNOWN,
+                "SEC_USER_AGENT",
+                "APCA_API_KEY_ID",
+                "APCA_API_SECRET_KEY",
+                "FOO_TOKEN",
+                "X_PASSWORD",
+                "PATH",
+                "LANG",
+            )
+        }
+        self.assertEqual(set(planted) - set(scrubbed_names(planted)), {"PATH", "LANG"})
+
+    def test_posix_spawn_children_inherit_the_guards(self):
+        script = dedent(
+            """
+            import socket
+            try:
+                socket.getaddrinfo("www.sec.gov", 443)
+            except AssertionError:
+                pass
+            """
+        )
+        argv = [sys.executable, "-c", script]
+        for name in ("posix_spawn", "posix_spawnp"):
+            spawn = getattr(os, name)
+            with self.subTest(spawn=name):
+                pid = spawn(sys.executable, argv, {"PATH": os.environ.get("PATH", "")})
+                _, status = os.waitpid(pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                self.assertEqual(self.violations.children(), ["(child) resolve 'www.sec.gov'"])
+                self.violations.clear()
+
+    def test_a_swallowed_child_trip_fails_the_test_in_teardown(self):
+        # Nothing in the inner test collects child trips; only the fixture's teardown does.
+        inner = self.dir / "inner"
+        inner.mkdir()
+        conftest = Path(__file__).with_name("conftest.py")
+        (inner / "conftest.py").write_text(
+            dedent(
+                f"""
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("suite_conftest", {str(conftest)!r})
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _offline_system = module._offline_system
+                """
+            ),
+            encoding="utf-8",
+        )
+        (inner / "test_inner.py").write_text(
+            dedent(
+                """
+                import subprocess, sys
+                SCRIPT = (
+                    "import socket\\n"
+                    "try:\\n    socket.getaddrinfo('www.sec.gov', 443)\\n"
+                    "except AssertionError:\\n    pass\\n"
+                )
+                def test_swallows_a_child_trip():
+                    subprocess.run([sys.executable, "-c", SCRIPT], check=True)
+                """
+            ),
+            encoding="utf-8",
+        )
+        # HOME points into tmp_path, so a user-site pytest must be put on the path by hand.
+        site = str(Path(pytest.__file__).resolve().parents[1])
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join([environment["PYTHONPATH"], site])
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(inner)],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("isolation guard tripped", done.stdout, done.stderr[-2000:])
+        self.assertIn("1 passed, 1 error", done.stdout)
+        self.assertEqual(self.violations.children(), [])
+
     def test_guard_constants_match_the_package(self):
         from conftest import GUARD
 

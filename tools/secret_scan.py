@@ -27,9 +27,14 @@ RULES: dict[str, re.Pattern[str]] = {
     "slack-token": re.compile(r"(?<![A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}"),
     "private-key": re.compile(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY( BLOCK)?-----"),
     # Alpaca secrets are 40 characters; only a quoted or bare value that long counts,
-    # so an empty placeholder such as ``APCA_API_SECRET_KEY=`` stays clean.
+    # so an empty placeholder such as ``APCA_API_SECRET_KEY=`` stays clean. The app's
+    # own name is ALPACA_API_SECRET_KEY; the SDK's is APCA_API_SECRET_KEY.
     "alpaca-secret": re.compile(
-        r"APCA_API_SECRET_KEY['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9/+]{32,}", re.IGNORECASE
+        r"(?:APCA|ALPACA)_API_SECRET_KEY['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9/+]{32,}", re.IGNORECASE
+    ),
+    # Typesafe keys have no documented prefix, so only a long assigned value counts.
+    "typesafe-key": re.compile(
+        r"TYPESAFE_API_KEY['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{24,}", re.IGNORECASE
     ),
 }
 
@@ -43,6 +48,7 @@ def _canary(rule: str) -> str:
         "slack-token": ("xo", "xb-", "1234567890-", "abcdefghij"),
         "private-key": ("-----BEGIN ", "RSA PRIVATE", " KEY-----"),
         "alpaca-secret": ("APCA_API_", 'SECRET_KEY="', "Ab1Cd2" * 7, '"'),
+        "typesafe-key": ("TYPESAFE_", 'API_KEY="', "Tz9Qw8" * 5, '"'),
     }[rule]
     return "".join(parts)
 

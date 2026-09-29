@@ -5,7 +5,9 @@ can keep the seams without rewriting tests. The old private names stay as aliase
 until every caller has migrated; patching an alias has no effect on the code.
 """
 
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from jevtrader import bars, launchd, local, providers, sec, secrets
@@ -18,6 +20,43 @@ SEAMS = {
     secrets: {"run": "_run", "keychain_available": "_keychain_available"},
     launchd: {"run": "_run"},
 }
+
+
+TESTS = Path(__file__).resolve().parent
+
+
+def alias_patches(source: str) -> list[str]:
+    """Private seam aliases that ``source`` patches; patching one silently does nothing."""
+    found = []
+    for module, names in SEAMS.items():
+        short = module.__name__.rsplit(".", 1)[-1]
+        for private in names.values():
+            by_object = rf"patch\.object\(\s*(?:\w+\.)?{short}\s*,\s*[\"']{private}[\"']"
+            by_target = rf"[\"']{re.escape(module.__name__)}\.{private}[\"']"
+            if re.search(by_object, source) or re.search(by_target, source):
+                found.append(f"{short}.{private}")
+    return found
+
+
+class AliasPatchTests(unittest.TestCase):
+    def test_no_test_patches_a_private_alias(self):
+        found = {
+            path.name: hits
+            for path in sorted(TESTS.rglob("*.py"))
+            if path != Path(__file__).resolve()
+            and (hits := alias_patches(path.read_text(encoding="utf-8")))
+        }
+        self.assertEqual(found, {})
+
+    def test_detector_catches_planted_alias_patches(self):
+        for source in (
+            'patch.object(secrets, "_run")',
+            "patch.object(jevtrader.sec, '_transport', fake)",
+            'patch("jevtrader.secrets._keychain_available", return_value=True)',
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(alias_patches(source))
+        self.assertEqual(alias_patches('patch.object(secrets, "run")'), [])
 
 
 class PublicSeamTests(unittest.TestCase):

@@ -49,7 +49,10 @@ EXEMPT_ROUTES = {("paper-api.alpaca.markets", "/v2/calendar")}
 
 
 def _is_path_like(text: str) -> bool:
-    return "://" in text or (text.startswith("/") and " " not in text.strip())
+    # Any space-free string with a slash, so relative routes such as "v2/orders" (joined
+    # onto a base URL) count as well as absolute ones.
+    stripped = text.strip()
+    return "://" in stripped or ("/" in stripped and not any(c.isspace() for c in stripped))
 
 
 def _route_of(text: str) -> str:
@@ -158,6 +161,15 @@ class GuardSelfTests(unittest.TestCase):
                 self.assertTrue(violations("feeds.py", f"PATH = {route!r}\n"))
                 self.assertTrue(violations("feeds.py", f"x = f'{route}{{y}}'\n"))
                 self.assertTrue(violations("page.html", f'<a href="{route}">x</a>\n'))
+
+    def test_catches_relative_routes(self):
+        for source in (
+            'PATH = "v2/orders"\n',
+            'url = urljoin(BASE, "v2/positions")\n',
+            'url = BASE + "v2/account/activities"\n',
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(violations("feeds.py", source))
 
     def test_exemption_is_bound_to_one_file(self):
         source = 'CALENDAR_HOST = "paper-api.alpaca.markets"\n'

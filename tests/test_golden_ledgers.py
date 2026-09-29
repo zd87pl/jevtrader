@@ -45,6 +45,10 @@ def rows(path: Path, query: str) -> list[tuple]:
 
 RECORDS = "SELECT kind, id, payload, content_hash, recorded_at FROM records ORDER BY kind, id"
 SCHEMA = "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+# The derived as_of index (ADR-0004) sits outside the hash chain and postdates the goldens.
+CHAINED_SCHEMA = (
+    "SELECT type, name, sql FROM sqlite_master WHERE tbl_name != 'knowledge' ORDER BY type, name"
+)
 CHAIN = "SELECT seq, kind, id, content_hash, prev_hash, chain_hash FROM chain ORDER BY seq"
 
 
@@ -128,9 +132,10 @@ def test_golden_files_are_reproduced_by_their_builders(tmp_path, build, golden):
     # Compared as contents, not dump text: iterdump output differs across Python versions.
     built, loaded = tmp_path / "built.sqlite", load_sql(golden, tmp_path / "golden.sqlite")
     build(built)
-    for query in ("PRAGMA user_version", SCHEMA, RECORDS):
+    for query in ("PRAGMA user_version", CHAINED_SCHEMA, RECORDS):
         assert rows(built, query) == rows(loaded, query)
     if golden == GOLDEN_V2:
+        assert ("index", "knowledge_by_time") in {row[:2] for row in rows(built, SCHEMA)}
         assert rows(built, CHAIN) == rows(loaded, CHAIN)
 
 

@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .common import canonical, digest, instant, symbol, timestamp, utc_now
+from .pit import Clock, Instant, knowledge_time
 
 KINDS = {
     "attempts",
@@ -76,6 +77,17 @@ _SCHEMA = (
     BEGIN SELECT RAISE(ABORT, 'Ledger chain must match a stored record'); END""",
 )
 
+# A derived, rebuildable index for as_of reads (ADR-0004). It is outside the hash chain;
+# as_of recomputes every returned row's knowledge time, so a stale or edited index can hide
+# a row but never leak one known after the requested instant.
+_KNOWLEDGE_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS knowledge (
+        kind TEXT NOT NULL, id TEXT NOT NULL, knowledge_time TEXT NOT NULL,
+        PRIMARY KEY (kind, id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS knowledge_by_time ON knowledge (kind, knowledge_time, id)",
+)
+
 
 def link_hash(prev_hash: str, kind: str, identity: str, content_hash: str) -> str:
     # Hashes are fixed-width hex and kinds contain no "|", so the preimage is unambiguous.
@@ -83,8 +95,16 @@ def link_hash(prev_hash: str, kind: str, identity: str, content_hash: str) -> st
 
 
 class Ledger:
-    def __init__(self, path: str | Path, *, readonly: bool = False, create: bool = True):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        readonly: bool = False,
+        create: bool = True,
+        clock: Clock | None = None,
+    ):
         self.path = str(path)
+        self.clock = clock
         self.readonly = readonly
         memory = self.path == ":memory:"
         if memory and (readonly or not create):
@@ -120,7 +140,40 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         if version < SCHEMA_VERSION:
             self._migrate()
+        self._index_knowledge()
         return SCHEMA_VERSION
+
+    def _index_knowledge(self) -> None:
+        """Create the knowledge index and backfill rows written before it existed."""
+        if self._has_table("knowledge") and not self._unindexed():
+            return  # the common case skips the write lock
+        with self._transaction():
+            for statement in _KNOWLEDGE_SCHEMA:
+                self.db.execute(statement)
+            missing = self.db.execute(
+                "SELECT r.kind, r.id, r.payload, r.recorded_at FROM records r "
+                "WHERE NOT EXISTS (SELECT 1 FROM knowledge k WHERE k.kind=r.kind AND k.id=r.id)"
+            ).fetchall()
+            for kind, identity, encoded, recorded_at in missing:
+                known = knowledge_time(kind, json.loads(encoded), recorded_at)
+                self._index(kind, identity, known)
+
+    def _unindexed(self) -> bool:
+        query = (
+            "SELECT 1 FROM records r WHERE NOT EXISTS "
+            "(SELECT 1 FROM knowledge k WHERE k.kind=r.kind AND k.id=r.id) LIMIT 1"
+        )
+        return self.db.execute(query).fetchone() is not None
+
+    def _index(self, kind: str, identity: str, known: Instant) -> None:
+        self.db.execute(
+            "INSERT INTO knowledge (kind, id, knowledge_time) VALUES (?, ?, ?)",
+            (kind, identity, known.iso()),
+        )
+
+    def now(self) -> str:
+        """The injected clock's reading; without one, the system clock (``utc_now``)."""
+        return utc_now() if self.clock is None else self.clock.now().iso()
 
     def _migrate(self) -> None:
         with self._transaction():
@@ -198,10 +251,12 @@ class Ledger:
             if existing is not None:
                 check_existing(existing)
                 return False
+            recorded_at = self.now()
             self.db.execute(
                 "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
-                (kind, identity, encoded, content_hash, utc_now()),
+                (kind, identity, encoded, content_hash, recorded_at),
             )
+            self._index(kind, identity, knowledge_time(kind, payload, recorded_at))
             self._link(kind, identity, content_hash, self.head()["chain_hash"])
         return True
 
@@ -348,6 +403,42 @@ class Ledger:
             result.append(value)
         return result
 
+    def as_of(self, kind: str, t: Instant | str, *, prefix: str | None = None) -> list[dict]:
+        """Records of ``kind`` whose knowledge time is at or before ``t``, ordered by id.
+
+        Reads through the ``knowledge_by_time`` index; ``prefix`` narrows ids as ``prefix()``
+        does. Each returned row is hash-checked and its knowledge time recomputed, so the
+        result never holds a row the ledger learned after ``t`` (ADR-0004)."""
+        if kind not in KINDS:
+            raise ValueError(f"Invalid ledger record kind: {kind}")
+        boundary = Instant.coerce(t)
+        low, high = ("", "\uffff") if prefix is None else (prefix, prefix + "\uffff")
+        columns = "r.id, r.payload, r.content_hash, r.recorded_at"
+        # The second column says whether the row came through the index (1) or, lacking an
+        # index row, from a scan (0) that as_of filters here.
+        unindexed = f"SELECT {columns}, 0 FROM records r WHERE r.kind=? AND r.id>=? AND r.id<?"
+        if self._has_table("knowledge"):
+            query = (
+                f"SELECT {columns}, 1 FROM knowledge k "
+                "JOIN records r ON r.kind=k.kind AND r.id=k.id "
+                "WHERE k.kind=? AND k.knowledge_time<=? AND k.id>=? AND k.id<? "
+                f"UNION ALL {unindexed} AND NOT EXISTS "
+                "(SELECT 1 FROM knowledge k WHERE k.kind=r.kind AND k.id=r.id) ORDER BY 1"
+            )
+            params: tuple = (kind, boundary.iso(), low, high, kind, low, high)
+        else:
+            query, params = f"{unindexed} ORDER BY 1", (kind, low, high)
+        result = []
+        for identity, encoded, fingerprint, recorded_at, indexed in self.db.execute(query, params):
+            value = json.loads(encoded)
+            if digest(value) != fingerprint:
+                raise ValueError(f"Corrupted record in {kind}")
+            if knowledge_time(kind, value, recorded_at) <= boundary:
+                result.append(value)
+            elif indexed:
+                raise ValueError(f"Knowledge index disagrees with its record: {kind}/{identity}")
+        return result
+
     def counts(self) -> dict:
         return {
             kind: count
@@ -371,7 +462,7 @@ class Ledger:
         event["first_seen_at"] = timestamp(event["first_seen_at"])
         if instant(event["published_at"]) > instant(event["first_seen_at"]):
             raise ValueError("Disclosure cannot be observed before publication")
-        if event["mode"] == "forward" and instant(event["first_seen_at"]) > instant(utc_now()):
+        if event["mode"] == "forward" and instant(event["first_seen_at"]) > instant(self.now()):
             raise ValueError("Forward observation cannot be in the future")
 
         def unchanged(prior: dict) -> None:

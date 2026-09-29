@@ -16,3 +16,16 @@ They are SQL text dumps because `*.sqlite*` files are never committed (`.gitigno
 **Never regenerate these to make a test pass**: a changed file or head means old ledgers no
 longer verify, which needs an ADR and a migration (invariants I-1 to I-6). To add a new
 schema version, add a new golden file beside these.
+
+## EDGAR acceptance pairs (#15)
+
+- `edgar_acceptance.json`: four real filings, each pairing the `-index.htm` "Accepted" time
+  (Eastern wall clock) with the same accession's `acceptanceDateTime` from the
+  `data.sec.gov` submissions JSON. It covers true-UTC `Z` (Apple 2026 8-Ks), Eastern
+  wall-clock `Z` (Rockwell Collins 2018), pre-2020 and an after-17:30 ET Form 4.
+
+Source: the `index_url` and `submissions_url` in each row. Captured: 2026-09-29, read via
+WebFetch by an agent with no User-Agent set; **owner browser spot-check pending** (see the
+file's `owner_check`). Each row's `json_source` and `confidence` say where its JSON value
+came from. `tests/test_edgar_acceptance.py` checks that `sec.latest_acceptance` never reads a
+real filing earlier than its index time and that the after-17:30 filing reads after hours.

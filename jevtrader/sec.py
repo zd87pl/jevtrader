@@ -31,6 +31,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .common import EASTERN
+from .ratelimit import SharedLimiter
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_BULK_BYTES = 10_000_000  # One day's form index or the ticker map; both are single SEC files.
@@ -216,9 +217,9 @@ class _RateLimiter:
             self.last_request = self.clock()
 
 
-# Shared by ordinary calls, including repeated symbols and concurrent threads.
-# Separate processes must be coordinated by their caller or run only one poller.
-_DEFAULT_LIMITER = _RateLimiter(time.monotonic, time.sleep)
+# Shared by ordinary calls in every thread and every process using this app directory
+# (daemon, backfill and collect together), so SEC sees at most five requests a second.
+_DEFAULT_LIMITER: _RateLimiter | SharedLimiter = SharedLimiter("sec", REQUEST_INTERVAL)
 
 
 class _SECClient:
@@ -255,7 +256,7 @@ class _SECClient:
         self.sleep = sleep or time.sleep
         self.now = now or utc_now
         self.requests = 0
-        self.limiter = (
+        self.limiter: _RateLimiter | SharedLimiter = (
             _DEFAULT_LIMITER
             if clock is None and sleep is None
             else _RateLimiter(self.clock, self.sleep)

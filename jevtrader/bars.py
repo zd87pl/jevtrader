@@ -21,7 +21,6 @@ import math
 import os
 import re
 import threading
-import time
 from bisect import bisect_left
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta, timezone
@@ -32,6 +31,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from . import __version__, paths
 from .common import EASTERN, instant, ledger_file, symbol, timestamp, utc_now
 from .market import SETTLE_DELAY, normalize_bar
+from .ratelimit import SharedLimiter
 
 DATA_HOST = "data.alpaca.markets"
 CALENDAR_HOST = "paper-api.alpaca.markets"
@@ -138,8 +138,9 @@ class _RateLimiter:
             self.last = self.clock()
 
 
-# Shared by every call in this process; one daemon is the only writer.
-_LIMITER = _RateLimiter(time.monotonic, time.sleep)
+# Shared by every thread and process using this app directory, so the daemon and a
+# backfill together stay within the free tier's 200 requests per minute.
+_LIMITER: _RateLimiter | SharedLimiter = SharedLimiter("alpaca", REQUEST_INTERVAL)
 
 
 def validate_url(url: str) -> None:

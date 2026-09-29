@@ -35,7 +35,7 @@ def idle_context(ledger):
         brief=lambda *a, **k: {"filings": []},
         render=lambda report: ("title", "body"),
         notify=lambda title, body: True,
-        reconcile=lambda *a, **k: [],
+        reconcile=lambda *a, **k: {},
         log=lambda line: None,
     )
 

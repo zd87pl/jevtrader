@@ -104,7 +104,7 @@ class Fakes:
             "skipped": {"requires_replay": 0, "no_market_data": 2, "missing_credentials": False},
         }
         self.brief_result = {"filings": [{"id": "a"}, {"id": "b"}]}
-        self.index_rows = []
+        self.reconcile_result = {"indexed": 0, "gaps": [], "errors": []}
         self.notify_result = True
         self.benchmarks = []
         self.out_of_time = []
@@ -143,9 +143,9 @@ class Fakes:
             raise self.notify_result
         return self.notify_result
 
-    def reconcile(self, user_agent, day):
-        self.calls.append(("reconcile", user_agent, day))
-        return self.index_rows
+    def reconcile(self, ledger, user_agent, day, *, symbols):
+        self.calls.append(("reconcile", user_agent, day, symbols))
+        return self.reconcile_result
 
     def jobs(self):
         return [call[0] for call in self.calls]
@@ -435,7 +435,7 @@ class RunJobTests(IsolatedTest):
             "brief": brief.compose,
             "render": brief.render_text,
             "notify": notify.macos,
-            "reconcile": feeds.daily_index,
+            "reconcile": feeds.reconcile,
             "price": daemon.registry_price,
         }
         for field, target in expected.items():
@@ -659,24 +659,72 @@ class RunJobTests(IsolatedTest):
         fakes.notify_result = False  # not macOS
         self.assertEqual(run_job("brief", context(fakes=fakes))["counts"]["notified"], 0)
 
-    def test_reconcile_compares_the_daily_index_with_collected_filings(self):
+    def test_reconcile_counts_recoveries_and_records_filing_gaps(self):
         ledger, fakes = FakeLedger(), Fakes()
-        ledger.put("disclosures", "sec:0000000001-26-000001:ex99.htm", {"id": "x"})
-        fakes.index_rows = [
-            {"accession": "0000000001-26-000001", "cik": "1", "form": "8-K"},
-            {"accession": "0000000002-26-000002", "cik": "2", "form": "8-K"},
-            {"accession": "0000000002-26-000002", "cik": "2", "form": "8-K"},
-            {"cik": "3"},
-        ]
+        fakes.reconcile_result = {
+            "indexed": 5,
+            "collected": 1,
+            "recovered": ["sec:0000000002-26-000002:ex99.htm"],
+            "not_qualifying": 1,
+            "unmapped": 0,
+            "not_watched": 1,
+            "gaps": [
+                {
+                    "accession": "0000000003-26-000003",
+                    "cik": "3",
+                    "form": "8-K",
+                    "reason": "not_in_submissions",
+                },
+            ],
+            "index_missing": False,
+            "errors": [],
+            "stopped": None,
+            "requests": 6,
+        }
         clock = Clock(et("2026-09-29", 7, 0))  # catches up Monday's index
         record = run_job("reconcile", context(ledger, clock, fakes))
-        self.assertEqual(fakes.calls[0][1:], (UA, datetime(2026, 9, 28).date()))
+        self.assertEqual(fakes.calls[0][1:], (UA, datetime(2026, 9, 28).date(), {"ABC", "XYZ"}))
+        self.assertEqual(record["status"], "ok")
         self.assertEqual(
-            record["counts"], {"indexed": 2, "collected": 1, "not_collected": 1, "unparsed": 1}
+            record["counts"],
+            {
+                "indexed": 5,
+                "collected": 1,
+                "recovered": 1,
+                "not_qualifying": 1,
+                "unmapped": 0,
+                "not_watched": 1,
+                "gaps": 1,
+                "index_missing": 0,
+                "requests": 6,
+                "stopped": 0,
+            },
         )
+        (gap,) = ledger.prefix("runs", f"{daemon.FILING_GAP_JOB}:")
+        self.assertEqual((gap["status"], gap["day"]), ("gap", "2026-09-28"))
+        self.assertEqual(gap["gaps"][0]["reason"], "not_in_submissions")
+        self.assertIn(daemon.FILING_GAP_JOB, daemon.last_runs(ledger))
         fakes = Fakes()
         record = run_job("reconcile", context(fakes=fakes, config=conf(sec_user_agent="")))
         self.assertEqual((record["status"], fakes.calls), ("skipped", []))
+
+    def test_reconcile_missing_index_and_errors(self):
+        ledger, fakes = FakeLedger(), Fakes()
+        fakes.reconcile_result = {
+            "index_missing": True,
+            "gaps": [],
+            "errors": [{"accession": "a", "error": "HTTPError: 429"}],
+            "stopped": "HTTPError: 429",
+        }
+        record = run_job("reconcile", context(ledger, fakes=fakes))
+        self.assertEqual(record["status"], "partial")
+        self.assertEqual((record["counts"]["index_missing"], record["counts"]["stopped"]), (1, 1))
+        (gap,) = ledger.prefix("runs", f"{daemon.FILING_GAP_JOB}:")
+        self.assertIn("daily index missing", gap["error"])
+        fakes.reconcile_result = {"indexed": 3, "collected": 3, "gaps": []}
+        ledger = FakeLedger()
+        self.assertEqual(run_job("reconcile", context(ledger, fakes=fakes))["status"], "ok")
+        self.assertEqual(ledger.prefix("runs", f"{daemon.FILING_GAP_JOB}:"), [])
 
 
 class SpendCapTests(IsolatedTest):

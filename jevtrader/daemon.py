@@ -40,6 +40,8 @@ from .secrets import KNOWN as SECRET_NAMES
 
 JOBS = ("poll", "bars", "observe", "settle", "brief", "reconcile")
 GAP_JOB = "coverage_gap"
+FILING_GAP_JOB = "filing_gap"  # filings the evening reconcile could not recover
+MAX_RECORDED_GAPS = 100
 STATUSES = ("ok", "partial", "skipped", "failed", "gap")
 DONE = frozenset({"ok", "partial", "skipped"})  # a failed run is retried; these are not
 
@@ -126,7 +128,7 @@ class Context:
     brief: Callable[..., dict] = briefing.compose
     render: Callable[[dict], tuple[str, str]] = briefing.render_text
     notify: Callable[..., bool] = notifier.macos
-    reconcile: Callable[..., list] = feeds.daily_index
+    reconcile: Callable[..., dict] = feeds.reconcile
     price: Callable[[str, str], Prices | None] = registry_price
     log: Callable[[str], None] = _stderr
 
@@ -422,18 +424,46 @@ def _brief(ctx: Context, now: str) -> tuple[dict, list]:
 
 def _reconcile(ctx: Context, now: str) -> tuple[dict, list]:
     agent = _user_agent(ctx)
-    rows = ctx.reconcile(agent, reconcile_day(instant(now)))
-    accessions = {
-        row["accession"] for row in rows if isinstance(row, dict) and row.get("accession")
-    }
-    collected = sum(bool(ctx.ledger.prefix("disclosures", f"sec:{a}:")) for a in accessions)
+    day = reconcile_day(instant(now))
+    result = ctx.reconcile(ctx.ledger, agent, day, symbols=_scope(ctx.config))
+    gaps = [gap for gap in result.get("gaps") or [] if isinstance(gap, dict)]
+    missing = bool(result.get("index_missing"))
     counts = {
-        "indexed": len(accessions),
-        "collected": collected,
-        "not_collected": len(accessions) - collected,
-        "unparsed": len(rows) - sum(isinstance(r, dict) and bool(r.get("accession")) for r in rows),
+        "indexed": _count(result.get("indexed")),
+        "collected": _count(result.get("collected")),
+        "recovered": _count(result.get("recovered")),
+        "not_qualifying": _count(result.get("not_qualifying")),
+        "unmapped": _count(result.get("unmapped")),
+        "not_watched": _count(result.get("not_watched")),
+        "gaps": len(gaps),
+        "index_missing": int(missing),
+        "requests": _count(result.get("requests")),
+        "stopped": int(bool(result.get("stopped"))),
     }
-    return counts, []
+    if gaps or missing:
+        _filing_gap(ctx, now, day, gaps, missing)
+    return counts, list(result.get("errors") or [])
+
+
+def _filing_gap(ctx: Context, now: str, day: date, gaps: list[dict], missing: bool) -> None:
+    """One ``runs`` record naming the filings (or the whole index) reconcile could not cover."""
+    listed = [
+        {key: _safe_text(str(gap.get(key, ""))) for key in ("accession", "cik", "form", "reason")}
+        for gap in gaps[:MAX_RECORDED_GAPS]
+    ]
+    record = {
+        "job": FILING_GAP_JOB,
+        "started_at": now,
+        "finished_at": now,
+        "status": "gap",
+        "counts": {"gaps": len(gaps), "index_missing": int(missing)},
+        "error": f"Not covered on {day.isoformat()}: "
+        + ("daily index missing" if missing else f"{len(gaps)} filing(s)"),
+        "day": day.isoformat(),
+        "gaps": listed,
+    }
+    record = {"id": f"{FILING_GAP_JOB}:{now}:{digest(record)[:12]}", **record}
+    ctx.ledger.put("runs", record["id"], record)
 
 
 _HANDLERS: dict[str, Callable[[Context, str], tuple[dict, list]]] = {
@@ -602,7 +632,7 @@ def last_run(ledger, job: str, *, statuses: frozenset[str] | None = None) -> dic
 def last_runs(ledger) -> dict[str, dict]:
     """Latest run per job (and the latest coverage gap), for health displays."""
     result = {}
-    for job in (*JOBS, GAP_JOB):
+    for job in (*JOBS, GAP_JOB, FILING_GAP_JOB):
         record = last_run(ledger, job)
         if record is not None:
             result[job] = record

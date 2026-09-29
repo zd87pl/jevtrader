@@ -197,6 +197,11 @@ def _check_day(value: object, name: str) -> date:
 
 
 def _daily_index(client: sec._SECClient, day: date) -> list[dict]:
+    return _published_index(client, day) or []
+
+
+def _published_index(client: sec._SECClient, day: date) -> list[dict] | None:
+    """The day's 8-K rows; None when SEC has no index for a weekday (404)."""
     if day.weekday() >= 5:
         return []
     try:
@@ -205,7 +210,7 @@ def _daily_index(client: sec._SECClient, day: date) -> list[dict]:
         if exc.code != 404:
             raise
         exc.close()  # A holiday, or an index SEC has not published yet.
-        return []
+        return None
     lines = payload.decode("latin-1").splitlines()
     try:
         start = next(i for i, line in enumerate(lines) if re.fullmatch(r"-{20,}\s*", line, re.A))
@@ -562,5 +567,100 @@ def backfill(
             record["first_seen_basis"] = "backfill_assumed"
             record["symbol_basis"] = "sec_ticker_map_at_backfill"
             _store(ledger, result, record)
+    result["requests"] = client.requests
+    return result
+
+
+def reconcile(
+    ledger,
+    user_agent: str,
+    day: date,
+    *,
+    symbols: set[str] | None,
+    transport: Callable | None = None,
+    max_filings: int = 25,
+    memory: PollMemory | None = None,
+) -> dict:
+    """Classify every 8-K in ``day``'s daily index and recover the qualifying ones poll missed.
+
+    Each accession is ``collected`` (already in the ledger), ``not_qualifying``, ``unmapped``,
+    ``not_watched``, ``recovered`` or a coverage gap. A recovered filing is a forward record
+    stamped with this collection's actual receipt, marked ``first_seen_basis:
+    "reconcile_late"``; it is never backdated to acceptance. Filings the poller gave up on
+    (MAX_FILING_ATTEMPTS) are tried again. Gaps are {"accession", "cik", "form", "reason"}
+    with reason "not_in_submissions", "deferred" (over ``max_filings``), "stopped" (after SEC
+    throttling or an outage) or "error: ...". ``index_missing`` means a weekday had no index.
+    -> {"indexed", "collected", "recovered", "not_qualifying", "unmapped", "not_watched",
+    "gaps", "index_missing", "stopped", "errors", "requests"}
+    """
+    day = _check_day(day, "day")
+    max_filings = _bounded(max_filings, MAX_POLL_FILINGS, "max_filings")
+    wanted = _watched(symbols)
+    _refuse(
+        ledger,
+        paths.research_ledger_path(),
+        "reconcile writes forward records; not the research ledger",
+    )
+    memory = _MEMORY if memory is None else memory
+    client = _client(user_agent, 2 + REQUESTS_PER_FILING * max_filings, transport)
+    index = _published_index(client, day)
+    registrants: dict[str, list[dict]] = {}
+    for row in index or []:
+        registrants.setdefault(row["accession"], []).append(row)
+    result = _result(indexed=len(registrants), index_missing=index is None)
+    del result["seen"], result["new"], result["skipped"]
+    result.update(collected=0, not_qualifying=0, unmapped=0, not_watched=0, gaps=[])
+    examined = 0
+
+    def gap(rows: list[dict], reason: str) -> None:
+        row = rows[0]
+        result["gaps"].append(
+            {
+                "accession": row["accession"],
+                "cik": row["cik"],
+                "form": row["form"],
+                "reason": reason,
+            }
+        )
+
+    for accession, rows in registrants.items():
+        if ledger.prefix("disclosures", f"sec:{accession}:"):
+            result["collected"] += 1
+            continue
+        if accession in memory.rejected:
+            result["not_qualifying"] += 1
+            continue
+        choice = _choose(rows, memory.table(client), wanted)
+        if isinstance(choice, str):
+            result[choice] += 1
+            continue
+        if result["stopped"]:
+            gap(rows, "stopped")
+            continue
+        if examined >= max_filings:
+            gap(rows, "deferred")
+            continue
+        examined += 1
+        cik, ticker = choice
+        try:
+            record = sec.collect_filing(client, cik, accession, ticker)
+        except sec.FilingNotFound:
+            gap(rows, "not_in_submissions")
+            continue
+        except (ValueError, OSError, HTTPException) as exc:
+            _failure(result, {"accession": accession, "cik": cik, "symbol": ticker}, exc)
+            gap(rows, f"error: {_describe(exc)}"[:300])
+            continue
+        if record is None:
+            memory.reject(accession)
+            result["not_qualifying"] += 1
+            continue
+        memory.attempts.pop(accession, None)
+        record["first_seen_basis"] = "reconcile_late"
+        before = len(result["added"])
+        _store(ledger, result, record)
+        if len(result["added"]) == before:
+            gap(rows, "error: not stored")
+    result["recovered"] = result.pop("added")
     result["requests"] = client.requests
     return result

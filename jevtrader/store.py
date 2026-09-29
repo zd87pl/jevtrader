@@ -25,6 +25,7 @@ KINDS = {
     "paper_plans",
     "experiments",
     "runs",
+    "securities",
 }
 
 SCHEMA_VERSION = 3

@@ -3,9 +3,9 @@
 ``poll`` stamps each filing with the time its selected document was actually received
 (forward mode). ``backfill`` is historical only: availability is an explicit conservative
 assumption (``first_seen_basis: "backfill_assumed"``), never evidence of a forward
-observation, and it refuses the forward ledger. Symbols come from SEC's *current* ticker
-map, so a backfill is survivorship-biased: delisted or renamed companies are missing or
-carry today's ticker. Every request goes through sec.py's allowlist, byte bounds, a
+observation, and it refuses the forward ledger. Backfill symbols come from the
+point-in-time security master (``pit.securities``, ADR-0006); only when it is empty does a
+backfill fall back to SEC's *current* ticker map, which is survivorship-biased. Every request goes through sec.py's allowlist, byte bounds, a
 per-call request budget and the shared 5 requests/second limiter.
 """
 
@@ -22,6 +22,7 @@ from xml.etree import ElementTree
 
 from . import paths, sec
 from .common import EASTERN, instant, ledger_file, sec_symbol
+from .pit.securities import SecurityMaster
 
 TIMEOUT = 20.0
 FEED_COUNTS = (10, 20, 40, 80, 100)
@@ -484,6 +485,7 @@ def backfill(
     symbols: set[str] | None = None,
     transport: Callable | None = None,
     max_filings: int = 500,
+    master: SecurityMaster | None = None,
 ) -> dict:
     """Historical 8-K collection from daily form indexes into a separate research ledger.
 
@@ -492,6 +494,12 @@ def backfill(
     the future are skipped. Covers filings within each company's recent SEC submissions.
     ``max_filings`` bounds filings examined (<= 4 requests each); ``truncated`` means a
     candidate was left unexamined, so the range was not finished. -> poll's keys plus "days", "truncated".
+
+    Symbols come from the point-in-time security master (``master``, or by default the
+    ledger's ``securities`` records known at the run's start) as of each index day, so
+    delisted and renamed companies keep the ticker they had then (``symbol_basis:
+    "security_master"``). Only with an empty master does it fall back to SEC's current map
+    (``"sec_ticker_map_at_backfill"``), which is survivorship-biased (ADR-0006).
     """
     days = _days(start, end)
     max_filings = _bounded(max_filings, MAX_BACKFILL_FILINGS, "max_filings")
@@ -502,6 +510,9 @@ def backfill(
     now = client.now()
     if days[-1] > now.astimezone(EASTERN).date():
         raise ValueError("Backfill cannot cover a future day")
+    if master is None:
+        master = SecurityMaster.from_ledger(ledger, now)
+    basis = "security_master" if master else "sec_ticker_map_at_backfill"
     result = _result(days=0, truncated=False)
     skipped = result["skipped"]
     skipped.update(not_in_submissions=0, not_yet_available=0)
@@ -517,6 +528,8 @@ def backfill(
             stop = _failure(result, {"day": day.isoformat()}, exc)
             continue
         result["days"] += 1
+        if master:
+            table = master.table(day)
         registrants: dict[str, list[dict]] = {}
         for row in index:
             registrants.setdefault(row["accession"], []).append(row)
@@ -565,7 +578,7 @@ def backfill(
                 skipped["not_yet_available"] += 1
                 continue
             record["first_seen_basis"] = "backfill_assumed"
-            record["symbol_basis"] = "sec_ticker_map_at_backfill"
+            record["symbol_basis"] = basis
             _store(ledger, result, record)
     result["requests"] = client.requests
     return result

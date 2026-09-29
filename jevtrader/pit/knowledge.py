@@ -17,6 +17,7 @@ KNOWLEDGE_FIELDS: dict[str, tuple[str, ...]] = {
     "forecasts": ("decision_at",),
     "extractions": ("created_at",),
     "outcomes": ("outcome_at", "label_available_at"),
+    "securities": ("known_at",),
 }
 
 

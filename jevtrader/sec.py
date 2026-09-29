@@ -109,6 +109,50 @@ def latest_acceptance(value: str) -> datetime:
     return max(readings)
 
 
+_ACCEPTED = re.compile(r"\bAccepted\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\b")
+ACCEPTANCE_BASES = ("edgar_index_accepted", "submissions_json_unverified")
+
+
+def index_url(cik: str, accession: str) -> str:
+    """The filing's EDGAR index page, whose 'Accepted' value is Eastern wall-clock time."""
+    cik = _check_cik(cik)
+    if not isinstance(accession, str) or not _ACCESSION.fullmatch(accession):
+        raise SECError("Accession must look like 0000000000-00-000000")
+    folder = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{folder}/{accession}-index.htm"
+
+
+def _eastern_wall(wall: datetime) -> datetime:
+    """A naive Eastern wall time as UTC; an ambiguous fall-back time reads at its later instant."""
+    return max(wall.replace(tzinfo=EASTERN, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
+
+
+def verified_acceptance(index_page: bytes, raw: str) -> datetime:
+    """The acceptance instant from an -index.htm 'Accepted' value, checked against the JSON.
+
+    The index value must appear exactly once and equal one reading of the submissions
+    JSON acceptanceDateTime (its "Z" as UTC, or as Eastern wall clock); anything else
+    fails closed. The result never exceeds ``latest_acceptance(raw)``.
+    """
+    text, _ = _read_document(index_page, "index.htm")
+    found = _ACCEPTED.findall(text)
+    if len(found) != 1:
+        raise SECError("Filing index must show exactly one Accepted timestamp")
+    try:
+        wall = datetime.strptime(found[0], "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise SECError("Invalid Accepted timestamp on the filing index") from exc
+    instant = _eastern_wall(wall)
+    _published_at(raw)
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    readings = {latest_acceptance(raw)}
+    if parsed.tzinfo is not None:
+        readings.add(parsed.astimezone(timezone.utc).replace(microsecond=0))
+    if instant not in {reading.replace(microsecond=0) for reading in readings}:
+        raise SECError("Filing index Accepted disagrees with SEC acceptanceDateTime")
+    return instant
+
+
 def _daily_index_path(match: re.Match[str]) -> bool:
     year, quarter, *day = (int(part) for part in match.groups())
     try:
@@ -472,6 +516,7 @@ def collect_filing(
     submissions: dict | None = None,
     mode: str = "forward",
     first_seen: str | Callable[[str], str] | None = None,
+    verify_acceptance: bool = False,
 ) -> dict | None:
     """Collect one filing's selected document, or None when the filing does not qualify.
 
@@ -480,7 +525,12 @@ def collect_filing(
     Historical mode requires one: a timestamp, or a callable given SEC's raw
     acceptanceDateTime; it may not precede the latest reading of that acceptance.
     Raises FilingNotFound when the accession is absent from the recent submissions.
-    At most 1 + 3 requests, all through ``client``'s allowlist, budget and limiter.
+    ``verify_acceptance`` also reads the filing's -index.htm: its 'Accepted' instant then
+    sets published_at, accepted_at and after_hours (acceptance_basis "edgar_index_accepted").
+    Otherwise published_at reads the JSON "Z" as UTC and after_hours uses the latest reading
+    ("submissions_json_unverified"). A supplied first_seen is always checked against the
+    latest reading, verified or not. At most 1 + 3 requests, or 1 + 4 when verifying, all
+    through ``client``'s allowlist, budget and limiter.
     """
     cik = _check_cik(cik)
     symbol = _check_symbol(symbol)
@@ -521,13 +571,19 @@ def collect_filing(
         # the filing/request budget while looking for another candidate.
         raise SECError("Selected SEC document contains no readable text")
     seen = observed if first_seen is None else _supplied_first_seen(first_seen, row)
-    latest = latest_acceptance(row["acceptance"]).astimezone(EASTERN)
+    if verify_acceptance:
+        accepted = verified_acceptance(client.get(index_url(cik, accession)), row["acceptance"])
+        published, basis = _iso_utc(accepted), ACCEPTANCE_BASES[0]
+    else:
+        accepted, basis = latest_acceptance(row["acceptance"]), ACCEPTANCE_BASES[1]
+        published = row["published_at"]
     return {
         "id": f"sec:{accession}:{document}",
         "symbol": symbol.upper(),
-        "published_at": row["published_at"],
-        "accepted_at": row["published_at"],
-        "after_hours": latest.time() >= AFTER_HOURS,
+        "published_at": published,
+        "accepted_at": published,
+        "after_hours": accepted.astimezone(EASTERN).time() >= AFTER_HOURS,
+        "acceptance_basis": basis,
         "first_seen_at": seen,
         "source_url": base + document,
         "text": text[:MAX_TEXT_CHARS],

@@ -1,42 +1,60 @@
 """Suite-wide guards: no test may reach the real Keychain, launchctl, osascript, the network,
-the real home directory or a daemon loop that never ends.
+a broker, the real home directory, real credentials or a daemon loop that never ends.
 
 Every guard raises at once and also records the attempt, so a test fails in teardown even when
-the code under test swallows the error (a daemon job records failures and carries on). Tests
-that exercise these defaults patch them again or call a captured original.
+the code under test swallows the error (a daemon job records failures and carries on). Child
+Python processes install the same guards (tests/isolation_guard/sitecustomize.py) and report
+their trips to the parent through a log file. Tests that exercise these defaults patch them
+again or call a captured original.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
-import socket
-import subprocess
+import re
 import threading
+from pathlib import Path
 
 import pytest
 
-from jevtrader import daemon, launchd, local, secrets
+from jevtrader import daemon, launchd, secrets
 
-SYSTEM_COMMANDS = frozenset({"security", "launchctl", "osascript"})
+_GUARD_FILE = Path(__file__).with_name("isolation_guard") / "sitecustomize.py"
+_spec = importlib.util.spec_from_file_location("jevtrader_isolation_guard", _GUARD_FILE)
+assert _spec and _spec.loader
+GUARD = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(GUARD)
+
+SYSTEM_COMMANDS = GUARD.SYSTEM_COMMANDS
 MAX_LOOP_TICKS = 1_000  # far more than any test's fake clock needs
+# Real keys and the declared SEC contact never reach a test, whichever file it lives in.
+SCRUBBED_ENV = frozenset(
+    {*secrets.KNOWN, "SEC_USER_AGENT", "OPENAI_MODEL", "XDG_DATA_HOME", "PYTHONSTARTUP"}
+)
+_SECRET_NAME = re.compile(r"^APCA_|^IB_|_API_KEY$|_API_KEY_ID$|_SECRET(_KEY)?$|_TOKEN$|PASSWORD")
 
 
-def _program(args: object) -> str:
-    if isinstance(args, (str, bytes, os.PathLike)):
-        args = [args]
-    first = next(iter(args), "") if isinstance(args, (list, tuple)) else ""
-    return os.path.basename(os.fsdecode(first)) if first else ""
+class Violations(list):
+    """Guard trips in this process, plus those child processes wrote to the log."""
 
+    def __init__(self, log: Path) -> None:
+        super().__init__()
+        self.log = log
 
-def _loopback(host: object) -> bool:
-    if isinstance(host, bytes):
-        host = host.decode(errors="replace")
-    return host in (None, "") or host in local.LOOPBACK_HOSTS
+    def children(self) -> list[str]:
+        """Move child trips from the log into this list and return them."""
+        if not self.log.exists():
+            return []
+        found = self.log.read_text(encoding="utf-8").splitlines()
+        self.log.write_text("", encoding="utf-8")
+        self.extend(found)
+        return found
 
 
 @pytest.fixture(autouse=True)
 def _offline_system(monkeypatch, tmp_path):
-    violations: list[str] = []
+    violations = Violations(tmp_path / "isolation-guard.log")
 
     def refuse(what: str) -> AssertionError:
         violations.append(what)
@@ -45,51 +63,20 @@ def _offline_system(monkeypatch, tmp_path):
     def refuse_command(*_args, **_kwargs):
         raise refuse("run a real system command")
 
+    for name in list(os.environ):
+        if name in SCRUBBED_ENV or _SECRET_NAME.search(name):
+            monkeypatch.delenv(name)
+
     monkeypatch.setattr(secrets, "_keychain_available", lambda: False)
     monkeypatch.setattr(secrets, "_run", refuse_command)
     monkeypatch.setattr(launchd, "_run", refuse_command)
 
-    # Any other route to these programs (notify's osascript, a new helper) ends here.
-    popen_init = subprocess.Popen.__init__
-
-    def guarded_popen(self, args, *rest, **kwargs):
-        program = _program(args)
-        if program in SYSTEM_COMMANDS or (
-            kwargs.get("shell") and any(name in str(args) for name in SYSTEM_COMMANDS)
-        ):
-            raise refuse(f"run {program or args!r}")
-        popen_init(self, args, *rest, **kwargs)
-
-    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_popen)
-
-    # Loopback servers in test_local and test_web stay reachable; nothing else is.
-    resolve, connect, connect_ex = (
-        socket.getaddrinfo,
-        socket.socket.connect,
-        socket.socket.connect_ex,
-    )
-
-    def guarded_getaddrinfo(host, *args, **kwargs):
-        if not _loopback(host):
-            raise refuse(f"resolve {host!r}")
-        return resolve(host, *args, **kwargs)
-
-    def target(address: object) -> object:
-        return address[0] if isinstance(address, tuple) else None  # AF_UNIX paths are local
-
-    def guarded_connect(sock, address):
-        if not _loopback(target(address)):
-            raise refuse(f"connect to {target(address)!r}")
-        return connect(sock, address)
-
-    def guarded_connect_ex(sock, address):
-        if not _loopback(target(address)):
-            raise refuse(f"connect to {target(address)!r}")
-        return connect_ex(sock, address)
-
-    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    # Every other route to a program or the network ends here: Popen (wrappers such as env and
+    # sh -c included), os.system, posix_spawn, exec*, spawn*, DNS, TCP and UDP. Loopback servers
+    # in test_local and test_web stay reachable; broker hosts and gateway ports do not.
+    monkeypatch.setenv(GUARD.LOG_ENV, str(violations.log))
+    monkeypatch.setenv("PYTHONPATH", GUARD.guarded_env(None)["PYTHONPATH"])
+    GUARD.install(refuse, monkeypatch.setattr)
 
     # A lost stop event or a lock regression must fail, not sleep 10 s per tick forever.
     run_forever = daemon.run_forever
@@ -117,4 +104,5 @@ def _offline_system(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("JEVTRADER_HOME", str(tmp_path / "jevtrader-home"))
     yield violations
+    violations.children()
     assert not violations, f"isolation guard tripped: {violations}"

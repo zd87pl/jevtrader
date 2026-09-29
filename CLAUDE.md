@@ -42,21 +42,19 @@ CI runs three jobs (`.github/workflows/ci.yml`):
 
 ## Offline test isolation
 
-Every test runs under one autouse fixture (`tests/conftest.py:37-120`). It guarantees:
-- **Keychain and launchctl** runners are refused (`tests/conftest.py:48-50`).
-- **`Popen`** of `security`, `launchctl` or `osascript` is refused (`tests/conftest.py:20`, `:53-63`).
-- **Network:** DNS lookups and TCP connections reach loopback only (`tests/conftest.py:66-92`).
-- **Daemon loop:** `daemon.run_forever` must be given `sleep=` and stops after 1,000 ticks (`tests/conftest.py:95-112`).
-- **Home directories:** `HOME` and `JEVTRADER_HOME` point into `tmp_path` (`tests/conftest.py:114-118`).
-- **Swallowed errors still fail:** a guard trip fails the test in teardown even if the code under test caught the error (`tests/conftest.py:39-43`, `:119-120`).
+Every test runs under one autouse fixture (`tests/conftest.py`), with the process and network guards in `tests/isolation_guard/sitecustomize.py`. It guarantees:
+- **Keychain and launchctl** runners are refused.
+- **Programs:** `security`, `launchctl` or `osascript` named anywhere in the argv or shell string (so `env` and `sh -c` wrappers too) is refused through `Popen`, `os.system` and `posix_spawn`; `os.exec*` and `os.spawn*` are refused outright.
+- **Network:** DNS lookups, TCP connections and UDP sends reach loopback only. Alpaca and IBKR hosts, and the TWS / IB Gateway ports on loopback, are refused by name.
+- **Child interpreters** get the guard directory first on `PYTHONPATH`, install the same guards as `sitecustomize`, and report trips to the parent test.
+- **Environment:** real keys, the SEC contact and credential-like variables are removed for every test.
+- **Daemon loop:** `daemon.run_forever` must be given `sleep=` and stops after 1,000 ticks.
+- **Home directories:** `HOME` and `JEVTRADER_HOME` point into `tmp_path`.
+- **Swallowed errors still fail:** a guard trip, in the test or a child, fails the test in teardown even if the code under test caught the error.
 
-Known gaps, tracked as P0-10:
-- The `Popen` guard reads only argv[0], so `env security …` and `sh -c` get through.
-- `os.system`, `posix_spawn`, `exec*` and UDP are not guarded.
-- Child interpreters run without the guards.
-- Environment variables are scrubbed per test file, not globally.
+Remaining limits: a child started with `python -I`, `-S` or `-E` skips the child guards, and a child's guards replace any site-wide `sitecustomize`.
 
-Never write code or tests that go around these gaps.
+Never write code or tests that go around these guards.
 
 ## Hard rules while working
 

@@ -430,7 +430,7 @@ class RunJobTests(IsolatedTest):
         expected = {
             "poll": feeds.poll,
             "bars": bars.fetch_forward,
-            "observe": daemon.pipeline.observe_queue,
+            # observe is bound to config (P0-25); see the construction-path test below.
             "settle": daemon.engine.settle,
             "brief": brief.compose,
             "render": brief.render_text,
@@ -441,6 +441,39 @@ class RunJobTests(IsolatedTest):
         for field, target in expected.items():
             with self.subTest(field=field):
                 self.assertIs(getattr(ctx, field), target)
+
+    def test_every_construction_path_wires_observe_from_config(self):
+        # P0-25: a bare Context must not silently use the default local URL or drop
+        # the declared model overrides; both paths bind them from the validated config.
+        from jevtrader import app
+
+        declared = {"openai:gpt-x": {"usd_per_million_input_tokens": 2.5}}
+        cases = {
+            "local": (
+                {"provider": "local", "local_base_url": "http://[::1]:1234/v1"},
+                "http://[::1]:1234/v1",
+            ),
+            "paid": ({"provider": "openai", "model": "gpt-x", "model_overrides": declared}, None),
+        }
+        builders = {
+            "Context": lambda config: Context(
+                ledger=FakeLedger(), config=config, strategy=STRATEGY
+            ),
+            "daemon_context": lambda config: app.daemon_context(FakeLedger(), config, STRATEGY),
+        }
+        for name, build in builders.items():
+            for case, (config, base_url) in cases.items():
+                with self.subTest(path=name, case=case):
+                    ctx = build(conf(**config))
+                    self.assertIs(ctx.observe.func, daemon.pipeline.observe_queue)
+                    self.assertEqual(ctx.observe.keywords["base_url"], base_url)
+                    self.assertEqual(
+                        ctx.observe.keywords["overrides"], ctx.config["model_overrides"]
+                    )
+        # An injected adapter still wins.
+        fake = Fakes().observe
+        ctx = Context(ledger=FakeLedger(), config=conf(), strategy=STRATEGY, observe=fake)
+        self.assertIs(ctx.observe, fake)
 
     def test_brief_counts_all_new_filings_not_only_those_displayed(self):
         fakes = Fakes()

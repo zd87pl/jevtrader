@@ -7,7 +7,6 @@ report key names, never values. Read-only views open the ledger read-only per re
 
 from __future__ import annotations
 
-import functools
 import getpass
 import os
 import signal
@@ -29,7 +28,6 @@ from . import (
     local,
     notify,
     paths,
-    pipeline,
     registry,
     secrets,
     web,
@@ -76,21 +74,13 @@ def model_price(overrides: dict) -> Callable[[str, str], daemon.Prices]:
     return lookup
 
 
-def observe_options(config: dict) -> dict:
-    """What the observation queue needs from config beyond provider and model."""
-    return {
-        "base_url": config["local_base_url"] if config["provider"] == "local" else None,
-        "overrides": config["model_overrides"],
-    }
+observe_options = daemon.observe_options
 
 
 def daemon_context(ledger, config: dict, strategy: dict, **adapters: Any) -> daemon.Context:
-    """The daemon's Context with config-aware observation and pricing; adapters override."""
+    """The daemon's Context with config-aware pricing; Context wires observation from config."""
     config = settings.validate(config)
-    wiring: dict[str, Any] = {
-        "observe": functools.partial(pipeline.observe_queue, **observe_options(config)),
-        "price": model_price(config["model_overrides"]),
-    }
+    wiring: dict[str, Any] = {"price": model_price(config["model_overrides"])}
     return daemon.Context(ledger=ledger, config=config, strategy=strategy, **{**wiring, **adapters})
 
 

@@ -18,6 +18,7 @@ from . import evidence, paths
 from .common import EASTERN, instant, sec_symbol, timestamp
 from .market import _compatible, bars_for
 from .providers import _NEGATIVE, _POSITIVE
+from .security.quarantine import DIRECTIVE as _DIRECTIVE
 from .security.sanitize import skeleton
 
 MAX_FILINGS = 50
@@ -46,23 +47,6 @@ _BOILERPLATE = re.compile(
     r"pursuant to the requirements|forward-looking statement|safe harbor|"
     r"incorporated (?:herein )?by reference|shall not be deemed|securities exchange act|"
     r"\bsignatures?\b",
-    re.I,
-)
-# The filer writes the text and the lexicon picks which sentences get quoted, so a filer could
-# get an instruction quoted to an assistant that reads the card (and may hold trading tools).
-# Best effort, erring toward dropping: a dropped sentence only means another one is quoted.
-_DIRECTIVE = re.compile(
-    r"\b(?:you|your|yours|yourself|assistants?|chatbots?|llms?|language models?|"
-    r"ai (?:agents?|assistants?|models?)|prompts?|instructions?|tool[ _-]?(?:calls?|use)|"
-    r"ignore|disregard|forget|override)\b"
-    r"|\b(?:system|user|human|assistant|ai|agent|model|developer)\s*:"
-    r"|^\W*(?:please\s+)?(?:buy|sell|short|place|submit|execute|cancel|use|call|invoke|tell|"
-    r"send|do not|don't|never|always)(?![\w-])"
-    r"|\b(?:buy|sell|limit|market|stop)\s+orders?\b"
-    r"|\bplac(?:e|ing)\s+(?:an?\s+|the\s+)?(?:\w+\s+)?(?:orders?|trades?)\b"
-    r"|\b(?:use|call|invoke)\b[^.!?]{0,40}\btools?\b"
-    r"|\b[a-z0-9]+_[a-z0-9_]+\b"  # snake_case reads as a tool or function name
-    r"|<\||\|>",
     re.I,
 )
 _ITEM = re.compile(r"\d{1,2}\.\d{2}")

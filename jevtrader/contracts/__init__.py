@@ -63,6 +63,8 @@ class Extraction(TypedDict):
     text_excerpt: NotRequired[str]
     # The exact request body sent (P0-07); None for rules; absent on records before it.
     prompt: NotRequired[dict[str, Any] | None]
+    # {"flagged": bool, "reasons": [...]} for the source text (#13); absent on older records.
+    quarantine: NotRequired[dict[str, Any]]
 
 
 class Forecast(TypedDict):
@@ -90,6 +92,8 @@ class Forecast(TypedDict):
     action: Literal["WATCH", "PASS", "LONG", "SHORT"]
     reasons: list[str]
     strategy: dict[str, Any]
+    # Copied from the extraction's quarantine flag (#13); absent on older records.
+    quarantined: NotRequired[bool]
 
 
 class Outcome(TypedDict):

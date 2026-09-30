@@ -85,8 +85,8 @@ def ledger_file(ledger: object) -> Path | None:
     return None
 
 
-def load_strategy(path: str | Path | None = None) -> dict:
-    data = json.loads(
+def load_strategy(path: str | Path | None = None) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(
         Path(path).read_text()
         if path
         else files("jevtrader").joinpath("default_strategy.json").read_text()
@@ -95,7 +95,7 @@ def load_strategy(path: str | Path | None = None) -> dict:
     return data
 
 
-def validate_strategy(data: dict) -> None:
+def validate_strategy(data: dict[str, Any]) -> None:
     defaults = json.loads(files("jevtrader").joinpath("default_strategy.json").read_text())
     if not isinstance(data, dict) or set(data) != set(defaults):
         raise ValueError("Strategy must contain exactly the documented configuration fields")
@@ -167,7 +167,7 @@ def meets_cost_floor(strategy: object) -> bool:
     return True
 
 
-def round_trip_bps(strategy: dict, *, short: bool = False) -> float:
+def round_trip_bps(strategy: dict[str, Any], *, short: bool = False) -> float:
     cost = strategy["spread_bps"] + 2 * strategy["slippage_bps_per_side"]
     if short:
         cost += strategy["short_borrow_bps_annual"] * strategy["horizon_sessions"] / 252

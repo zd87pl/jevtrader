@@ -122,6 +122,19 @@ class StrictTypingTests(unittest.TestCase):
             )
         self.assertEqual(status, 0, out + err)
 
+    def test_pit_core_passes_mypy_strict(self) -> None:
+        # pit imports jevtrader.common, so strict typing covers it as well (#27).
+        # --no-site-packages: under pytest the repo root is on sys.path, and mypy
+        # would otherwise treat jevtrader as an installed package and hide its errors.
+        from mypy import api
+
+        core = [str(ROOT / "jevtrader" / name) for name in ("pit", "contracts", "common.py")]
+        with tempfile.TemporaryDirectory() as cache:
+            out, err, status = api.run(
+                ["--strict", "--no-site-packages", "--cache-dir", cache, *core]
+            )
+        self.assertEqual(status, 0, out + err)
+
 
 if __name__ == "__main__":
     unittest.main()

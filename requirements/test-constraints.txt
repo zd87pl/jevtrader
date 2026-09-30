@@ -3,7 +3,7 @@
 # pyproject.toml keeps ranges; this file makes CI reproducible. Dependabot
 # (pip ecosystem) proposes bumps. numpy is a runtime dependency and stays a
 # range in pyproject so every supported Python resolves.
-pytest==9.0.3
+pytest==9.1.1
 pytest-cov==7.1.0
 coverage==7.13.5
 pytest-timeout==2.4.0

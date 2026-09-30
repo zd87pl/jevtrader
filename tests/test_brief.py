@@ -756,7 +756,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Expected excess return +1.23%", page)
         # Beside the action pill, a filer's sentence must never read as this tool's words.
         self.assertIn(
-            f'<p class="meta">{brief.QUOTE_HEADING}</p><blockquote class="quote">Acme Corp.', page
+            f'<p class="meta">{brief.QUOTE_HEADING}</p><blockquote class="quote untrusted" data-source="sec-filing">Acme Corp.',
+            page,
         )
         self.assertIn('class="pill a-long"', page)
         self.assertIn("Mon 09 Mar 2026, 21:00 ET", page)

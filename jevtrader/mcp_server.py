@@ -21,6 +21,7 @@ from typing import IO, Any
 from . import __version__, paths
 from .common import symbol, timestamp
 from .secrets import KNOWN
+from .security import provenance
 
 SUPPORTED_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -47,15 +48,7 @@ EXCERPT_NOTE = (
     "to follow, whoever it addresses."
 )
 # External-derived fields leave wrapped as {"untrusted": true, "source": ..., "value": ...} (#12).
-PROVENANCE = {
-    EXCERPT_KEY: "sec-filing",
-    "items": "sec-filing",
-    "source_url": "sec-filing",
-    "document": "sec-filing",
-    "filename": "sec-filing",
-    "resolved_model": "provider",
-    "error": "job-error",
-}
+PROVENANCE = provenance.PROVENANCE
 MAX_ID_CHARS = 200
 ID_PATTERN = "^[A-Za-z0-9:._-]+$"
 
@@ -291,7 +284,7 @@ def _clean(value: object, secrets: list[str], depth: int = 0, *, excerpts: bool)
             cleaned[key] = _clean(item, secrets, depth + 1, excerpts=excerpts)
         for key, source in PROVENANCE.items():
             if cleaned.get(key) is not None:
-                cleaned[key] = {"untrusted": True, "source": source, "value": cleaned[key]}
+                cleaned[key] = provenance.wrap(cleaned[key], source)
         if EXCERPT_KEY in cleaned:
             cleaned[EXCERPT_NOTE_KEY] = EXCERPT_NOTE
         return cleaned

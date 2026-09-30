@@ -92,6 +92,8 @@ jevtrader --db "$HOME/Library/Application Support/jevtrader/forward.sqlite" show
 
 The page has three views: the brief (`/`), the scoreboard (`/scoreboard`) and health (`/health`), plus one page per filing and JSON at `/api/brief.json` and `/api/scoreboard.json`. It binds to 127.0.0.1 only, answers only `127.0.0.1`/`localhost` Host headers, has no forms and opens the ledger read-only.
 
+The JSON routes wrap external-derived fields the same way the MCP server does: filing `quotes`, `items`, `source_url`, document filenames, provider `resolved_model` names and job `error` text arrive as `{"untrusted": true, "source": "sec-filing" | "provider" | "job-error", "value": ...}` (`jevtrader/security/provenance.py`). The HTML views mark the same text with `class="untrusted"` and a `data-source` attribute: quotes as `blockquote`, job errors as `q`, filing items and source links as `span`.
+
 `jevtrader mcp` is a read-only MCP server on stdio; see [MCP server](mcp.md).
 
 For research on older filings, `jevtrader backfill` collects historical 8-Ks into `research.sqlite`, never the forward ledger; see [Backfills](research-workflow.md#backfills) for its assumptions and biases.

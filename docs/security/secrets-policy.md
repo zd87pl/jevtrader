@@ -66,7 +66,7 @@ A secret value never appears in:
 - the **ledger** — records hold names at most;
 - **prompts** — no provider request carries a key in its body, only in its auth header;
 - **MCP** results — any result containing a known value is withheld
-  (`jevtrader/mcp_server.py:197-199`);
+  (`jevtrader/mcp_server.py:190-192`);
 - the repository — `tools/secret_scan.py` runs in CI and in the pre-commit checklist of CLAUDE.md.
 
 ## Rotation

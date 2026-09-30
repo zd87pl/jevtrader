@@ -577,7 +577,13 @@ def _source(url: str | None) -> str:
     if url is None:
         return '<span class="muted">source link unavailable</span>'
     host = urlsplit(url).hostname or "source"
-    return f'<a href="{escape(url)}" rel="noopener noreferrer">Source ({escape(host)})</a>'
+    link = f'<a href="{escape(url)}" rel="noopener noreferrer">Source ({escape(host)})</a>'
+    return _untrusted(link)
+
+
+def _untrusted(markup: str, source: str = "sec-filing") -> str:
+    """Already-escaped markup labeled as external text (#12)."""
+    return f'<span class="untrusted" data-source="{escape(source)}">{markup}</span>'
 
 
 def _quotes(quotes: list[str], heading: str = "") -> str:
@@ -585,13 +591,16 @@ def _quotes(quotes: list[str], heading: str = "") -> str:
         return '<p class="muted">No short verified quote available.</p>'
     # Beside an action pill, an unattributed sentence could read as this tool's advice.
     lead = f'<p class="meta">{escape(heading)}</p>' if heading else ""
-    return lead + "".join(f'<blockquote class="quote">{escape(q)}</blockquote>' for q in quotes)
+    return lead + "".join(
+        f'<blockquote class="quote untrusted" data-source="sec-filing">{escape(q)}</blockquote>'
+        for q in quotes
+    )
 
 
 def _meta(item: dict) -> str:
     parts = [escape(item["form"] or "Filing")]
     if item["items"]:
-        parts.append("Items " + escape(", ".join(item["items"])))
+        parts.append("Items " + _untrusted(escape(", ".join(item["items"]))))
     parts.append("first seen " + escape(et_time(item["first_seen_at"])))
     if item["mode"] != "forward":
         parts.append(escape(f"{item['mode']} record"))

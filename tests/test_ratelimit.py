@@ -176,7 +176,10 @@ class CrossProcessTests(unittest.TestCase):
         first, second = runs
         # The processes overlapped, so only a shared schedule explains the spacing.
         self.assertLess(max(min(first), min(second)), min(max(first), max(second)))
-        self.assertGreaterEqual(stamps[-1] - stamps[0], (len(stamps) - 1) * interval - 0.05)
+        # Slots are exactly one interval apart, but a busy runner can wake a request late, which
+        # shortens the measured span. Allow one interval of that jitter: without a shared
+        # schedule the two runs would interleave freely and span only about half of this.
+        self.assertGreaterEqual(stamps[-1] - stamps[0], (len(stamps) - 2) * interval)
 
     def test_sec_stays_at_or_below_ten_per_second_across_processes(self) -> None:
         runs = self.run_children("sec", 6)

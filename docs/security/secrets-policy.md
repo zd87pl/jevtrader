@@ -34,7 +34,7 @@ libsecret, Windows credential tools, `launchctl`, `systemctl` or `osascript`.
 
 - **Key-using commands only.** `export_to_environ` (`jevtrader/secrets.py:99-114`) runs for the
   commands in `USES_KEYS` and for `doctor`. Target (#46): export only the keys that command needs.
-- **Providers** read their one variable (`jevtrader/providers.py:124-128`).
+- **Providers** read their one variable (`jevtrader/providers.py:186-190`).
 - **Setup** asks with `getpass`, so the value is not echoed (`jevtrader/app.py:557`).
 - **Never:** LLM readers, MCP clients, the web view, the notifier, coding agents, or any child
   process. Child processes get a scrubbed environment (#46).

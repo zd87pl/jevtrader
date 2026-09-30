@@ -13,7 +13,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | Broker keys (`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`) | Paper account keys today; can probably place paper orders (ADR-0001 D2). Live keys later. | Keychain or environment (`jevtrader/secrets.py:15`) |
 | Provider keys (`TYPESAFE_API_KEY`, `OPENAI_API_KEY`) | Billable; a leak spends money. | Same store (`jevtrader/secrets.py:15`) |
 | The ledger | System of record (R3); poisoned rows bias every later gate. | SQLite under the data directory (`docs/data-and-ledger.md`) |
-| Prompt templates and question sets | Trusted instruction channel of every extraction. | Code plus strategy JSON (`jevtrader/providers.py:232-241`) |
+| Prompt templates and question sets | Trusted instruction channel of every extraction. | Code plus strategy JSON (`jevtrader/providers.py:282-302`) |
 | The owner's SEC contact | Personal data (O3); must never be fabricated or leaked. | Config only (`jevtrader/config.py:125-137`) |
 | The user's host session | An assistant reading our output may hold broker or shell tools. | MCP client, browser |
 
@@ -54,14 +54,14 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | --- | --- | --- | --- |
 | E1 | SEC fetches, allowlisted HTTPS URLs only | `jevtrader/sec.py:177-196` | untrusted |
 | E2 | Filing HTML to text through the central sanitizer (`sanitize-v1`): hidden tags (`script`, `style`, `noscript`, `head`, `template`, `ix:hidden`) and `display:none`/`visibility:hidden` dropped, NFKC, format and bidi characters stripped | `jevtrader/security/sanitize.py:34` | untrusted until sanitized |
-| E3 | Provider prompts: fixed instructions plus questions | `jevtrader/providers.py:232-241`, `jevtrader/providers.py:366` | trusted template, untrusted state |
-| E4 | Provider HTTP with redirects refused | `jevtrader/providers.py:141-145` | untrusted response |
+| E3 | Provider prompts: fixed instructions and questions in the instruction channel; filing text only in hash-tagged data blocks | `jevtrader/providers.py:282-302`, `jevtrader/providers.py:411-419` | trusted template, untrusted blocks |
+| E4 | Provider HTTP with redirects refused | `jevtrader/providers.py:203-207` | untrusted response |
 | E5 | Alpaca bars with key headers | `jevtrader/bars.py:177-178` | untrusted response |
 | E6 | Autoresearch proposals run as experiments | `jevtrader/lab.py:141-156` | LLM-written |
 | E7 | Brief cards quoting filing sentences, directive filter | `jevtrader/brief.py:53` | untrusted |
 | E8 | MCP stdio server | `jevtrader/mcp_server.py:485-496`, `jevtrader/mcp_server.py:41` | untrusted client |
 | E9 | Web view, loopback, GET/HEAD only | `jevtrader/web.py:323-328`, `jevtrader/web.py:417-418` | untrusted client |
-| E10 | Local reader, loopback endpoints only | `jevtrader/local.py:40` | local |
+| E10 | Local reader, loopback endpoints only | `jevtrader/local.py:45` | local |
 | E11 | Keychain reads and writes | `jevtrader/secrets.py:79-81`, `jevtrader/secrets.py:99-114` | owner |
 | E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:56-58`, `jevtrader/cli.py:515-516`, `jevtrader/app.py:466-468` | owner |
 | E13 | Notifier child process | `jevtrader/notify.py:16` | our text, inherited env |
@@ -97,10 +97,10 @@ of service, E elevation of privilege.
 | T5 | Values go through stdin, never argv (`jevtrader/secrets.py:79-81`); MCP withholds any result containing a key (`jevtrader/mcp_server.py:181-183`, `jevtrader/mcp_server.py:280-285`); `tools/secret_scan.py` | Canary secrets across every sink: #28 |
 | T6 | Only key-using commands export (`jevtrader/cli.py:56-58`) | Export only needed keys, scrub child env, execution-only trading keys: #46 |
 | T7 | Loopback bind only (`jevtrader/web.py:417-418`), Host check and read-only methods (`jevtrader/web.py:323-328`) | Auth and CSRF on any future state-changing route (ADR-0001 D2) |
-| T8 | Redirects refused (`jevtrader/providers.py:141-145`) | none |
-| T9 | Approved-URL allowlist (`jevtrader/sec.py:177-196`); local reader loopback only (`jevtrader/local.py:40`) | none |
+| T8 | Redirects refused (`jevtrader/providers.py:203-207`) | none |
+| T9 | Approved-URL allowlist (`jevtrader/sec.py:177-196`); local reader loopback only (`jevtrader/local.py:45`) | none |
 | T10 | MCP result and text size caps (`jevtrader/mcp_server.py:280-285`) | Raw store with bounded parsing: #9 |
-| T11 | Instructions are code constants (`jevtrader/providers.py:232-241`) | Separate channels, versioned template, prompt log: #11 |
+| T11 | Instructions are code constants (`jevtrader/providers.py:282-302`) | Done in #11: separate channels, hash-tagged blocks, template hash in the spec and extractor key, exact request stored in the ledger |
 | T12 | Contact is required config, alias recommended (`jevtrader/config.py:125-137`) | Owner-identity rule in [secrets-policy.md](secrets-policy.md#owner-identity) |
 
 Cross-platform storage for every mitigation above is #28; broker-key isolation is #46.

@@ -11,6 +11,8 @@ from .providers import (
     ProviderInputError,
     ProviderValidationError,
     extract_features,
+    prompt_template_hash,
+    render_request,
 )
 from .research import FEATURE_NAMES, VERSION, fit_model, predict, walk_forward
 from .security.sanitize import SANITIZER_VERSION, sanitize_text
@@ -119,6 +121,8 @@ def observe(
         "spread_bps": strategy["spread_bps"],
         # Providers only ever see sanitized text (P0-05); the version is part of the key.
         "sanitizer_version": SANITIZER_VERSION,
+        # A template edit is a different extractor, never a silent reuse (P0-07).
+        "prompt_template": prompt_template_hash(provider),
     }
     extraction_id = digest(
         {"spec": spec, "current": event["text"], "previous": prior["text"] if prior else ""}
@@ -184,6 +188,10 @@ def observe(
         )
         if excerpt:
             extraction["text_excerpt"] = excerpt
+        # The exact request body (first attempt), so every prompt is auditable from the ledger.
+        extraction["prompt"] = render_request(
+            provider, model, current_text, previous_text, strategy
+        )
         ledger.put("extractions", extraction_id, extraction)
     if mode == "forward":
         # A prediction only exists when extraction has finished; never backdate API latency.

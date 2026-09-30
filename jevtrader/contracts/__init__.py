@@ -61,6 +61,8 @@ class Extraction(TypedDict):
     extractor_key: str
     input_chars: int
     text_excerpt: NotRequired[str]
+    # The exact request body sent (P0-07); None for rules; absent on records before it.
+    prompt: NotRequired[dict[str, Any] | None]
 
 
 class Forecast(TypedDict):

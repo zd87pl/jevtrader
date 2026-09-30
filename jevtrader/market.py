@@ -88,6 +88,11 @@ def bars_for(ledger, ticker: str) -> list[dict]:
     return sorted(ledger.prefix("bars", f"{ticker}:"), key=lambda b: b["open_at"])
 
 
+def bars_as_of(ledger, ticker: str, t: str) -> list[dict]:
+    """A ticker's bars the ledger knew at ``t`` (available_at <= t), in open order (ADR-0004)."""
+    return sorted(ledger.as_of("bars", t, prefix=f"{ticker}:"), key=lambda b: b["open_at"])
+
+
 def _compatible(bar: dict, mode: str) -> bool:
     return bar["mode"] == mode if mode in {"forward", "synthetic"} else bar["mode"] != "synthetic"
 
@@ -104,10 +109,8 @@ def snapshot(ledger, ticker: str, decision_at: str, strategy: dict, *, mode: str
     def visible(name):
         return [
             b
-            for b in bars_for(ledger, name)
-            if instant(b["available_at"]) <= boundary
-            and instant(b["close_at"]) <= boundary
-            and _compatible(b, mode)
+            for b in bars_as_of(ledger, name, decision_at)
+            if instant(b["close_at"]) <= boundary and _compatible(b, mode)
         ]
 
     stock, benchmark = visible(ticker), visible(strategy["benchmark"])
@@ -150,12 +153,12 @@ def outcome(ledger, forecast: dict, as_of: str) -> dict | None:
     mode = forecast.get("mode", "historical")
     stock_all = [
         b
-        for b in bars_for(ledger, forecast["symbol"])
+        for b in bars_as_of(ledger, forecast["symbol"], as_of)
         if _compatible(b, mode) and instant(b["open_at"]) > decision
     ]
     benchmark = [
         b
-        for b in bars_for(ledger, strategy["benchmark"])
+        for b in bars_as_of(ledger, strategy["benchmark"], as_of)
         if instant(b["open_at"]) > decision and _compatible(b, mode)
     ]
     horizon = strategy["horizon_sessions"]

@@ -100,11 +100,11 @@ def observe(
         raise ObservationRejected(str(exc)) from None
     previous = [
         item
-        for item in ledger.all("disclosures")
+        # as_of keeps only disclosures first seen by decision_at (ADR-0004).
+        for item in ledger.as_of("disclosures", decision_at)
         if item["symbol"] == event["symbol"]
         and item["mode"] == event["mode"]
         and instant(item["published_at"]) < instant(event["published_at"])
-        and instant(item["first_seen_at"]) <= instant(decision_at)
     ]
     prior = max(previous, key=lambda item: (item["published_at"], item["id"])) if previous else None
     spec = {

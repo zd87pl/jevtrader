@@ -132,6 +132,34 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["previous_event_id"], "known")
         self.assertEqual(extract.call_args.args[3], "The previous operating report was stable.")
 
+    def test_decision_path_reads_disclosures_and_bars_through_as_of(self):
+        # Issue #21: the prior disclosure and the market snapshot come from Ledger.as_of at
+        # decision_at, so a record the ledger learned after the decision is invisible.
+        self.populate(receipts={("ABC", 21): self.at(23), ("SPY", 21): self.at(23)})
+        self.event("known", index=17, text="The previous operating report was stable.")
+        self.event("late", index=19, first_seen=self.at(23), text="Received after decision.")
+        self.event(index=21)
+
+        def guarded(read):
+            def call(kind, *args):
+                if kind in {"disclosures", "bars"}:
+                    raise AssertionError(f"decision path bypassed as_of: {kind}")
+                return read(kind, *args)
+
+            return call
+
+        with (
+            patch.object(self.ledger, "all", side_effect=guarded(self.ledger.all)),
+            patch.object(self.ledger, "prefix", side_effect=guarded(self.ledger.prefix)),
+            patch.object(self.ledger, "as_of", wraps=self.ledger.as_of) as as_of,
+        ):
+            result = self.observe(index=21)
+        self.assertEqual(result["previous_event_id"], "known")
+        self.assertEqual(result["market"]["session"], self.days[20])
+        decision = timestamp(self.at(21))
+        self.assertIn(("disclosures", decision), [c.args for c in as_of.call_args_list])
+        self.assertIn(("bars", decision), [c.args for c in as_of.call_args_list])
+
     def test_previous_document_does_not_cross_synthetic_provenance(self):
         self.populate()
         self.event("fixture-prior", index=19, mode="synthetic")
@@ -308,6 +336,24 @@ class EngineTests(unittest.TestCase):
         rows = engine.training_rows(self.ledger, key, before=self.at(28))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["outcome_at"], timestamp(receipt))
+
+    def test_outcome_reads_bars_through_as_of_at_the_settlement_time(self):
+        # Issue #21: a label bar the ledger learns after as_of is invisible to outcome().
+        self.populate(receipts={("ABC", 23): self.at(27)})
+        self.event()
+        forecast = self.observe()
+
+        def guarded(kind, *args):
+            raise AssertionError(f"outcome bypassed as_of: {kind}")
+
+        with (
+            patch.object(self.ledger, "prefix", side_effect=guarded),
+            patch.object(self.ledger, "as_of", wraps=self.ledger.as_of) as as_of,
+        ):
+            self.assertIsNone(outcome(self.ledger, forecast, self.at(24)))
+            settled = outcome(self.ledger, forecast, self.at(28))
+        self.assertEqual(settled["label_available_at"], timestamp(self.at(27)))
+        self.assertIn(("bars", self.at(24)), [c.args for c in as_of.call_args_list])
 
     def test_training_freezes_earliest_event_observation_even_if_unresolved(self):
         self.populate()

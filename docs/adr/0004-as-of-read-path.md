@@ -24,5 +24,6 @@ Pinned by `tests/test_pit.py`, including a seeded property test (40 seeds, rando
 
 ## Consequences
 
-- Decision code keeps its current readers; migrating callers (`engine.py`, `market.py`, `evidence.py`, `store.py` helpers) to `as_of` and replacing the remaining direct `utc_now()` calls and local parsers (`research._time`, `sec._published_at`) are follow-ups.
+- The decision path reads through `as_of` (issue #21): `engine.observe` picks the previous disclosure from `as_of("disclosures", decision_at)`, and `market.snapshot` and `market.outcome` read bars through `market.bars_as_of`, a thin sorted helper over `as_of("bars", t, prefix=...)`, keyed by the decision or settlement time. The filters they replaced (`first_seen_at <= decision_at`, `available_at <= t`) are the same knowledge fields, so results are unchanged. One corner differs only if availability is non-monotone: a label bar still unknown at `t` while a later session's bar is known is now skipped rather than blocking `outcome`; the session-alignment checks still apply.
+- Later migrations (still on `all()`/`prefix()`/`bars_for`): `engine.settle`, `engine.training_rows` and the forecast scans in `observe`; `evidence.py`; `brief.py` and `pipeline.py` (`bars_for`); `app.py`, `cli.py`, `daemon.py`, `feeds.py`, `lab.py`, `bars.py`; plus the remaining direct `utc_now()` calls and local parsers (`research._time`, `sec._published_at`).
 - Opening a writable ledger that predates this ADR takes one write transaction to backfill the index.

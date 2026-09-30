@@ -91,8 +91,17 @@ IDENTITY_FIELDS = (
     "legacy_recorded_at",
 )
 IDENTITY_TRIGGERS = frozenset(
-    {"ledger_identity_no_update", "ledger_identity_no_delete", "ledger_identity_single"}
+    {
+        "ledger_identity_no_update",
+        "ledger_identity_no_delete",
+        "ledger_identity_single",
+        "chain_links_v3",
+    }
 )
+# SQLite resolves a trigger's functions when a statement that fires it is prepared. Only a
+# schema-3 connection registers this one, so a writer still running pre-upgrade code fails
+# loudly ("no such function") instead of appending a schema-2 link after the upgrade.
+LINK_FUNCTION = "jevtrader_link_v3"
 _IDENTITY_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS ledger_identity (
         nonce TEXT NOT NULL, created_at TEXT NOT NULL, migrated_from INTEGER NOT NULL,
@@ -107,6 +116,18 @@ _IDENTITY_SCHEMA = (
     WHEN EXISTS (SELECT 1 FROM ledger_identity)
     BEGIN SELECT RAISE(ABORT, 'Ledger identity is immutable'); END""",
 )
+# Every link after the creation record must use the schema-3 formula (ADR-0005). A link that
+# fails the replace, head or record checks is left to those triggers, so their messages stay precise.
+_LINK_TRIGGER = f"""CREATE TRIGGER IF NOT EXISTS chain_links_v3 BEFORE INSERT ON chain
+    WHEN NOT EXISTS (SELECT 1 FROM chain WHERE (kind=NEW.kind AND id=NEW.id) OR seq=NEW.seq)
+    AND NEW.prev_hash IS COALESCE(
+        (SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1), '{GENESIS}')
+    AND NEW.content_hash IS (SELECT content_hash FROM records WHERE kind=NEW.kind AND id=NEW.id)
+    AND NEW.chain_hash IS NOT {LINK_FUNCTION}(
+        NEW.prev_hash, NEW.kind, NEW.id, NEW.content_hash,
+        (SELECT recorded_at FROM records WHERE kind=NEW.kind AND id=NEW.id),
+        (SELECT root FROM ledger_identity ORDER BY rowid LIMIT 1))
+    BEGIN SELECT RAISE(ABORT, 'Ledger chain link must use the schema-3 formula'); END"""
 
 # A derived, rebuildable index for as_of reads (ADR-0004). It is outside the hash chain;
 # as_of recomputes every returned row's knowledge time, so a stale or edited index can hide
@@ -181,6 +202,7 @@ class Ledger:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
             target, uri = self.path, False
         self.db = sqlite3.connect(target, uri=uri, timeout=10, isolation_level=None)
+        self.db.create_function(LINK_FUNCTION, 6, _v3_link, deterministic=True)
         try:
             self.version = self._open(create)
         except BaseException:
@@ -199,6 +221,9 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         if version < SCHEMA_VERSION:
             self._migrate()
+        elif not self._has_trigger("chain_links_v3") and self._has_table("ledger_identity"):
+            with self._transaction():  # a schema-3 ledger written before the trigger existed
+                self.db.execute(_LINK_TRIGGER)
         self._index_knowledge()
         return SCHEMA_VERSION
 
@@ -275,6 +300,7 @@ class Ledger:
             "INSERT INTO ledger_identity VALUES (?, ?, ?, ?, ?, ?, ?)",
             (*(fields[name] for name in IDENTITY_FIELDS), identity_root(fields)),
         )
+        self.db.execute(_LINK_TRIGGER)
 
     def _identity_rows(self) -> list[dict]:
         if not self._has_table("ledger_identity"):
@@ -301,6 +327,10 @@ class Ledger:
 
     def _user_version(self) -> int:
         return self.db.execute("PRAGMA user_version").fetchone()[0]
+
+    def _has_trigger(self, name: str) -> bool:
+        query = "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?"
+        return self.db.execute(query, (name,)).fetchone() is not None
 
     def _has_table(self, name: str) -> bool:
         query = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
@@ -364,6 +394,11 @@ class Ledger:
         encoded = canonical(payload)
         content_hash = hashlib.sha256(encoded.encode()).hexdigest()
         with self._transaction():
+            # Another process may have changed the schema since this handle opened the file.
+            if self._user_version() != self.version:
+                raise ValueError(
+                    f"Ledger schema changed to {self._user_version()} while open; reopen it"
+                )
             existing = self.get(kind, identity)
             if existing is not None:
                 check_existing(existing)
@@ -388,6 +423,16 @@ class Ledger:
         seq, chain_hash = self._chain_head()
         return {"seq": seq, "chain_hash": chain_hash}
 
+    def anchor(self) -> dict:
+        """head() plus the ledger's identity and root (ADR-0005 §5): the value to publish.
+
+        verify(anchor=...) then checks the root too, which a nonce alone cannot pin down."""
+        result = self.head()
+        found = self._identity_rows() if self.version >= SCHEMA_VERSION else []
+        if found:
+            result |= {"identity": found[0]["nonce"], "root": identity_root(found[0])}
+        return result
+
     def _unchained(self) -> str:
         return (
             f"Ledger schema {self.version} has no hash chain; "
@@ -402,10 +447,11 @@ class Ledger:
             or anchor["seq"] < 0
             or not isinstance(anchor.get("chain_hash"), str)
             or not isinstance(anchor.get("identity", ""), str)
+            or not isinstance(anchor.get("root", ""), str)
         ):
             raise ValueError(
-                "Anchor must be a head() result: {'seq': int, 'chain_hash': hex}, "
-                "optionally with 'identity': str"
+                "Anchor must be a head() or anchor() result: {'seq': int, 'chain_hash': hex}, "
+                "optionally with 'identity': str and 'root': hex"
             )
         # One read transaction: a writer committing mid-scan (the service writes on every
         # poll) must not look like a chain entry without its record.
@@ -438,7 +484,7 @@ class Ledger:
         nonce = None if found is None else found["nonce"]
         length, head = self._verify_chain(recorded, stamps, found, problems)
         if anchor is not None:
-            self._verify_anchor(anchor, nonce, problems)
+            self._verify_anchor(anchor, found, problems)
         return _report(len(recorded), length, head, problems, nonce)
 
     def _verify_identity(self, problems: list[str]) -> dict | None:
@@ -528,15 +574,19 @@ class Ledger:
             )
         return length, prev
 
-    def _verify_anchor(self, anchor: dict, nonce: str | None, problems: list[str]) -> None:
+    def _verify_anchor(self, anchor: dict, found: dict | None, problems: list[str]) -> None:
         seq = anchor["seq"]
         row = self.db.execute("SELECT chain_hash FROM chain WHERE seq=?", (seq,)).fetchone()
         if seq and row is None:
             problems.append(f"Anchored head seq {seq} is not in the chain")
         elif (row[0] if seq else GENESIS) != anchor["chain_hash"]:
             problems.append(f"Chain differs from the anchored head at seq {seq}")
-        if "identity" in anchor and anchor["identity"] != nonce:
+        if "identity" in anchor and anchor["identity"] != (found and found["nonce"]):
             problems.append("Ledger identity differs from the anchored identity")
+        # The nonce is public once an anchor is published; the root also commits to the
+        # creation time and the legacy prefix, so a forged identity row cannot match it.
+        if "root" in anchor and anchor["root"] != (found and identity_root(found)):
+            problems.append("Ledger root differs from the anchored root")
 
     def get(self, kind: str, identity: str) -> dict | None:
         row = self.db.execute(
@@ -659,6 +709,12 @@ class Ledger:
                 )
 
         return self._append("disclosures", event["id"], event, unchanged)
+
+
+def _v3_link(
+    prev_hash: str, kind: str, identity: str, content_hash: str, recorded_at: str, root: str
+) -> str:
+    return link_hash(prev_hash, kind, identity, content_hash, recorded_at, root)
 
 
 def _intact(encoded: str, content_hash: str) -> bool:

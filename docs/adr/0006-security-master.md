@@ -19,12 +19,20 @@ arrive after a bar is stored were never applied, and delisting returns were not 
 1. **One ledger kind, `securities`.** Each record is an immutable event (`jevtrader/pit/securities.py`):
    `ticker` (the CIK's full ticker set from a date), `delisting` (with an optional delisting
    return, never below -100%) or `split` (a positive ratio). Every event carries `cik`,
-   `effective` (New York date, valid time), `known_at` (UTC instant, knowledge time) and `source`.
-   Unknown fields are rejected. Ids are `cik:effective:type:` plus a content hash, so a correction
+   `effective` (New York date, valid time), `known_at` (UTC instant, knowledge time),
+   `known_at_basis` and `source`. Unknown fields are rejected. `known_at_basis` is `observed`
+   when this system stamped `known_at` while reading SEC (`ticker_snapshot`) and `asserted`
+   (the default) when an owner file claims it; `record_events` refuses an `observed` event
+   unless its caller passes `observed=True`, and an observed `known_at` later than `ledger.now()`. Ids are `cik:effective:type:` plus a content hash, so a correction
    is a new record, never an edit, and the hash chain is untouched.
 2. **Bitemporal reads through `as_of`.** `SecurityMaster.from_ledger(ledger, t)` reads
-   `Ledger.as_of("securities", t)`; `known_at` is the knowledge field (ADR-0004), so a fact
-   learned late never reaches an earlier read. For the same CIK, type and effective date the
+   `Ledger.as_of("securities", t)`; `known_at` is the knowledge field (ADR-0004), so an
+   observed fact learned late never reaches an earlier read. An asserted `known_at` is only as
+   honest as its file (review PIT-2): nothing ties it to `recorded_at`, so a backdated owner
+   file shows a late corporate action to earlier reads. A read at a past instant must
+   therefore either pass `observed_only=True` or label its output with
+   `SecurityMaster.asserted`. Today's only consumer, `feeds.backfill`, reads the master as of
+   the run's own start, not a past instant. For the same CIK, type and effective date the
    latest-known event wins. `tickers(cik, on)`, `table(on)`, `cik_for(ticker, on)`,
    `delisting(cik)` and `split_factor(cik, after, through]` answer in valid time.
 3. **Backfills use it.** `feeds.backfill` maps each index day's CIKs through the master known at

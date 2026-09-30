@@ -259,3 +259,111 @@ def test_put_refuses_a_ledger_whose_identity_was_removed():
     with pytest.raises(ValueError, match="identity is missing"):
         ledger.put("runs", "r1", {"job": "poll"})
     assert ledger.db.execute("SELECT COUNT(*) FROM records").fetchone() == (0,)
+
+
+def test_a_writer_left_on_pre_upgrade_code_cannot_append_after_the_upgrade(tmp_path):
+    # PIT-1: a schema-2 handle opened before another process upgraded the file used to append
+    # a schema-2 link after legacy_seq, breaking verify for good.
+    path = load_sql(GOLDEN_V2, tmp_path / "v2.sqlite")
+    old = sqlite3.connect(str(path), isolation_level=None)  # the old code's handle
+    try:
+        old.execute("SELECT count(*) FROM chain").fetchone()
+        Ledger(path, clock=CLOCK).close()  # new code upgrades the file to schema 3
+        payload = {"job": "late"}
+        head = old.execute("SELECT chain_hash FROM chain ORDER BY seq DESC LIMIT 1").fetchone()[0]
+        old.execute("BEGIN IMMEDIATE")
+        old.execute(
+            "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+            ("runs", "late", json.dumps(payload), digest(payload), "2026-02-03T00:00:00Z"),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="jevtrader_link_v3"):
+            old.execute(
+                "INSERT INTO chain (kind, id, content_hash, prev_hash, chain_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "runs",
+                    "late",
+                    digest(payload),
+                    head,
+                    link_hash(head, "runs", "late", digest(payload)),
+                ),
+            )
+        old.execute("ROLLBACK")
+    finally:
+        old.close()
+    with Ledger(path, readonly=True) as ledger:
+        assert ledger.verify(anchor=GOLDEN_HEAD)["ok"]
+
+
+def test_schema_two_links_are_refused_after_the_creation_record():
+    ledger = fresh()
+    ledger.put("runs", "r1", {"job": "poll"})
+    payload = {"job": "raw"}
+    ledger.db.execute(
+        "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+        ("runs", "r2", json.dumps(payload), digest(payload), CLOCK.now().iso()),
+    )
+    head = ledger.head()["chain_hash"]
+    with pytest.raises(sqlite3.IntegrityError, match="schema-3 formula"):
+        ledger.db.execute(
+            "INSERT INTO chain (kind, id, content_hash, prev_hash, chain_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("runs", "r2", digest(payload), head, link_hash(head, "runs", "r2", digest(payload))),
+        )
+
+
+def test_a_schema_three_ledger_without_the_link_trigger_gets_it_on_a_writable_open(tmp_path):
+    path = tmp_path / "v3.sqlite"
+    Ledger(path, clock=CLOCK).close()
+    db = sqlite3.connect(str(path))
+    db.execute("DROP TRIGGER chain_links_v3")
+    db.commit()
+    db.close()
+    with Ledger(path, readonly=True) as ledger:
+        problems = ledger.verify()["problems"]
+    assert problems == ["Immutability trigger is missing: chain_links_v3"]
+    with Ledger(path, clock=CLOCK) as ledger:
+        assert ledger.verify()["ok"]
+
+
+def test_put_refuses_when_another_process_changed_the_schema(tmp_path):
+    path = tmp_path / "v3.sqlite"
+    with Ledger(path, clock=CLOCK) as ledger:
+        other = sqlite3.connect(str(path))
+        other.execute("PRAGMA user_version=4")
+        other.commit()
+        other.close()
+        with pytest.raises(ValueError, match="schema changed to 4"):
+            ledger.put("runs", "r1", {"job": "poll"})
+        assert ledger.db.execute("SELECT count(*) FROM records").fetchone() == (0,)
+
+
+def test_an_anchor_carries_the_root_so_a_reused_nonce_is_caught():
+    # PIT-4: the nonce is public once an anchor is published. A ledger forged with the same
+    # (empty) legacy prefix and the same nonce passed a nonce-only anchor.
+    original = fresh("ab" * 16)
+    anchor = original.anchor()
+    assert anchor == {
+        "seq": 0,
+        "chain_hash": GENESIS,
+        "identity": "ab" * 16,
+        "root": original.db.execute("SELECT root FROM ledger_identity").fetchone()[0],
+    }
+    assert original.verify(anchor=anchor)["ok"]
+    with patch("jevtrader.store.new_nonce", return_value="ab" * 16):
+        forged = Ledger(":memory:", clock=FixedClock(Instant.parse("2026-03-03T00:00:00Z")))
+    nonce_only = {key: anchor[key] for key in ("seq", "chain_hash", "identity")}
+    assert forged.verify(anchor=nonce_only)["ok"]  # why anchors must carry the root
+    assert forged.verify(anchor=anchor)["problems"] == [
+        "Ledger root differs from the anchored root"
+    ]
+    with pytest.raises(ValueError, match="Anchor"):
+        original.verify(anchor={**anchor, "root": 7})
+
+
+def test_anchor_of_a_legacy_ledger_has_no_identity(tmp_path):
+    path = load_sql(GOLDEN_V2, tmp_path / "v2.sqlite")
+    with Ledger(path, readonly=True) as ledger:
+        assert ledger.anchor() == GOLDEN_HEAD
+        report = ledger.verify(anchor={**GOLDEN_HEAD, "root": "f" * 64})
+    assert report["problems"] == ["Ledger root differs from the anchored root"]

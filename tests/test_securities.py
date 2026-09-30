@@ -165,6 +165,56 @@ class MasterTests(unittest.TestCase):
         self.assertTrue(self.master("2026-01-01T00:00Z"))
 
 
+class KnownAtBasisTests(unittest.TestCase):
+    """PIT-2: an owner file's known_at is asserted, not observed; reads can tell them apart."""
+
+    def setUp(self):
+        self.ledger = Ledger(":memory:", clock=FixedClock(Instant.parse("2026-09-01T00:00:00Z")))
+        self.addCleanup(self.ledger.db.close)
+
+    def test_owner_facts_are_asserted_and_snapshots_observed(self):
+        self.assertEqual(
+            parse_event(ticker(ABC, ["ABC"], "2020-01-02", "2020-01-02T12:00Z"))["known_at_basis"],
+            "asserted",
+        )
+        at = Instant.parse("2026-08-31T21:00:00Z")
+        snapshot = ticker_snapshot({ABC: ["ABC"]}, at)
+        self.assertEqual(snapshot[0]["known_at_basis"], "observed")
+        with self.assertRaises(ValueError):
+            parse_event({**snapshot[0], "known_at_basis": "guessed"})
+
+    def test_an_owner_file_cannot_claim_an_observed_time(self):
+        forged = {**ticker(ABC, ["ABC"], "2015-01-02", "2015-01-02T00:00Z")}
+        forged["known_at_basis"] = "observed"
+        with self.assertRaisesRegex(ValueError, "Only the system"):
+            record_events(self.ledger, [forged])
+        self.assertEqual(self.ledger.counts(), {})
+
+    def test_an_observed_fact_cannot_be_known_after_now(self):
+        late = ticker_snapshot({ABC: ["ABC"]}, Instant.parse("2026-09-01T00:00:01Z"))
+        with self.assertRaisesRegex(ValueError, "after now"):
+            record_events(self.ledger, late, observed=True)
+        # known_at equal to now is allowed
+        now = ticker_snapshot({ABC: ["ABC"]}, Instant.parse("2026-09-01T00:00:00Z"))
+        self.assertEqual(record_events(self.ledger, now, observed=True), 1)
+
+    def test_a_backdated_owner_fact_can_be_excluded_or_labelled(self):
+        # Recorded 2026-09-01 but claiming to be known in 2020: a past read sees it only
+        # through its asserted basis, which it can refuse or report.
+        record_events(self.ledger, [split(ABC, "2020-08-31", "2020-09-01T00:00Z", 4.0)])
+        observed = ticker_snapshot({ABC: ["ABC"]}, Instant.parse("2026-08-31T21:00:00Z"))
+        record_events(self.ledger, observed, observed=True)
+        past = SecurityMaster.from_ledger(self.ledger, "2021-01-01T00:00Z")
+        self.assertTrue(past.asserted)
+        self.assertEqual(past.split_factor(ABC, date(2020, 1, 1), date(2021, 1, 1)), 4.0)
+        strict = SecurityMaster.from_ledger(self.ledger, "2021-01-01T00:00Z", observed_only=True)
+        self.assertFalse(strict)
+        self.assertEqual(strict.split_factor(ABC, date(2020, 1, 1), date(2021, 1, 1)), 1.0)
+        today = SecurityMaster.from_ledger(self.ledger, "2026-09-01T00:00Z", observed_only=True)
+        self.assertFalse(today.asserted)
+        self.assertEqual(today.tickers(ABC, date(2026, 9, 1)), ("ABC",))
+
+
 class BackfillUsesMasterTests(FeedsCase):
     FRIDAY = date(2026, 9, 18)
 

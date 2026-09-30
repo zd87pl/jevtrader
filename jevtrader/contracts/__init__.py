@@ -25,6 +25,10 @@ class Disclosure(TypedDict):
     source_type: str
     source_url: str
     text: str
+    # Central sanitizer (P0-05); absent on legacy records written before it.
+    sanitizer_version: NotRequired[str]
+    raw_sha256: NotRequired[str]
+    sanitize_diff: NotRequired[dict[str, Any]]
     # SEC filings only.
     accepted_at: NotRequired[str]
     after_hours: NotRequired[bool]

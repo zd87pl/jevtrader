@@ -22,7 +22,7 @@ ANCHORS = [
     (THREAT_MODEL, "jevtrader/cli.py:56-58", "USES_KEYS"),
     (THREAT_MODEL, "jevtrader/cli.py:515-516", "export_to_environ"),
     (THREAT_MODEL, "jevtrader/app.py:466-468", "export_to_environ"),
-    (THREAT_MODEL, "jevtrader/sec.py:322", '"script", "style", "noscript"'),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:34", '"head", "template", "ix:hidden"'),
     (THREAT_MODEL, "jevtrader/sec.py:177-196", "approved HTTPS URL"),
     (THREAT_MODEL, "jevtrader/providers.py:232-241", "instructions"),
     (THREAT_MODEL, "jevtrader/providers.py:366", '"questions": questions'),

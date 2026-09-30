@@ -13,6 +13,7 @@ from .providers import (
     extract_features,
 )
 from .research import FEATURE_NAMES, VERSION, fit_model, predict, walk_forward
+from .security.sanitize import SANITIZER_VERSION, sanitize_text
 
 PREVIOUS_MIN_CHARS = 10_000
 
@@ -116,6 +117,8 @@ def observe(
         "horizon_sessions": strategy["horizon_sessions"],
         "history_sessions": strategy["min_history_sessions"],
         "spread_bps": strategy["spread_bps"],
+        # Providers only ever see sanitized text (P0-05); the version is part of the key.
+        "sanitizer_version": SANITIZER_VERSION,
     }
     extraction_id = digest(
         {"spec": spec, "current": event["text"], "previous": prior["text"] if prior else ""}
@@ -142,8 +145,9 @@ def observe(
         if not compatible:
             raise ObservationRejected("Calibrator and extraction schemas/models do not match")
     if extraction is None:
+        # Legacy ledger text predates the sanitizer; sanitizing is idempotent for newer text.
         current_text, previous_text, excerpt = _excerpt(
-            event["text"], prior["text"] if prior else ""
+            sanitize_text(event["text"]), sanitize_text(prior["text"]) if prior else ""
         )
         # Only a local engine takes an address; other adapters keep their exact call.
         location = {"base_url": base_url} if provider == "local" and base_url is not None else {}

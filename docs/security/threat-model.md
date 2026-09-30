@@ -53,7 +53,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | # | Entry point | Code | Input trust |
 | --- | --- | --- | --- |
 | E1 | SEC fetches, allowlisted HTTPS URLs only | `jevtrader/sec.py:177-196` | untrusted |
-| E2 | Filing HTML to text; only script/style/noscript dropped | `jevtrader/sec.py:322` | untrusted |
+| E2 | Filing HTML to text through the central sanitizer (`sanitize-v1`): hidden tags (`script`, `style`, `noscript`, `head`, `template`, `ix:hidden`) and `display:none`/`visibility:hidden` dropped, NFKC, format and bidi characters stripped | `jevtrader/security/sanitize.py:34` | untrusted until sanitized |
 | E3 | Provider prompts: fixed instructions plus questions | `jevtrader/providers.py:232-241`, `jevtrader/providers.py:366` | trusted template, untrusted state |
 | E4 | Provider HTTP with redirects refused | `jevtrader/providers.py:141-145` | untrusted response |
 | E5 | Alpaca bars with key headers | `jevtrader/bars.py:177-178` | untrusted response |
@@ -90,7 +90,7 @@ of service, E elevation of privilege.
 
 | Threat | In place (cited) | Planned (issue) |
 | --- | --- | --- |
-| T1 | script/style/noscript removed (`jevtrader/sec.py:322`) | Central versioned sanitizer before any LLM and any display: #9 |
+| T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:34`) on collection, and again in the engine before any provider call for legacy ledger text | Done in #9; display surfaces still use their own filters (#12) |
 | T2 | Readers have no tools and return bounded numbers | Quarantine flag and exclusions, red-team corpus in CI: #13 |
 | T3 | Directive sentences dropped from cards (`jevtrader/brief.py:53`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`) | Provenance on external-derived text, warn against co-installed broker servers: #12 |
 | T4 | Proposals must pass validation before an experiment (`jevtrader/lab.py:141-156`) | Human review of LLM-written questions: #10 |

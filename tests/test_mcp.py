@@ -579,6 +579,12 @@ class OutputFilterTests(ServerCase):
         )
         self.assertNotIn("FULL FILING", self.output)
 
+    def test_sanitization_status_is_our_own_value_and_not_wrapped(self):
+        payload = {"symbol": "ABC", "sanitization": "legacy_unsanitized", "quotes": ["q" * 10]}
+        result = self.structured(payload, "explain_filing")
+        self.assertEqual(result["sanitization"], "legacy_unsanitized")
+        self.assertNotIn("sanitization", mcp_server.PROVENANCE)
+
     def test_quotes_are_capped_per_card(self):
         key = mcp_server.EXCERPT_KEY
         payload = {

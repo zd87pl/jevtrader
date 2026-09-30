@@ -9,6 +9,7 @@ from jevtrader import brief, cohorts, daemon, engine
 from jevtrader.common import load_strategy, timestamp
 from jevtrader.market import normalize_bar
 from jevtrader.research import FEATURE_NAMES
+from jevtrader.security import sanitize
 from jevtrader.store import Ledger
 
 STRATEGY = load_strategy()
@@ -503,6 +504,42 @@ class FilingCardTests(unittest.TestCase):
         self.assertEqual(card["decisions"], [])
         self.assertEqual(card["notice"], brief.NOTICE)
 
+    def test_legacy_disclosure_is_flagged_and_its_quotes_are_display_cleaned(self):
+        # Pre-sanitizer ledger text (#9): cleaned at read time and marked as legacy.
+        text = (
+            "The company raised guid\u200bance for fiscal 2026 after strong demand in its "
+            "services seg\u202ement."
+        )
+        event_id = store(
+            self.ledger,
+            disclosure("sec:0000000001-26-000003:ex99.htm", "2026-03-02T21:30:00Z", text=text),
+        )
+        card = brief.filing_card(self.ledger, event_id, now=NOW)
+        self.assertEqual(card["sanitization"], sanitize.LEGACY)
+        self.assertEqual(card["sanitization"], "legacy_unsanitized")
+        self.assertTrue(card["quotes"])
+        self.assertTrue(all("\u200b" not in q and "\u202e" not in q for q in card["quotes"]))
+        self.assertIn("raised guidance for fiscal 2026", card["quotes"][0])
+        page = brief.render_filing_html(card)
+        self.assertIn(brief.LEGACY_NOTE, page)
+        self.assertEqual(
+            brief.LEGACY_NOTE,
+            "Stored before the sanitizer existed; text shown after display cleaning.",
+        )
+
+    def test_sanitized_disclosure_carries_its_version_and_no_legacy_note(self):
+        event_id = store(
+            self.ledger,
+            disclosure(
+                "sec:0000000001-26-000004:ex99.htm",
+                "2026-03-02T21:30:00Z",
+                sanitizer_version=sanitize.SANITIZER_VERSION,
+            ),
+        )
+        card = brief.filing_card(self.ledger, event_id, now=NOW)
+        self.assertEqual(card["sanitization"], sanitize.SANITIZER_VERSION)
+        self.assertNotIn(brief.LEGACY_NOTE, brief.render_filing_html(card))
+
     def test_card_quotes_share_one_character_budget(self):
         # Each lexicon sentence fits MAX_QUOTE_CHARS; together they exceed the card's budget.
         text = (
@@ -590,7 +627,7 @@ class FilingCardTests(unittest.TestCase):
                     "source": "Fixed lexical rules; nothing is learned",
                 },
                 "legacy": None,
-                "odd": {"origin": None, "training_cutoff": None, "source": "a b"},
+                "odd": {"origin": None, "training_cutoff": None, "source": "ab"},
             },
         )
         page = brief.render_filing_html(card)

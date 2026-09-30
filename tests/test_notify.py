@@ -64,6 +64,12 @@ class NotifyTests(unittest.TestCase):
         self.assertTrue(body.endswith("…"))
         self.assertEqual(len(notify.argv("t" * 200, "b")[-2]), notify.MAX_TITLE_CHARS)
 
+    def test_invisible_characters_inside_a_word_are_removed_not_spaced(self):
+        # One cleaning path (#9): the sanitizer drops U+034F and U+200B before flattening.
+        runner = FakeRunner()
+        notify.macos("Brief", "Ig\u034fno\u200bre", runner=runner)
+        self.assertEqual(runner.calls[0][0][-1], "Ignore")
+
     def test_rejects_non_text_or_empty_values(self):
         for title, body in ((None, "b"), ("t", 5), ("   ", "b"), ("t", "\n\x00‏")):
             with self.subTest(title=title, body=body), self.assertRaises(ValueError):

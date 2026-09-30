@@ -47,7 +47,7 @@ ANCHORS = [
     (THREAT_MODEL, "jevtrader/web.py:323-328", "405"),
     (THREAT_MODEL, "jevtrader/web.py:417-418", "loopback only"),
     (THREAT_MODEL, "jevtrader/local.py:45", "LOOPBACK_HOSTS"),
-    (THREAT_MODEL, "jevtrader/notify.py:18", "osascript"),
+    (THREAT_MODEL, "jevtrader/notify.py:19", "osascript"),
     (THREAT_MODEL, "jevtrader/cli.py:71-89", "def keys_for"),
     (THREAT_MODEL, "jevtrader/security/childenv.py:16-31", "_SECRETISH"),
     (SECRETS_POLICY, "jevtrader/cli.py:71-89", "OPENAI_API_KEY"),

@@ -19,7 +19,8 @@ from .common import EASTERN, instant, sec_symbol, timestamp
 from .market import _compatible, bars_for
 from .providers import _NEGATIVE, _POSITIVE
 from .security.quarantine import DIRECTIVE as _DIRECTIVE
-from .security.sanitize import skeleton
+from .security import sanitize
+from .security.sanitize import sanitize_text, skeleton
 
 MAX_FILINGS = 50
 MAX_QUOTE_CHARS = 200
@@ -229,14 +230,16 @@ def _filing(
         "evidence": evidence.evidence_label(forecast) if forecast else None,
         "counts_as_evidence": evidence.is_evidence(forecast) if forecast else False,
         "unscored_reason": _unscored(ledger, event, forecast, boundary),
-        "quotes": verified_quotes(event["text"], phrases=PHRASES, max_total=CARD_QUOTE_CHARS),
+        "quotes": verified_quotes(
+            sanitize_text(event["text"]), phrases=PHRASES, max_total=CARD_QUOTE_CHARS
+        ),
     }
 
 
 def _short(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    cleaned = "".join(ch if _safe(ch) else " " for ch in value).strip()
+    cleaned = "".join(ch if _safe(ch) else " " for ch in sanitize_text(value)).strip()
     return cleaned[:MAX_ERROR_CHARS] or None
 
 
@@ -481,6 +484,9 @@ def _basis(value: object) -> dict | None:
     }
 
 
+LEGACY_NOTE = "Stored before the sanitizer existed; text shown after display cleaning."
+
+
 def filing_card(ledger, event_id: str, *, now: str) -> dict:
     """One filing and every decision on it visible at ``now``; no raw filing text."""
     boundary = instant(now)
@@ -507,7 +513,10 @@ def filing_card(ledger, event_id: str, *, now: str) -> dict:
         "source_url": _https(event.get("source_url")),
         "document_role": _word(event.get("document_role")),
         "selection_method": _word(event.get("selection_method")),
-        "quotes": verified_quotes(event["text"], phrases=PHRASES, max_total=CARD_QUOTE_CHARS),
+        "quotes": verified_quotes(
+            sanitize_text(event["text"]), phrases=PHRASES, max_total=CARD_QUOTE_CHARS
+        ),
+        "sanitization": sanitize.sanitization_status(event),
         "decisions": [_decision(ledger, f, boundary) for f in forecasts],
         "notice": NOTICE,
     }
@@ -728,6 +737,11 @@ def _basis_html(basis: dict | None) -> str:
 def render_filing_html(card: dict) -> str:
     """One filing card as an HTML fragment; every value is escaped."""
     item = {**card, "watchlist": False}
+    legacy = (
+        f'<p class="muted">{escape(LEGACY_NOTE)}</p>'
+        if card.get("sanitization") == sanitize.LEGACY
+        else ""
+    )
     decisions = (
         "".join(_decision_html(d) for d in card["decisions"])
         if card["decisions"]
@@ -738,7 +752,7 @@ def render_filing_html(card: dict) -> str:
         f'<h1><span class="sym">{escape(card["symbol"])}</span></h1>'
         f'<p class="meta">{_meta(item)} · accepted {escape(et_time(card["published_at"]))}</p>'
         f'<p class="links">{_source(card["source_url"])}</p>'
-        f"<h2>From the filing</h2>{_quotes(card['quotes'])}"
+        f"<h2>From the filing</h2>{legacy}{_quotes(card['quotes'])}"
         f"<h2>Decisions</h2>{decisions}"
         "</article>"
     )

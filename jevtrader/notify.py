@@ -14,6 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .security import childenv
+from .security.sanitize import sanitize_text
 
 OSASCRIPT = "/usr/bin/osascript"
 TIMEOUT_SECONDS = 10
@@ -46,9 +47,11 @@ def _run(argv: list[str], input: str | None = None) -> subprocess.CompletedProce
 def _clean(value: object, name: str, limit: int) -> str:
     if not isinstance(value, str):
         raise ValueError(f"Notification {name} must be a string")
-    # Control and bidi-override characters could disguise what the notification says.
+    # One cleaning path (#9): the sanitizer drops invisible characters inside words first,
+    # then control and bidi-override characters that could disguise the text become spaces.
     text = "".join(
-        " " if unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} else ch for ch in value
+        " " if unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} else ch
+        for ch in sanitize_text(value)
     )
     text = " ".join(text.split())
     if not text:

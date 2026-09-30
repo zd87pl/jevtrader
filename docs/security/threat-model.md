@@ -64,7 +64,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | E10 | Local reader, loopback endpoints only | `jevtrader/local.py:45` | local |
 | E11 | Keychain reads and writes | `jevtrader/secrets.py:120-121`, `jevtrader/secrets.py:369-390` | owner |
 | E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:66-68`, `jevtrader/cli.py:574-576`, `jevtrader/app.py:480-485` | owner |
-| E13 | Notifier child process | `jevtrader/notify.py:18` | our text, scrubbed env |
+| E13 | Notifier child process | `jevtrader/notify.py:19` | our text, scrubbed env |
 
 ## Threats
 
@@ -112,7 +112,7 @@ Cross-platform storage for every mitigation above is #28; broker-key isolation i
   agent can read every key.
 - **Environment inheritance.** Fixed for the package's own children: each gets a scrubbed
   allowlist environment (`jevtrader/security/childenv.py:16-31`), including the notifier's
-  `osascript` (`jevtrader/notify.py:18`). A command still holds its own needed keys in
+  `osascript` (`jevtrader/notify.py:19`). A command still holds its own needed keys in
   `os.environ`; trading keys move out of reach in Phase 5 (ADR-0008, #46).
 - **Legacy ledger text is unsanitized** and cannot be re-sanitized for hidden HTML, since no raw
   store exists (ADR-0001 D3, #9).

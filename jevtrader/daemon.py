@@ -37,6 +37,7 @@ from .common import (
 )
 from .providers import MAX_OUTPUT_TOKENS, MAX_TEXT_CHARS, PAID_PROVIDERS
 from .secrets import KNOWN as SECRET_NAMES
+from .security.sanitize import sanitize_text
 
 JOBS = ("poll", "bars", "observe", "settle", "brief", "reconcile")
 GAP_JOB = "coverage_gap"
@@ -591,13 +592,21 @@ def _problem_summary(problems: list) -> str:
     return _safe_text(f"{len(problems)} error(s); first: {text}")
 
 
-def _safe_text(message: str) -> str:
-    """Errors reach the ledger and logs: drop key material, control characters and bulk."""
+def _redact(message: str) -> str:
     for name in SECRET_NAMES:
         value = os.environ.get(name, "")
         if len(value) >= 4:
             message = message.replace(value, "[redacted]")
-    message = re.sub(r"(?i)(bearer|apca-api-[a-z-]+:?)\s+\S+", r"\1 [redacted]", message)
+    return re.sub(r"(?i)(bearer|apca-api-[a-z-]+:?)\s+\S+", r"\1 [redacted]", message)
+
+
+def _safe_text(message: str) -> str:
+    """Errors reach the ledger and logs: drop key material, control characters and bulk.
+
+    Redaction runs on the raw text and again after sanitizing, so a key split by a
+    zero-width character is still caught (#9).
+    """
+    message = _redact(sanitize_text(_redact(message)))
     message = "".join(ch if ch.isprintable() else " " for ch in message)
     return message[:MAX_ERROR_CHARS]
 

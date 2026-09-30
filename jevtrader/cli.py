@@ -205,7 +205,7 @@ def parser() -> argparse.ArgumentParser:
 
 def _app_commands(commands) -> None:
     commands.add_parser("setup", help="Guided setup: SEC contact, watchlist, provider, keys")
-    commands.add_parser("up", help="Install and start the background service (launchd)")
+    commands.add_parser("up", help="Install and start the background service (launchd or systemd)")
     commands.add_parser("down", help="Stop and remove the background service")
     commands.add_parser("daemon", help="Run the background schedule in the foreground")
     commands.add_parser("poll", help="Collect new qualifying 8-Ks once (as the service does)")

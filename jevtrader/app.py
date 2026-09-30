@@ -30,6 +30,7 @@ from . import (
     paths,
     registry,
     secrets,
+    systemd,
     web,
 )
 from . import config as settings
@@ -292,6 +293,11 @@ def program_args(*, ledger: str | None = None, strategy: str | None = None) -> l
     return [*args, "daemon"]
 
 
+def service_manager(platform: str | None = None) -> Any:
+    """systemd on Linux, launchd elsewhere; both expose install, uninstall and status."""
+    return systemd if (platform or sys.platform).startswith("linux") else launchd
+
+
 def up(
     config: dict,
     *,
@@ -299,16 +305,24 @@ def up(
     program: list[str],
     runner: launchd.Runner | None = None,
     home: Path | None = None,
+    platform: str | None = None,
 ) -> dict:
-    """Install and start the LaunchAgent; setup must have created the ledger first."""
+    """Install and start the background service; setup must have created the ledger first."""
     if not config["sec_user_agent"]:
         raise ValueError(f"Run `{paths.APP_NAME} setup` first: no contact for SEC is declared")
     open_ledger(ledger_path).close()
-    return launchd.install(program, runner=runner, home=home)
+    result: dict = service_manager(platform).install(program, runner=runner, home=home)
+    return result
 
 
-def down(*, runner: launchd.Runner | None = None, home: Path | None = None) -> dict:
-    return launchd.uninstall(runner=runner, home=home)
+def down(
+    *,
+    runner: launchd.Runner | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> dict:
+    result: dict = service_manager(platform).uninstall(runner=runner, home=home)
+    return result
 
 
 # ---------------------------------------------------------------- doctor

@@ -17,11 +17,11 @@ CITATION = re.compile(
 
 # (document, citation, text the cited range must contain): pins the load-bearing claims.
 ANCHORS = [
-    (THREAT_MODEL, "jevtrader/secrets.py:79-81", "add-generic-password"),
-    (THREAT_MODEL, "jevtrader/secrets.py:99-114", "os.environ[name] = value"),
+    (THREAT_MODEL, "jevtrader/secrets.py:101-102", "add-generic-password"),
+    (THREAT_MODEL, "jevtrader/secrets.py:350-369", "os.environ[name] = value"),
     (THREAT_MODEL, "jevtrader/cli.py:64-66", "USES_KEYS"),
     (THREAT_MODEL, "jevtrader/cli.py:553-554", "export_to_environ"),
-    (THREAT_MODEL, "jevtrader/app.py:466-468", "export_to_environ"),
+    (THREAT_MODEL, "jevtrader/app.py:480-482", "export_to_environ"),
     (THREAT_MODEL, "jevtrader/security/sanitize.py:34", '"head", "template", "ix:hidden"'),
     (THREAT_MODEL, "jevtrader/sec.py:177-196", "approved HTTPS URL"),
     (THREAT_MODEL, "jevtrader/providers.py:282-302", "instructions"),
@@ -45,11 +45,11 @@ ANCHORS = [
     (THREAT_MODEL, "jevtrader/notify.py:16", "osascript"),
     (THREAT_MODEL, "jevtrader/providers.py:203-207", "redirect"),
     (THREAT_MODEL, "jevtrader/bars.py:177-178", "APCA-API-SECRET-KEY"),
-    (SECRETS_POLICY, "jevtrader/secrets.py:15", "KNOWN"),
-    (SECRETS_POLICY, "jevtrader/secrets.py:50", "find-generic-password"),
-    (SECRETS_POLICY, "jevtrader/secrets.py:59-68", "environment wins"),
-    (SECRETS_POLICY, "jevtrader/secrets.py:79-81", "stdin"),
-    (SECRETS_POLICY, "jevtrader/secrets.py:99-114", "export_to_environ"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:22", "KNOWN"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:90", "find-generic-password"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:328-335", "environment wins"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:101-102", "stdin"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:350-369", "export_to_environ"),
     (SECRETS_POLICY, "jevtrader/launchd.py:191-203", "store it in the Keychain"),
     (SECRETS_POLICY, "jevtrader/launchd.py:206-210", "Refusing to write an API key"),
     (SECRETS_POLICY, "jevtrader/config.py:1", "never secrets"),
@@ -57,7 +57,7 @@ ANCHORS = [
     (SECRETS_POLICY, "jevtrader/config.py:125-137", "dedicated alias"),
     (SECRETS_POLICY, "jevtrader/providers.py:186-190", "os.environ.get(variable"),
     (SECRETS_POLICY, "jevtrader/mcp_server.py:197-199", "KNOWN"),
-    (SECRETS_POLICY, "jevtrader/app.py:557", "getpass"),
+    (SECRETS_POLICY, "jevtrader/app.py:571", "getpass"),
     (SECRETS_POLICY, "tools/secret_scan.py:94-97", "_canary"),
 ]
 

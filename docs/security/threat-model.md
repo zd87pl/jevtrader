@@ -10,8 +10,8 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 
 | Asset | Why it matters | Where it lives today |
 | --- | --- | --- |
-| Broker keys (`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`) | Paper account keys today; can probably place paper orders (ADR-0001 D2). Live keys later. | Keychain or environment (`jevtrader/secrets.py:15`) |
-| Provider keys (`TYPESAFE_API_KEY`, `OPENAI_API_KEY`) | Billable; a leak spends money. | Same store (`jevtrader/secrets.py:15`) |
+| Broker keys (`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`) | Paper account keys today; can probably place paper orders (ADR-0001 D2). Live keys later. | Keychain or environment (`jevtrader/secrets.py:22`) |
+| Provider keys (`TYPESAFE_API_KEY`, `OPENAI_API_KEY`) | Billable; a leak spends money. | Same store (`jevtrader/secrets.py:22`) |
 | The ledger | System of record (R3); poisoned rows bias every later gate. | SQLite under the data directory (`docs/data-and-ledger.md`) |
 | Prompt templates and question sets | Trusted instruction channel of every extraction. | Code plus strategy JSON (`jevtrader/providers.py:282-302`) |
 | The owner's SEC contact | Personal data (O3); must never be fabricated or leaked. | Config only (`jevtrader/config.py:125-137`) |
@@ -23,7 +23,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
    and approved prompt templates.
 2. **Core process (trusted code, untrusted data).** Collectors, readers, the calibrator, the
    ledger. It holds provider and market-data keys in its environment after
-   `export_to_environ` (`jevtrader/secrets.py:99-114`).
+   `export_to_environ` (`jevtrader/secrets.py:350-369`).
 3. **Quarantined readers (untrusted output).** Provider LLMs and the local reader. They receive
    filing text and return bounded values; their output is data, never instructions.
 4. **Read-only surfaces (untrusted consumers).** The MCP server over stdio
@@ -62,8 +62,8 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | E8 | MCP stdio server | `jevtrader/mcp_server.py:525-536`, `jevtrader/mcp_server.py:41` | untrusted client |
 | E9 | Web view, loopback, GET/HEAD only | `jevtrader/web.py:323-328`, `jevtrader/web.py:417-418` | untrusted client |
 | E10 | Local reader, loopback endpoints only | `jevtrader/local.py:45` | local |
-| E11 | Keychain reads and writes | `jevtrader/secrets.py:79-81`, `jevtrader/secrets.py:99-114` | owner |
-| E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:64-66`, `jevtrader/cli.py:553-554`, `jevtrader/app.py:466-468` | owner |
+| E11 | Keychain reads and writes | `jevtrader/secrets.py:101-102`, `jevtrader/secrets.py:350-369` | owner |
+| E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:64-66`, `jevtrader/cli.py:553-554`, `jevtrader/app.py:480-482` | owner |
 | E13 | Notifier child process | `jevtrader/notify.py:16` | our text, inherited env |
 
 ## Threats
@@ -94,7 +94,7 @@ of service, E elevation of privilege.
 | T2 | Readers have no tools and return bounded numbers; adversarial-looking source text flags the extraction quarantined (`jevtrader/engine.py:192`), and a quarantined forecast never counts (`jevtrader/evidence.py:49`), trains (`jevtrader/engine.py:394`) or gets a paper plan (`jevtrader/paper.py:131`); red-team corpus in CI (`tests/redteam/cases.json`, `tests/test_redteam.py`) | Done in #13; paraphrased directives can still pass unflagged |
 | T3 | Directive sentences dropped from cards, matched on the confusable skeleton (`jevtrader/security/quarantine.py:24`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`); external-derived MCP fields wrapped with provenance (`jevtrader/mcp_server.py:50`); id arguments bounded and never echoed (`jevtrader/mcp_server.py:225`); co-installed broker warning in `docs/mcp.md` and the server instructions | Paraphrased directives; `/api/brief.json` fields still unlabelled (escaped in HTML only) |
 | T4 | Proposals pass validation and a question lint, and run only after human approval of the diff (`jevtrader/lab.py:197-209`) | Done in #10 |
-| T5 | Values go through stdin, never argv (`jevtrader/secrets.py:79-81`); MCP withholds any result containing a key (`jevtrader/mcp_server.py:197-199`, `jevtrader/mcp_server.py:313-318`); `tools/secret_scan.py` | Canary secrets across every sink: #28 |
+| T5 | Values go through stdin, never argv (`jevtrader/secrets.py:101-102`); MCP withholds any result containing a key (`jevtrader/mcp_server.py:197-199`, `jevtrader/mcp_server.py:313-318`); `tools/secret_scan.py` | Canary secrets across every sink: #28 |
 | T6 | Only key-using commands export (`jevtrader/cli.py:64-66`) | Export only needed keys, scrub child env, execution-only trading keys: #46 |
 | T7 | Loopback bind only (`jevtrader/web.py:417-418`), Host check and read-only methods (`jevtrader/web.py:323-328`) | Auth and CSRF on any future state-changing route (ADR-0001 D2) |
 | T8 | Redirects refused (`jevtrader/providers.py:203-207`) | none |

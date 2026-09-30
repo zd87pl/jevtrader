@@ -6,7 +6,7 @@ by `tests/test_security_docs.py`. Threats and mitigations are in [threat-model.m
 
 ## Inventory
 
-The only secrets are the four names in `KNOWN` (`jevtrader/secrets.py:15`):
+The only secrets are the four names in `KNOWN` (`jevtrader/secrets.py:22`):
 
 | Name | Purpose | Needed by |
 | --- | --- | --- |
@@ -21,21 +21,25 @@ The SEC contact is not a secret but is personal data; see [Owner identity](#owne
 
 | OS | Store | Status |
 | --- | --- | --- |
-| macOS | Keychain, generic password, service `jevtrader`, account = key name; read with `find-generic-password` (`jevtrader/secrets.py:50`), written through stdin (`jevtrader/secrets.py:79-81`) | today |
-| Linux desktop | libsecret (Secret Service) | planned, #28 |
-| Windows | Windows Credential Manager | planned, #28 |
-| Containers | Docker secrets mounted as files, read-only, into the one container that needs them | planned, #28 |
-| Any | Process environment, for a shell or service override; the environment wins (`jevtrader/secrets.py:59-68`) | today |
+| macOS | Keychain, generic password, service `jevtrader`, account = key name; read with `find-generic-password` (`jevtrader/secrets.py:90`), written through stdin (`jevtrader/secrets.py:101-102`) | today |
+| Linux desktop | libsecret via `secret-tool`, attributes `service jevtrader account <name>`, value on stdin (`jevtrader/secrets.py:119`) | today |
+| Windows | Windows Credential Manager through a fixed PowerShell script; operation, name and value on stdin (`jevtrader/secrets.py:226`) | today, untested on real Windows |
+| Containers | Docker secrets mounted as files (`/run/secrets/<name lowercased>` or `JEVTRADER_SECRETS_DIR`), read-only (`jevtrader/secrets.py:267`) | today |
+| Any | Process environment, for a shell or service override; the environment wins (`jevtrader/secrets.py:328-335`) | today |
+
+`choose_store` (`jevtrader/secrets.py:291-307`) picks Docker secrets when mounted or configured, else
+the platform store. The systemd user unit carries no secret: secret-looking names and values are
+refused (`jevtrader/systemd.py:165`).
 
 Every backend is tested through an injected runner only; tests never call the real Keychain,
 libsecret, Windows credential tools, `launchctl`, `systemctl` or `osascript`.
 
 ## Who may read
 
-- **Key-using commands only.** `export_to_environ` (`jevtrader/secrets.py:99-114`) runs for the
+- **Key-using commands only.** `export_to_environ` (`jevtrader/secrets.py:350-369`) runs for the
   commands in `USES_KEYS` and for `doctor`. Target (#46): export only the keys that command needs.
 - **Providers** read their one variable (`jevtrader/providers.py:186-190`).
-- **Setup** asks with `getpass`, so the value is not echoed (`jevtrader/app.py:557`).
+- **Setup** asks with `getpass`, so the value is not echoed (`jevtrader/app.py:571`).
 - **Never:** LLM readers, MCP clients, the web view, the notifier, coding agents, or any child
   process. Child processes get a scrubbed environment (#46).
 - **Trading keys:** only the execution service, by a mechanism the Phase 5 ADR names (D2).
@@ -60,7 +64,7 @@ A secret value never appears in:
 
 1. Revoke the key at the provider or broker first.
 2. Store the new one with `jevtrader setup` (or the platform store); the write is verified by
-   reading it back (`jevtrader/secrets.py:79-81`).
+   reading it back (`jevtrader/secrets.py:101-102`).
 3. Restart the service so no process keeps the old value in its environment.
 4. Rotate immediately after any suspected leak, after a coding agent session that had access, and
    when a paper key is promoted to anything live (live keys are always new keys, ADR-0001 D2).

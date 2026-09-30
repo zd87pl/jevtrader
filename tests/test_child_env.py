@@ -121,6 +121,40 @@ class KeysForCommandTests(unittest.TestCase):
         ex.assert_not_called()
 
 
+class TradingKeySeparationTests(unittest.TestCase):
+    """RT-4, ADR-0008 rule 4: the Alpaca keys are trading-capable, so no command's key set may
+    hold one next to a provider key (the process would call an LLM with a trading key)."""
+
+    COMMANDS = (
+        ["observe", "--provider", "openai"],
+        ["observe", "--provider", "jev"],
+        ["bars"],
+        ["backfill", "--start", "2024-01-01", "--end", "2024-02-01", "--bars"],
+        ["autoresearch", "--development-until", "2024-01-01"],
+        ["propose", "--trial", "t", "--output", "o"],
+    )
+
+    def mixed(self, argv: list[str], provider: str) -> bool:
+        from jevtrader import app
+
+        keys = set(cli.keys_for(cli.parser().parse_args(argv), {"provider": provider}))
+        return bool(keys & set(app.ALPACA_KEYS)) and bool(keys & set(app.PROVIDER_KEYS.values()))
+
+    def test_no_single_command_mixes_alpaca_and_provider_keys(self):
+        for argv in self.COMMANDS:
+            for provider in ("jev", "openai", "local", "rules"):
+                with self.subTest(argv=argv, provider=provider):
+                    self.assertFalse(self.mixed(argv, provider))
+
+    @unittest.expectedFailure
+    def test_daemon_never_holds_alpaca_and_provider_keys_together(self):
+        # Known gap (ADR-0008 Context): the daemon fetches bars and calls the provider in one
+        # process. Strict: this starts passing, and so fails as unexpected, once bar fetching
+        # moves to its own child; then drop the decorator.
+        for provider in ("jev", "openai"):
+            self.assertFalse(self.mixed(["daemon"], provider), provider)
+
+
 class DoctorKeyTests(unittest.TestCase):
     def test_doctor_loads_only_the_configured_keys(self):
         from jevtrader import app

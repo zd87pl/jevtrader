@@ -73,7 +73,7 @@ of service, E elevation of privilege.
 
 | Id | STRIDE | Threat | Entry |
 | --- | --- | --- | --- |
-| T1 | T, E | A malicious filer hides instructions in `display:none`, `ix:hidden`, `<template>` or bidi text; the sanitizer keeps them (only E2's three tags are dropped) and a reader follows them. | E2, E3 |
+| T1 | T, E | A malicious filer hides instructions from the human reader but not from an LLM reader: CSS hiding the sanitizer does not recognise (CSS escapes, tiny but non-zero fonts, clipping, text coloured like a non-white background) or invisible characters outside its strip list, and a reader follows them. | E2, E3 |
 | T2 | T | Adversarial but in-range extraction values poison the ledger and the calibrator (audit §5.2). | E3 |
 | T3 | E | Prompt injection in a quoted excerpt reaches a host LLM that also holds a broker MCP server, and it places an order. | E7, E8 |
 | T4 | E, T | Autoresearch writes questions that become instruction text without human review. | E6, E3 |
@@ -90,7 +90,7 @@ of service, E elevation of privilege.
 
 | Threat | In place (cited) | Planned (issue) |
 | --- | --- | --- |
-| T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:34`) on collection, and again in the engine before any provider call for legacy ledger text | Done in #9; display surfaces still use their own filters (#12) |
+| T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:45-47`) on collection, and again in the engine before any provider call for legacy ledger text. `sanitize-v2` drops `display:none`, `visibility:hidden`, `font-size:0`, `opacity:0`, off-screen offsets and zero-height `overflow:hidden` after removing CSS comments (`jevtrader/security/sanitize.py:53-63`), and strips private-use, unassigned and default-ignorable characters (`jevtrader/security/sanitize.py:118-123`). Concealed body text and near-white text quarantine the filing; structural drops such as `head` or the iXBRL header do not (`jevtrader/security/quarantine.py:61-67`) | Done in #9 and #13 (red-team fix-ups RT-1 to RT-3); display surfaces still use their own filters (#12) |
 | T2 | Readers have no tools and return bounded numbers; adversarial-looking source text flags the extraction quarantined (`jevtrader/engine.py:192`), and a quarantined forecast never counts (`jevtrader/evidence.py:49`), trains (`jevtrader/engine.py:394`) or gets a paper plan (`jevtrader/paper.py:131`); red-team corpus in CI (`tests/redteam/cases.json`, `tests/test_redteam.py`) | Done in #13; paraphrased directives can still pass unflagged |
 | T3 | Directive sentences dropped from cards, matched on the confusable skeleton (`jevtrader/security/quarantine.py:24`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`); external-derived MCP fields wrapped with provenance (`jevtrader/mcp_server.py:50`); id arguments bounded and never echoed (`jevtrader/mcp_server.py:225`); co-installed broker warning in `docs/mcp.md` and the server instructions | Paraphrased directives; `/api/brief.json` fields still unlabelled (escaped in HTML only) |
 | T4 | Proposals pass validation and a question lint, and run only after human approval of the diff (`jevtrader/lab.py:197-209`) | Done in #10 |
@@ -116,6 +116,10 @@ Cross-platform storage for every mitigation above is #28; broker-key isolation i
   `os.environ`; trading keys move out of reach in Phase 5 (ADR-0008, #46).
 - **Legacy ledger text is unsanitized** and cannot be re-sanitized for hidden HTML, since no raw
   store exists (ADR-0001 D3, #9).
+- **Sanitizer residual (T1).** CSS escapes (`\64 isplay`), tiny non-zero fonts, `clip`,
+  stylesheet rules in `<style>` that hide a class, and text coloured like a dark background stay
+  in the text unflagged. Near-white text is kept (the background is unknown) but quarantines the
+  filing. Mitigations: the E2 sanitizer, quarantine, and the directive filter on quotes.
 - **The directive filter is best effort.** A paraphrased instruction can survive
   (`jevtrader/security/quarantine.py:24`); the host LLM remains the last line (#12).
 - **Co-installed broker MCP servers** are outside our control; we can only warn (#12).

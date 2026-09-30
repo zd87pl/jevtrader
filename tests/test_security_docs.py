@@ -22,7 +22,11 @@ ANCHORS = [
     (THREAT_MODEL, "jevtrader/cli.py:66-68", "USES_KEYS"),
     (THREAT_MODEL, "jevtrader/cli.py:574-576", "export_to_environ"),
     (THREAT_MODEL, "jevtrader/app.py:480-485", "export_to_environ"),
-    (THREAT_MODEL, "jevtrader/security/sanitize.py:34", '"head", "template", "ix:hidden"'),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:45-47", '"head", "template", "ix:hidden"'),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:53-63", "font-size"),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:118-123", '"Co", "Cn"'),
+    (THREAT_MODEL, "jevtrader/security/quarantine.py:61-67", "near-white text"),
+    (SECRETS_POLICY, "jevtrader/cli.py:84-86", "ALPACA_KEYS"),
     (THREAT_MODEL, "jevtrader/sec.py:177-196", "approved HTTPS URL"),
     (THREAT_MODEL, "jevtrader/providers.py:282-302", "instructions"),
     (THREAT_MODEL, "jevtrader/providers.py:411-419", "_questions_text(questions)"),
@@ -122,6 +126,24 @@ class SecurityDocTests(unittest.TestCase):
             self.assertRegex(text, rf"{issue}(?!\d)", issue)
         for actor in ("malicious filer", "prompt injection"):
             self.assertIn(actor, text.lower())
+
+    def test_t1_states_the_current_sanitizer_residual(self):
+        # RT-5: T1 must not claim the sanitizer keeps display:none or ix:hidden text.
+        text = THREAT_MODEL.read_text(encoding="utf-8")
+        t1 = next(line for line in text.splitlines() if line.startswith("| T1 | T, E |"))
+        self.assertNotIn("sanitizer keeps them", t1)
+        self.assertNotIn("three tags", t1)
+        self.assertIn("sanitize-v2", text)
+        self.assertIn("Sanitizer residual (T1)", text)
+
+    def test_alpaca_keys_are_classified_as_trading_capable(self):
+        # RT-4: ADR-0008 and the policy must not call the Alpaca keys market-data keys.
+        adr = (ROOT / "docs" / "adr" / "0008-trading-key-isolation.md").read_text(encoding="utf-8")
+        policy = SECRETS_POLICY.read_text(encoding="utf-8")
+        self.assertIn("The Alpaca keys are trading keys.", adr)
+        self.assertNotIn("provider and market-data keys", adr.lower())
+        self.assertIn("trading-capable", policy)
+        self.assertNotIn("Alpaca market data (paper account)", policy)
 
     def test_policy_forbids_every_leak_channel(self):
         text = SECRETS_POLICY.read_text(encoding="utf-8").lower()

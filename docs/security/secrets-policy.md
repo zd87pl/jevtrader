@@ -12,9 +12,13 @@ The only secrets are the four names in `KNOWN` (`jevtrader/secrets.py:23`):
 | --- | --- | --- |
 | `TYPESAFE_API_KEY` | JEV text provider | extraction commands |
 | `OPENAI_API_KEY` | OpenAI text provider | extraction commands |
-| `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY` | Alpaca market data (paper account) | bars, observe, daemon |
+| `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY` | Alpaca bars; paper-account keys, so **trading-capable** | bars, backfill `--bars`, daemon |
 
-Trading keys (Phase 5) are a separate inventory owned by the execution service (ADR-0001 D2).
+The Alpaca keys fetch bars, but they can probably place paper orders, so this policy treats them
+as trading keys (ADR-0008): they must never share an environment with a provider key in a
+process that calls an LLM. Known gap: the daemon holds both today (`jevtrader/cli.py:84-86`),
+pinned by a strict expected-failure guard test until bar fetching moves to its own child.
+Live trading keys (Phase 5) are a separate inventory owned by the execution service (ADR-0001 D2).
 The SEC contact is not a secret but is personal data; see [Owner identity](#owner-identity).
 
 ## Where each secret lives

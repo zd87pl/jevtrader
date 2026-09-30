@@ -114,6 +114,59 @@ class PromptChannelTests(unittest.TestCase):
         with self.assertRaises(providers.ProviderInputError):
             providers.prompt_template_hash("other")
 
+    def test_template_hash_tracks_every_template_component(self):
+        # Mutants 9 and 10: dropping a component from the hash must fail a test (P0-07).
+        from jevtrader import local
+
+        blocks = ["_BLOCK_OPEN", "_BLOCK_CLOSE", "_BLOCK_NOTE", "_BLOCK_SOURCE"]
+        components = {
+            "rules": [(providers, name) for name in ["_RULES_METHOD", "_POSITIVE", "_NEGATIVE"]],
+            "jev": [
+                (providers, name)
+                for name in [
+                    "_EVIDENCE_INSTRUCTIONS",
+                    "_JEV_DIRECTION_CRITERIA",
+                    "_JEV_NOUL_CRITERIA",
+                    *blocks,
+                ]
+            ],
+            "openai": [
+                (providers, name)
+                for name in [
+                    "_OPENAI_INSTRUCTIONS",
+                    "_FEATURE_SCHEMA",
+                    "MAX_OUTPUT_TOKENS",
+                    *blocks,
+                ]
+            ],
+            "local": [
+                *(
+                    (local, name)
+                    for name in [
+                        "_INSTRUCTIONS",
+                        "_RETRY_NOTE",
+                        "_FEATURE_SCHEMA",
+                        "_TEMPERATURE",
+                        "MAX_OUTPUT_TOKENS",
+                    ]
+                ),
+                *((providers, name) for name in blocks),
+            ],
+        }
+        self.assertEqual(set(components), set(providers.PROVIDERS))
+        for provider, items in components.items():
+            before = providers.prompt_template_hash(provider)
+            for module, name in items:
+                value = getattr(module, name)
+                changed = {"changed": value} if isinstance(value, dict) else [value, "changed"]
+                if isinstance(value, str):
+                    changed = value + " changed"
+                elif isinstance(value, (int, float)):
+                    changed = value + 1
+                with self.subTest(provider=provider, component=name):
+                    with patch.object(module, name, changed):
+                        self.assertNotEqual(providers.prompt_template_hash(provider), before)
+
     def test_template_hash_does_not_depend_on_the_questions(self):
         # Questions are already in the spec on their own; the hash pins only the template.
         before = providers.prompt_template_hash("local")

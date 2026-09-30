@@ -1,7 +1,7 @@
 """Quarantine for adversarial-looking source text (ADR-0001 §D3, #13).
 
-``assess`` flags a disclosure whose sanitizer diff shows hidden or stripped content, or whose
-text holds look-alike letters, a forged untrusted-block marker or directive-like sentences.
+``assess`` flags a disclosure whose sanitizer diff shows concealed, near-white or stripped
+content, or whose text holds look-alike letters, a forged marker or directive-like sentences.
 The flag is stored on the extraction and copied onto each forecast as ``quarantined``; a
 quarantined forecast never counts as evidence, never trains a calibrator and never gets a
 paper plan. Erring toward flagging only costs evidence volume, never safety.
@@ -56,10 +56,15 @@ def assess(text: str, diff: Mapping[str, Any] | None = None) -> Quarantine:
         raise TypeError("assess needs the disclosure text")
     reasons = []
     diff = diff if isinstance(diff, Mapping) else {}
-    if _count(diff, "hidden_elements") > 0:
+    # A sanitize-v2 diff keeps structural drops (head, script, the iXBRL header) apart from
+    # concealed body text; an older diff cannot tell them apart, so any drop counts.
+    concealed = "concealed_elements" in diff
+    if _count(diff, "concealed_elements" if concealed else "hidden_elements") > 0:
         reasons.append("hidden HTML elements removed")
-    if _count(diff, "hidden_chars") > 0:
+    if _count(diff, "concealed_chars" if concealed else "hidden_chars") > 0:
         reasons.append("hidden characters removed")
+    if _count(diff, "faint_elements") > 0:
+        reasons.append("near-white text")
     if diff.get("removed_chars") or sanitize_text(text) != text:
         reasons.append("format or control characters removed")
     if any(ch in _LOOKALIKES for ch in text.casefold()):

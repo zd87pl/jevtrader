@@ -33,8 +33,17 @@ Issue #46 already narrowed the exposure without changing the store:
 - Every child the package starts gets an allowlist environment with no keys
   (`jevtrader/security/childenv.py:16-31`).
 
-That is enough for provider and market-data keys, which the core needs. It is not enough for
-trading keys, because the core, its LLM hosts and any coding agent share one OS user.
+That is enough for provider keys, which the core needs. It is not enough for trading keys,
+because the core, its LLM hosts and any coding agent share one OS user.
+
+**The Alpaca keys are trading keys.** `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` fetch bars
+today, but they are paper-account keys and can probably place paper orders (threat model,
+Assets); Alpaca issues no data-only key. This ADR therefore treats them as trading-capable, not
+as market-data keys. Today they break rule 4 below in one place: `keys_for("daemon")`
+(`jevtrader/cli.py:84-86`) exports them together with the configured provider key, and the
+daemon fetches bars and calls the LLM provider in the same process. That is a known gap, pinned
+by a strict expected-failure guard test (`tests/test_child_env.py`), and it must close before any
+order code lands (Phase 5).
 
 ## Options
 
@@ -59,8 +68,11 @@ trading keys, because the core, its LLM hosts and any coding agent share one OS 
 4. **Common rules for every option:**
    - The core reaches the execution service only through a loopback or Unix-socket API that
      accepts pending tickets and approval tokens, never keys.
-   - Trading keys are never exported into any environment of the research user
-     (`keys_for` has no trading-key entry, and a guard test keeps it so in Phase 5).
+   - Trading keys, including the Alpaca paper keys, are never exported into the environment of
+     a process that hosts or calls an LLM (ADR-0001 D2). Until Phase 5 moves them to the
+     execution user, bar fetching must run in its own child with only the Alpaca keys, apart
+     from provider calls; a guard test asserts that no command's key set holds both an Alpaca key
+     and a provider key.
    - The execution service's children get the scrubbed environment
      (`jevtrader/security/childenv.py:16-31`).
    - Paper-only credentials follow the same path as live ones (ADR-0001 D2).
@@ -82,5 +94,7 @@ These stay with the owner; no agent runs them (CLAUDE.md hard rules, owner decis
   research core.
 - A coding agent running as the owner cannot read trading keys even if the Keychain ACL check
   fails, because they are not in the owner's store.
-- Provider and market-data keys remain readable by same-user processes; this ADR accepts that
-  residual risk and keeps it bounded by least-privilege export and scrubbed children.
+- Provider keys remain readable by same-user processes; this ADR accepts that residual risk and
+  keeps it bounded by least-privilege export and scrubbed children. The Alpaca keys get the same
+  bound until Phase 5, plus the split from provider calls above; until that split lands the
+  daemon holds both (the gap in Context).

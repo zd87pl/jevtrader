@@ -223,6 +223,46 @@ class RedTeamTests(unittest.TestCase):
                 self.assertNotIn(marker.casefold(), loose.casefold())
 
 
+class SanitizerDiffQuarantineTests(unittest.TestCase):
+    """RT-1, RT-2, RT-3: v2 diffs quarantine on concealed body text, not structural drops."""
+
+    def test_structural_drops_alone_do_not_quarantine(self):
+        diff = {
+            "hidden_elements": 5,
+            "hidden_chars": 400,
+            "concealed_elements": 0,
+            "concealed_chars": 0,
+            "structural_elements": 5,
+            "faint_elements": 0,
+            "removed_chars": {},
+        }
+        self.assertEqual(quarantine.assess("Plain text.", diff), {"flagged": False, "reasons": []})
+
+    def test_concealed_and_faint_text_quarantine(self):
+        diff = {"hidden_elements": 1, "concealed_elements": 1, "concealed_chars": 3}
+        self.assertEqual(
+            quarantine.assess("Plain text.", diff)["reasons"],
+            ["hidden HTML elements removed", "hidden characters removed"],
+        )
+        faint = {"hidden_elements": 0, "concealed_elements": 0, "faint_elements": 1}
+        self.assertEqual(quarantine.assess("Plain text.", faint)["reasons"], ["near-white text"])
+
+    def test_default_ignorable_characters_in_text_quarantine(self):
+        for invisible in ["\u034f", "\ufe0f", "\U000e0100", "\ue000", "\u2800"]:
+            with self.subTest(code=hex(ord(invisible))):
+                reasons = quarantine.assess(f"Revenue ro{invisible}se.")["reasons"]
+                self.assertIn("format or control characters removed", reasons)
+
+    def test_real_shaped_ixbrl_8k_is_not_quarantined(self):
+        from jevtrader.security.sanitize import sanitize_document
+        from tests.test_sanitize import IXBRL_8K
+
+        result = sanitize_document(IXBRL_8K.encode(), "abc-20260930.htm")
+        self.assertEqual(
+            quarantine.assess(result["text"], result["diff"]), {"flagged": False, "reasons": []}
+        )
+
+
 class _Relabelled:
     """A read-only view that makes every forecast a forward, evidence-labelled one, so only the
     quarantine and cost rules decide what counts (a forward event counts its first call)."""

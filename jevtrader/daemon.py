@@ -8,6 +8,7 @@ stops before a conservative estimate of this month's spend could exceed the conf
 from __future__ import annotations
 
 import fcntl
+import functools
 import math
 import os
 import re
@@ -96,6 +97,19 @@ def _stderr(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
+def observe_options(config: dict) -> dict:
+    """What the observation queue needs from config beyond provider and model."""
+    return {
+        "base_url": config["local_base_url"] if config["provider"] == "local" else None,
+        "overrides": config["model_overrides"],
+    }
+
+
+def _observe_from_config(*args: Any, **kwargs: Any) -> dict:
+    """Sentinel default: ``Context`` replaces it with a queue bound to its own config."""
+    raise AssertionError("Context.observe was not wired from config")
+
+
 @dataclass
 class Context:
     """Everything a job touches. Adapters are injectable; defaults are the real modules."""
@@ -106,7 +120,8 @@ class Context:
     clock: Callable[[], str] = utc_now
     poll: Callable[..., dict] = feeds.poll
     bars: Callable[..., dict] = market_bars.fetch_forward
-    observe: Callable[..., dict] = pipeline.observe_queue
+    # Built from ``config`` in __post_init__ (local base URL, declared overrides; P0-25).
+    observe: Callable[..., dict] = _observe_from_config
     settle: Callable[..., dict] = engine.settle
     brief: Callable[..., dict] = briefing.compose
     render: Callable[[dict], tuple[str, str]] = briefing.render_text
@@ -118,6 +133,8 @@ class Context:
     def __post_init__(self) -> None:
         self.config = settings.validate(self.config)
         validate_strategy(self.strategy)
+        if self.observe is _observe_from_config:
+            self.observe = functools.partial(pipeline.observe_queue, **observe_options(self.config))
 
 
 # ---------------------------------------------------------------- schedule (pure)
@@ -432,7 +449,10 @@ _HANDLERS: dict[str, Callable[[Context, str], tuple[dict, list]]] = {
 def _user_agent(ctx: Context) -> str:
     agent = ctx.config["sec_user_agent"]
     if not agent:
-        raise _Skip("sec_user_agent is not set; run setup with your name and email")
+        raise _Skip(
+            "sec_user_agent is not set; declare a contact for SEC with setup "
+            "(a dedicated alias is recommended)"
+        )
     return agent
 
 

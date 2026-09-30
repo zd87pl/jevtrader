@@ -89,7 +89,12 @@ def parser() -> argparse.ArgumentParser:
     collect.add_argument("--cik", required=True)
     collect.add_argument("--symbol", required=True)
     collect.add_argument("--limit", type=int, default=5)
-    collect.add_argument("--user-agent", default=os.environ.get("SEC_USER_AGENT", ""))
+    collect.add_argument(
+        "--user-agent",
+        default=None,
+        help="Deprecated: argv is visible to other processes; declare the contact for SEC "
+        "in config with `setup` (or SEC_USER_AGENT)",
+    )
     observations = commands.add_parser(
         "observe", help="Record frozen features and optional calibrated decisions"
     )
@@ -284,7 +289,7 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
         return {"added": import_bars(ledger, args.file, mode=args.mode)}
     if command == "collect":
         records = collect_disclosures(
-            args.cik, args.symbol, user_agent=args.user_agent, limit=args.limit
+            args.cik, args.symbol, user_agent=_sec_contact(args.user_agent), limit=args.limit
         )
         return {
             "collected": len(records),
@@ -484,6 +489,20 @@ def _exit_code(command: str, result: dict) -> int:
     if command in ("doctor", "verify"):
         return 0 if result.get("ok") else 1
     return 1 if result.get("errors") else 0
+
+
+def _sec_contact(flag: str | None) -> str:
+    """The declared contact for SEC: config first, then SEC_USER_AGENT. There is no default.
+    ``--user-agent`` still works but is deprecated, because argv is visible to other
+    processes (``ps``)."""
+    if flag is not None:
+        print(
+            "jevtrader: --user-agent is deprecated (argv is visible to other processes); "
+            "declare the contact for SEC in config with `jevtrader setup` instead",
+            file=sys.stderr,
+        )
+        return flag
+    return settings.load()["sec_user_agent"] or os.environ.get("SEC_USER_AGENT", "")
 
 
 def main(argv: list[str] | None = None) -> int:

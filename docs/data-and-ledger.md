@@ -61,15 +61,15 @@ python -m jevtrader --db data/research.sqlite import-disclosures disclosures.jso
 
 ## Collecting from SEC
 
-For public SEC data, provide your real contact-bearing User-Agent; no SEC API key is needed. `collect` needs an existing ledger, so create one first:
+For public SEC data, declare a contact for SEC; no SEC API key is needed. Use a dedicated alias that reaches you, not your personal name or address. `collect` reads it from `config.json` (set it with `jevtrader setup`), or from `SEC_USER_AGENT` when the config has none. There is no default. `collect` needs an existing ledger, so create one first:
 
 ```sh
-export SEC_USER_AGENT='Your Name your-real-contact@your-domain.com'
+export SEC_USER_AGENT='jevtrader sec-alias@your-domain.example'   # or set it in config via setup
 python -m jevtrader --db data/forward.sqlite init
 python -m jevtrader --db data/forward.sqlite collect --cik 0000320193 --symbol AAPL --limit 5
 ```
 
-`--limit` (1 to 20) caps how many qualifying filings are collected from the company's recent submissions. Many companies rarely file under Items 7.01 or 8.01, so a run can collect few filings or none. You can pass `--user-agent "Name email"` instead of the environment variable. Collected filings are `forward` disclosures stamped with the time you collected them; they have no decision until you run `observe`, and cannot be scored until the ledger has bars for the symbol and benchmark.
+`--limit` (1 to 20) caps how many qualifying filings are collected from the company's recent submissions. Many companies rarely file under Items 7.01 or 8.01, so a run can collect few filings or none. The `--user-agent` option is deprecated and prints a warning: command-line arguments are visible to other processes (`ps`), so keep the contact in config. Collected filings are `forward` disclosures stamped with the time you collected them; they have no decision until you run `observe`, and cannot be scored until the ledger has bars for the symbol and benchmark.
 
 Collection accepts 8-K/8-K/A filings listing 7.01 or 8.01 while excluding Item 2.02. It prefers one EX-99 HTML/text exhibit and marks primary-document fallbacks. Filename/link heuristics cannot guarantee an exhibit's type or that content is non-earnings. Unknown item metadata is excluded; PDFs and complete attachment coverage are unsupported. Requests are bounded and rate-limited (at most five requests a second); external links and redirects are not followed.
 

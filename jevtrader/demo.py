@@ -17,7 +17,8 @@ def run_demo(ledger) -> dict:
         raise ValueError("Demo requires a new, empty ledger; existing records were preserved")
     strategy = load_strategy()
     rng = random.Random(17)
-    sessions, day = [], datetime(2022, 1, 3, tzinfo=timezone.utc)
+    sessions: list[datetime] = []
+    day = datetime(2022, 1, 3, tzinfo=timezone.utc)
     while len(sessions) < 360:
         if day.weekday() < 5:
             sessions.append(day)

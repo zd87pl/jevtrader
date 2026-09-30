@@ -161,5 +161,126 @@ class PaperPlanTests(unittest.TestCase):
         self.assertTrue(any("not a guaranteed" in note for note in plan["notes"]))
 
 
+class PaperRefusalTests(unittest.TestCase):
+    """One case per refusal branch of ``plan_order``, each pinned by its own reason (P0-20)."""
+
+    def refused(self, signal, strategy=None, **kwargs):
+        kwargs.setdefault("equity", 3000)
+        plan = plan_order(signal, strategy or {}, **kwargs)
+        self.assertEqual(plan["action"], "PASS")
+        self.assertEqual(plan["quantity"], 0)
+        self.assertIsNone(plan["stop_price"])
+        return plan["reasons"]
+
+    def planned(self, signal, strategy=None, **kwargs):
+        kwargs.setdefault("equity", 3000)
+        plan = plan_order(signal, strategy or {}, **kwargs)
+        self.assertGreater(plan["quantity"], 0, plan["reasons"])
+        return plan
+
+    def test_drawdown_pause(self):
+        reasons = self.refused(forecast(), equity=2760, peak_equity=3000)
+        self.assertEqual(reasons, ["Portfolio drawdown reached the pause threshold."])
+
+    def test_existing_position_in_the_symbol(self):
+        held = [{"symbol": "TEST", "side": "LONG", "quantity": 1, "price": 50}]
+        reasons = self.refused(forecast(), positions=held)
+        self.assertEqual(reasons, ["A position in this symbol already exists."])
+
+    def test_maximum_position_count(self):
+        held = [
+            {"symbol": name, "side": "LONG", "quantity": 1, "price": 50}
+            for name in ("AAA", "BBB", "CCC", "DDD")
+        ]
+        self.assertEqual(
+            self.refused(forecast(), positions=held), ["Maximum position count reached."]
+        )
+        self.planned(forecast(), positions=held[:3])
+
+    def test_existing_short_exposure_above_the_maximum(self):
+        # max_short_fraction 0.25 of 3000 equity is 750; the rule refuses only above it.
+        over = [{"symbol": "OTHER", "side": "SHORT", "quantity": 16, "price": 50}]
+        reasons = self.refused(forecast(), positions=over)
+        self.assertEqual(reasons, ["Existing short exposure exceeds the configured maximum."])
+        at = [{"symbol": "OTHER", "side": "SHORT", "quantity": 15, "price": 50}]
+        self.planned(forecast(), positions=at, cash=3000)
+
+    def test_price_below_minimum(self):
+        self.assertEqual(
+            self.refused(forecast(price=4.99)), ["Price is below the configured minimum."]
+        )
+        self.planned(forecast(price=5.0))
+
+    def test_dollar_volume_below_minimum(self):
+        signal = forecast()
+        signal["market"]["dollar_volume"] = 4_999_999.0
+        reasons = self.refused(signal)
+        self.assertEqual(reasons, ["Dollar volume is below the configured liquidity minimum."])
+        signal["market"]["dollar_volume"] = 5_000_000.0
+        self.planned(signal)
+
+    def test_semantic_uncertainty_above_maximum(self):
+        signal = forecast()
+        signal["features"][3] = 0.61
+        reasons = self.refused(signal)
+        self.assertEqual(reasons, ["Semantic uncertainty exceeds the configured maximum."])
+        signal["features"][3] = 0.6
+        self.planned(signal)
+
+    def test_short_disabled_by_the_strategy(self):
+        reasons = self.refused(forecast("SHORT"), shortable=True)
+        self.assertEqual(reasons, ["Shorts are disabled by the strategy."])
+
+    def test_short_availability_not_confirmed(self):
+        reasons = self.refused(forecast("SHORT"), {"allow_short": True})
+        self.assertEqual(reasons, ["Short availability was not explicitly confirmed."])
+
+    def test_missing_expected_return(self):
+        signal = forecast()
+        signal["expected_return"] = None
+        self.assertEqual(self.refused(signal), ["No numerical expected return is available."])
+
+    def test_expected_return_against_the_requested_direction(self):
+        message = ["Expected return does not support the requested direction."]
+        short = {"allow_short": True}
+        for action, value, strategy in (
+            ("LONG", 0.0, {}),
+            ("LONG", -0.03, {}),
+            ("SHORT", 0.0, short),
+            ("SHORT", 0.03, short),
+        ):
+            with self.subTest(action=action, value=value):
+                signal = forecast(action)
+                signal["expected_return"] = value
+                self.assertEqual(self.refused(signal, strategy, shortable=True), message)
+
+    def test_spread_and_slippage_that_consume_the_price_raise(self):
+        # A configured spread of 200% (no upper bound in the strategy) leaves no entry price.
+        with self.assertRaisesRegex(ValueError, "invalid entry price"):
+            plan_order(forecast(), {"spread_bps": 20_000.0}, equity=3000)
+
+    def test_stop_distance_too_large(self):
+        signal = forecast()
+        signal["features"][6] = 0.5  # stop_volatility_multiple 2.0 x 0.5 = the whole price.
+        self.assertEqual(
+            self.refused(signal), ["Stop distance is too large for this paper policy."]
+        )
+        signal["features"][6] = 0.4999
+        reasons = plan_order(signal, {}, equity=3000)["reasons"]
+        self.assertNotIn("Stop distance is too large for this paper policy.", reasons)
+
+    def test_insufficient_whole_share_capacity_names_the_binding_limit(self):
+        reasons = self.refused(forecast(), cash=50)
+        self.assertEqual(reasons, ["Insufficient whole-share capacity under cash reserve."])
+
+    def test_expected_edge_below_costs_plus_minimum_edge(self):
+        signal = forecast()
+        signal["expected_return"] = 0.003
+        reasons = self.refused(signal)
+        self.assertEqual(
+            reasons, ["Expected edge does not cover full costs plus the minimum edge requirement."]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,8 +6,10 @@ event decided forward uses only its forward forecasts (the first LONG/SHORT call
 else the first recorded forecast): a replay, recorded when the outcome may already be known,
 never replaces a forward observation. An event with replays only uses its first recorded
 replay, so re-scoring cannot swap in a better call. A call is scored only once its label was
-available by ``as_of``. The gate is fixed and fingerprinted so a reader can tell if
-thresholds moved.
+available by ``as_of``. A decision frozen with costs below the documented cost floor
+(``common.COST_FLOOR``, ADR-0002) never counts, and the floor applies after each event's
+decision is chosen, so a sub-floor call is never replaced by a later forecast. The gate is
+fixed and fingerprinted so a reader can tell if thresholds moved.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from collections.abc import Callable
 from datetime import datetime
 from statistics import fmean, stdev
 
-from .common import EASTERN, digest, instant, round_trip_bps, timestamp
+from .common import EASTERN, digest, instant, meets_cost_floor, round_trip_bps, timestamp
 from .registry import counts_as_evidence
 
 GATE = {"version": 1, "min_matured_calls": 100, "confidence": 0.90, "futility_upper_bps": 10.0}
@@ -31,11 +33,17 @@ METHOD = (
 )
 ELIGIBILITY_RULE = (
     "registry evidence labels (forward, post_cutoff, no_model_knowledge); unlabelled "
-    "forecasts count only in forward mode; synthetic never counts"
+    "forecasts count only in forward mode; synthetic never counts; a decision frozen with "
+    "costs below the documented cost floor never counts"
 )
 
 
 def is_evidence(forecast: dict) -> bool:
+    """An evidence label and frozen costs at or above the cost floor (R2, invariant I-2)."""
+    return _labelled(forecast) and meets_cost_floor(forecast.get("strategy"))
+
+
+def _labelled(forecast: dict) -> bool:
     if forecast.get("mode") == "synthetic":
         return False
     if "eligibility" in forecast:
@@ -57,10 +65,13 @@ def label_available_at(outcome: dict) -> datetime:
 
 
 def net_return(forecast: dict, outcome: dict) -> float | None:
-    """Benchmark-relative return after round-trip cost for a call; None for WATCH/PASS."""
+    """Benchmark-relative return after round-trip cost for a call; None for WATCH/PASS and
+    for a call whose frozen costs are below the cost floor, which has no net-of-cost return."""
     action = forecast.get("action")
     sign = CALL_SIGNS.get(action) if isinstance(action, str) else None
-    return None if sign is None else _net(forecast, outcome, sign)
+    if sign is None or not meets_cost_floor(forecast.get("strategy")):
+        return None
+    return _net(forecast, outcome, sign)
 
 
 def _net(forecast: dict, outcome: dict, sign: int) -> float:
@@ -207,14 +218,17 @@ def scoreboard(ledger, *, as_of: str, eligible: Callable[[dict], bool] | None = 
         raise ValueError("eligible must be a callable taking a forecast")
     gate = copy.deepcopy(GATE)
     visible = [f for f in ledger.all("forecasts") if instant(f["decision_at"]) <= boundary]
-    evidence = [f for f in visible if is_evidence(f) and (eligible is None or eligible(f))]
+    labelled = [f for f in visible if _labelled(f) and (eligible is None or eligible(f))]
+    evidence = [f for f in labelled if meets_cost_floor(f.get("strategy"))]
     counts = {action: 0 for action in ACTIONS}
     counts["other"] = 0
     by_date: dict[str, list[float]] = {}
     nets: list[float] = []
     targets: list[float] = []
     pending = 0
-    chosen = decisions(evidence)
+    # Choose each event's decision first, then apply the floor: dropping a sub-floor call
+    # must never promote a later forecast of the same event (R2, ADR-0002).
+    chosen = [f for f in decisions(labelled) if meets_cost_floor(f.get("strategy"))]
     for forecast in chosen:
         action = forecast.get("action")
         counts[action if action in ACTIONS else "other"] += 1

@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 from jevtrader import engine, registry
-from jevtrader.common import digest, load_strategy, timestamp
+from jevtrader.common import digest, load_strategy, round_trip_bps, timestamp
 from jevtrader.market import normalize_bar, outcome
 from jevtrader.providers import (
     MissingCredentials,
@@ -485,7 +485,7 @@ class EngineTests(unittest.TestCase):
         paid = {"provider": "jev", "model": "jev-1.13.0"}
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("jevtrader.providers._post_json") as post,
+            patch("jevtrader.providers.post_json") as post,
             self.assertRaises(MissingCredentials),
         ):
             self.observe(**paid)
@@ -493,7 +493,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.ledger.all("attempts"), [])
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json", side_effect=ProviderError("HTTP error 500")),
+            patch("jevtrader.providers.post_json", side_effect=ProviderError("HTTP error 500")),
             self.assertRaises(ProviderError),
         ):
             self.observe(**paid)
@@ -521,7 +521,7 @@ class EngineTests(unittest.TestCase):
             with (
                 self.subTest(provider),
                 patch.dict("os.environ", {"TYPESAFE_API_KEY": "test", "OPENAI_API_KEY": "test"}),
-                patch("jevtrader.providers._post_json", return_value=response),
+                patch("jevtrader.providers.post_json", return_value=response),
             ):
                 self.event(provider, index=20 + index)
                 with self.assertRaises(error):
@@ -598,6 +598,87 @@ class EngineTests(unittest.TestCase):
         scored = self.observe("fresh", index=37, calibrator_id=first["model_id"])
         self.assertIsInstance(scored["expected_return"], float)
         self.assertNotEqual(scored["action"], "WATCH")
+
+
+BP = 0.0001
+# Default costs (default_strategy.json): 10 bps spread + 2 x 5 bps slippage + 20 bps edge.
+LONG_THRESHOLD = 0.0040
+# Shorts add 300 bps a year of borrow over the 10-session horizon: 40 + 3000/252 = 51.9 bps.
+SHORT_THRESHOLD = (40 + 300 * 10 / 252) / 10_000
+BELOW_THRESHOLD = "predicted excess return does not clear cost and edge threshold"
+
+
+class DecisionThresholdTests(unittest.TestCase):
+    """Pins the LONG/SHORT rule (engine.observe) for the unmodified default strategy (P0-20)."""
+
+    # Reuse the fixture helpers without inheriting (and re-running) every EngineTests test.
+    at = EngineTests.at
+    populate = EngineTests.populate
+    event = EngineTests.event
+    observe = EngineTests.observe
+    calibrator = EngineTests.calibrator
+
+    def setUp(self):
+        self.ledger = Ledger(":memory:")
+        self.addCleanup(self.ledger.db.close)
+        self.strategy = load_strategy()  # Default horizon (10 sessions) and costs.
+        self.days = sessions()
+
+    def decide(self, *expected_returns):
+        """Forecasts for one event scored by constant calibrators predicting each value."""
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        key = self.observe()["extractor_key"]
+        results = []
+        for index, value in enumerate(expected_returns):
+            model_id = self.calibrator(key, identity=f"constant-{index}", intercept=value)
+            forecast = self.observe(calibrator_id=model_id)
+            self.assertEqual(forecast["expected_return"], value)
+            results.append(forecast)
+        return results
+
+    def test_thresholds_are_pinned_to_the_default_costs(self):
+        self.assertEqual(self.strategy["horizon_sessions"], 10)
+        self.assertFalse(self.strategy["allow_short"])
+        long_bps = round_trip_bps(self.strategy) + self.strategy["min_edge_bps"]
+        short_bps = round_trip_bps(self.strategy, short=True) + self.strategy["min_edge_bps"]
+        self.assertEqual(long_bps / 10_000, LONG_THRESHOLD)
+        self.assertAlmostEqual(short_bps / 10_000, SHORT_THRESHOLD, places=15)
+        self.assertAlmostEqual(SHORT_THRESHOLD * 10_000, 51.9, places=1)
+
+    def test_fixture_event_clears_every_other_gate(self):
+        (forecast,) = self.decide(0.0)
+        self.assertEqual(forecast["action"], "PASS")
+        self.assertEqual(forecast["reasons"], [BELOW_THRESHOLD])
+
+    def test_long_needs_more_than_40_bps(self):
+        above, at, below = self.decide(LONG_THRESHOLD + BP, LONG_THRESHOLD, LONG_THRESHOLD - BP)
+        self.assertEqual(above["action"], "LONG")
+        self.assertEqual(above["reasons"], [])
+        for forecast in (at, below):
+            self.assertEqual(forecast["action"], "PASS")
+            self.assertEqual(forecast["reasons"], [BELOW_THRESHOLD])
+
+    def test_short_needs_more_than_51_9_bps_below_zero(self):
+        self.strategy["allow_short"] = True
+        above, below = self.decide(-(SHORT_THRESHOLD + BP), -(SHORT_THRESHOLD - BP))
+        self.assertEqual(above["action"], "SHORT")
+        self.assertEqual(above["reasons"], [])
+        self.assertEqual(below["action"], "PASS")
+        self.assertEqual(below["reasons"], [BELOW_THRESHOLD])
+
+    def test_short_threshold_is_not_the_long_threshold(self):
+        # Between -51.9 and -40 bps a short does not clear its borrow-inclusive threshold.
+        self.strategy["allow_short"] = True
+        (forecast,) = self.decide(-(LONG_THRESHOLD + BP))
+        self.assertEqual(forecast["action"], "PASS")
+        self.assertEqual(forecast["reasons"], [BELOW_THRESHOLD])
+
+    def test_short_is_refused_when_the_strategy_disallows_it(self):
+        (forecast,) = self.decide(-(SHORT_THRESHOLD + 10 * BP))
+        self.assertEqual(forecast["action"], "PASS")
+        self.assertEqual(forecast["reasons"], [BELOW_THRESHOLD])
 
 
 if __name__ == "__main__":

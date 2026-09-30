@@ -816,7 +816,7 @@ class LabTests(unittest.TestCase):
             "usage": {"input_tokens": 10},
         }
         with (
-            patch("jevtrader.providers._post_json", return_value=response) as post,
+            patch("jevtrader.providers.post_json", return_value=response) as post,
             self.assertRaisesRegex(ProposalRejected, "novelty.*proposal-slot:0"),
         ):
             generate_proposal(self.ledger, trial, "proposal-model")

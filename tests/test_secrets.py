@@ -10,7 +10,7 @@ from jevtrader import secrets
 
 VALUE = "sk-test_Value.123+/="
 CLEAN = {name: "" for name in secrets.KNOWN}
-DEFAULT_RUN = secrets._run  # Captured before setUp replaces it with a guard.
+DEFAULT_RUN = secrets.run  # Captured before setUp replaces it with a guard.
 
 
 class FakeKeychain:
@@ -50,7 +50,7 @@ class SecretsTests(unittest.TestCase):
         for name in secrets.KNOWN:
             os.environ.pop(name, None)
         # A missing runner must never reach the real Keychain from a test.
-        guard = patch.object(secrets, "_run", side_effect=AssertionError("real security call"))
+        guard = patch.object(secrets, "run", side_effect=AssertionError("real security call"))
         guard.start()
         self.addCleanup(guard.stop)
 
@@ -163,7 +163,7 @@ class SecretsTests(unittest.TestCase):
         )
 
     def test_without_a_keychain_reads_use_only_the_environment(self):
-        with patch.object(secrets, "_keychain_available", return_value=False):
+        with patch.object(secrets, "keychain_available", return_value=False):
             self.assertIsNone(secrets.get("OPENAI_API_KEY"))
             self.assertEqual(secrets.export_to_environ(), [])
             with self.assertRaisesRegex(ValueError, "export OPENAI_API_KEY"):

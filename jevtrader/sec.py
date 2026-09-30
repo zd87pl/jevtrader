@@ -65,7 +65,7 @@ class FilingNotFound(SECError):
     """The accession is absent from the company's recent submissions (not yet indexed or older)."""
 
 
-def _utc_now() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -118,7 +118,7 @@ def _daily_index_path(match: re.Match[str]) -> bool:
     return parsed.year == year and (parsed.month - 1) // 3 + 1 == quarter
 
 
-def _validate_url(url: str) -> None:
+def validate_url(url: str) -> None:
     # urlsplit silently drops tabs and newlines, so reject every non-printable byte first.
     if not isinstance(url, str) or any(not 33 <= ord(char) <= 126 for char in url):
         raise SECError("SEC requests require an approved HTTPS URL")
@@ -152,7 +152,7 @@ class _NoRedirects(HTTPRedirectHandler):
         raise SECError("SEC redirects are not followed")
 
 
-def _transport(request: Request, *, timeout: float):
+def urlopen(request: Request, *, timeout: float):
     return build_opener(_NoRedirects()).open(request, timeout=timeout)
 
 
@@ -198,16 +198,18 @@ class _SECClient:
             or "\n" in user_agent
             or not _EMAIL.search(user_agent)
         ):
-            raise SECError("Provide an explicit SEC User-Agent containing your contact email")
+            raise SECError(
+                "Declare a contact for SEC with an email address (an alias is recommended)"
+            )
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= 60:
             raise SECError("timeout must be between 0 and 60 seconds")
         self.user_agent = user_agent
         self.timeout = timeout
         self.max_requests = max_requests
-        self.transport = transport or _transport
+        self.transport = transport or urlopen
         self.clock = clock or time.monotonic
         self.sleep = sleep or time.sleep
-        self.now = now or _utc_now
+        self.now = now or utc_now
         self.requests = 0
         self.limiter = (
             _DEFAULT_LIMITER
@@ -216,7 +218,7 @@ class _SECClient:
         )
 
     def get(self, url: str, *, max_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
-        _validate_url(url)
+        validate_url(url)
         if self.requests >= self.max_requests:
             raise SECError("SEC request budget exhausted")
         self.limiter.acquire()
@@ -229,7 +231,7 @@ class _SECClient:
             },
         )
         with self.transport(request, timeout=self.timeout) as response:
-            _validate_url(response.geturl())
+            validate_url(response.geturl())
             payload = response.read(max_bytes + 1)
         if len(payload) > max_bytes:
             raise SECError("SEC response exceeds maximum byte size")
@@ -367,7 +369,7 @@ def _cover_exhibit(links: list[tuple[str, str]], base: str, primary: str) -> str
         if name == primary or not _DOCUMENT.fullmatch(name):
             continue
         try:
-            _validate_url(url)
+            validate_url(url)
         except (SECError, ValueError):
             continue
         candidates.append(name)
@@ -577,3 +579,10 @@ def collect_disclosures(
         if len(records) >= limit:
             break
     return records
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_transport = urlopen
+_validate_url = validate_url
+_utc_now = utc_now

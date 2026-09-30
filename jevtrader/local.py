@@ -70,7 +70,7 @@ class EngineUnreachable(ProviderError):
     """No usable answer arrived from the loopback address (refused, reset or timed out)."""
 
 
-def _base_url(value: object) -> str:
+def normalize_base_url(value: object) -> str:
     text = value.strip() if isinstance(value, str) else ""
     try:
         parts = urlsplit(text)
@@ -138,9 +138,9 @@ def _inputs(model: object, current: object, previous: object, questions: object)
         raise ProviderInputError(str(exc)) from None
 
 
-def _http_json(url: str, payload: dict | None, _key: str, timeout: float) -> dict:
+def http_json(url: str, payload: dict | None, _key: str, timeout: float) -> dict:
     """Default transport: GET when payload is None, else POST JSON. Never sends a key."""
-    url = _base_url(url)
+    url = normalize_base_url(url)
     data = None if payload is None else _json_text(payload).encode("utf-8")
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -174,7 +174,7 @@ def _call(
     transport: Callable[..., dict] | None, url: str, payload: dict | None, timeout: float
 ) -> dict:
     try:
-        raw = (transport or _http_json)(url, payload, "", timeout)
+        raw = (transport or http_json)(url, payload, "", timeout)
     except ProviderError:
         raise
     except urllib.error.HTTPError as error:
@@ -278,7 +278,7 @@ def extract(
         wait = _timeout(timeout)
     except ProviderValidationError as exc:
         raise ProviderInputError(str(exc)) from None
-    url = f"{_base_url(base_url)}/chat/completions"
+    url = f"{normalize_base_url(base_url)}/chat/completions"
     problem = ""
     for attempt in range(2):
         request = _payload(model, current, previous, questions)
@@ -318,7 +318,7 @@ def health_check(
     tiny structured probe through ``extract``. Only invalid arguments raise
     (``ProviderInputError``); every engine problem is reported in the result.
     """
-    base = _base_url(base_url)
+    base = normalize_base_url(base_url)
     try:
         _model(model)
         wait = _timeout(timeout)
@@ -375,3 +375,9 @@ def health_check(
     report["latency_ms"] = max(0, round((time.monotonic() - started) * 1000))
     report["detail"] = detail or f"{model} answered a structured probe in {report['latency_ms']} ms"
     return report
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_http_json = http_json
+_base_url = normalize_base_url

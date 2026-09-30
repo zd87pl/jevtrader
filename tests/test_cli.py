@@ -240,7 +240,7 @@ class CLITests(unittest.TestCase):
             ledger.disclosure(historical_event("valid", days[25]))
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json", return_value=jev_response()) as post,
+            patch("jevtrader.providers.post_json", return_value=jev_response()) as post,
         ):
             code, result, error = self.command(
                 "observe", "--replay", "--provider", "jev", "--limit", "1"
@@ -344,7 +344,7 @@ class CLITests(unittest.TestCase):
         responses = [ProviderError("Provider HTTP error 500"), jev_response(), jev_response()]
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json", side_effect=responses) as post,
+            patch("jevtrader.providers.post_json", side_effect=responses) as post,
         ):
             code, result, error = self.command(*paid)
             self.assertEqual(code, 1, error)
@@ -381,7 +381,7 @@ class CLITests(unittest.TestCase):
         path = Path(self.temp.name) / "renamed.json"
         path.write_text(json.dumps(renamed))
         paid = ["observe", "--replay", "--provider", "jev"]
-        with patch("jevtrader.providers._post_json", return_value=jev_response()) as post:
+        with patch("jevtrader.providers.post_json", return_value=jev_response()) as post:
             with patch.dict("os.environ", {}, clear=True):
                 code, result, error = self.command(*paid)
             self.assertEqual(code, 2, error)
@@ -416,7 +416,7 @@ class CLITests(unittest.TestCase):
         responses = [ProviderError("Provider HTTP error 500"), *[jev_response()] * 3]
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
-            patch("jevtrader.providers._post_json", side_effect=responses) as post,
+            patch("jevtrader.providers.post_json", side_effect=responses) as post,
         ):
             self.assertEqual(self.command(*paid)[0], 1)
             for label, args in (
@@ -453,7 +453,7 @@ class CLITests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"TYPESAFE_API_KEY": "test-secret"}),
             patch(
-                "jevtrader.providers._post_json", side_effect=[KeyboardInterrupt, jev_response()]
+                "jevtrader.providers.post_json", side_effect=[KeyboardInterrupt, jev_response()]
             ) as post,
         ):
             with self.assertRaises(KeyboardInterrupt):

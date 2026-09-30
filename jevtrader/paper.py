@@ -197,6 +197,8 @@ def plan_order(
         binding = [name for name, capacity in capacities.items() if capacity < 1]
         reasons.append("Insufficient whole-share capacity under " + ", ".join(binding) + ".")
         return result
+    # Narrowing only: a None expected return already returned through `reasons`.
+    assert expected_return is not None
     total_cost = quantity * flat_cost_per_share + commission
     expected_pnl = quantity * price * abs(expected_return)
     required_edge = quantity * price * settings["min_edge_bps"] / 10000

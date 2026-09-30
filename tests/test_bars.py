@@ -24,7 +24,7 @@ ET = ZoneInfo("America/New_York")
 KEY_VALUE = "PKTESTKEYID0000000001"
 SECRET_VALUE = "TestSecretValue00000000000000000000002"
 KEYS = {"ALPACA_API_KEY_ID": KEY_VALUE, "ALPACA_API_SECRET_KEY": SECRET_VALUE}
-DEFAULT_URLOPEN = bars._urlopen  # Captured before setUp replaces it with a guard.
+DEFAULT_URLOPEN = bars.urlopen  # Captured before setUp replaces it with a guard.
 HOLIDAYS = frozenset({date(2026, 2, 16)})  # Fixture calendar only.
 NOW = "2026-03-13T20:20:00Z"  # 16:20 EDT on a Friday, 20 minutes after the close.
 RECEIPT = "2026-03-13T20:30:00.000000Z"
@@ -237,7 +237,7 @@ class AlpacaTestCase(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         # A missing transport must never reach the network from a test.
-        guard = patch.object(bars, "_urlopen", side_effect=AssertionError("real network call"))
+        guard = patch.object(bars, "urlopen", side_effect=AssertionError("real network call"))
         guard.start()
         self.addCleanup(guard.stop)
         self.sleeps = []
@@ -293,10 +293,10 @@ class UrlAllowlistTests(unittest.TestCase):
         return f"https://{host}{path}?{urlencode(params)}"
 
     def test_approved_routes(self):
-        bars._validate_url(self.url(self.BARS))
-        bars._validate_url(self.url({**self.BARS, "page_token": "QUFQTHxEfDIw+/Mi0wMQ=="}))
-        bars._validate_url(self.url(self.ACTIONS, path="/v1/corporate-actions"))
-        bars._validate_url(
+        bars.validate_url(self.url(self.BARS))
+        bars.validate_url(self.url({**self.BARS, "page_token": "QUFQTHxEfDIw+/Mi0wMQ=="}))
+        bars.validate_url(self.url(self.ACTIONS, path="/v1/corporate-actions"))
+        bars.validate_url(
             self.url(
                 {"start": "2026-01-01", "end": "2026-03-13"},
                 host="paper-api.alpaca.markets",
@@ -321,7 +321,7 @@ class UrlAllowlistTests(unittest.TestCase):
             "https://data.alpaca.markets:bad/v2/stocks/bars",
         ):
             with self.subTest(url=url), self.assertRaises(bars.BarsError):
-                bars._validate_url(url)
+                bars.validate_url(url)
 
     def test_rejects_unapproved_parameters(self):
         cases = [
@@ -341,14 +341,14 @@ class UrlAllowlistTests(unittest.TestCase):
         ]
         for params in cases:
             with self.subTest(params=params), self.assertRaises(bars.BarsError):
-                bars._validate_url(self.url(params))
+                bars.validate_url(self.url(params))
         with self.assertRaises(bars.BarsError):
-            bars._validate_url(self.url(self.BARS) + "&feed=sip")  # Duplicate parameter.
+            bars.validate_url(self.url(self.BARS) + "&feed=sip")  # Duplicate parameter.
         with self.assertRaises(bars.BarsError):
             actions = {**self.ACTIONS, "types": "forward_split,spin_off"}
-            bars._validate_url(self.url(actions, path="/v1/corporate-actions"))
+            bars.validate_url(self.url(actions, path="/v1/corporate-actions"))
         with self.assertRaises(bars.BarsError):
-            bars._validate_url(
+            bars.validate_url(
                 self.url(
                     {"start": "2026-01-01T00:00:00Z", "end": "2026-03-13"},
                     host="paper-api.alpaca.markets",
@@ -358,7 +358,7 @@ class UrlAllowlistTests(unittest.TestCase):
 
     def test_one_hundred_symbols_fit_one_request(self):
         symbols = ",".join(f"S{index:03d}" for index in range(100))
-        bars._validate_url(self.url({**self.BARS, "symbols": symbols}))
+        bars.validate_url(self.url({**self.BARS, "symbols": symbols}))
 
 
 class TransportTests(AlpacaTestCase):
@@ -374,7 +374,7 @@ class TransportTests(AlpacaTestCase):
             self.assertTrue(headers["User-Agent"].startswith(f"{paths.APP_NAME}/"))
             self.assertEqual(call["timeout"], bars.REQUEST_TIMEOUT)
             self.assertNoSecrets(call["url"])
-            bars._validate_url(call["url"])
+            bars.validate_url(call["url"])
         hosts = [urlsplit(call["url"]).netloc for call in fake.calls]
         self.assertEqual(
             hosts, ["paper-api.alpaca.markets", "data.alpaca.markets", "data.alpaca.markets"]
@@ -547,7 +547,7 @@ class DefaultTransportTests(AlpacaTestCase):
             json.dumps([{"date": "2026-03-02", "open": "09:30", "close": "16:00"}]).encode(),
         )
         with (
-            patch.object(bars, "_urlopen", DEFAULT_URLOPEN),
+            patch.object(bars, "urlopen", DEFAULT_URLOPEN),
             patch.object(bars, "build_opener", return_value=opener),
         ):
             sessions = bars.calendar(date(2026, 3, 2), date(2026, 3, 2))

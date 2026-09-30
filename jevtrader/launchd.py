@@ -30,7 +30,7 @@ _SECRETISH = re.compile(r"KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL")
 Runner = Callable[[list[str]], Any]  # runner(argv) -> .returncode, .stdout, .stderr
 
 
-def _run(argv: list[str]) -> subprocess.CompletedProcess:
+def run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
     )
@@ -231,7 +231,7 @@ def _runner(runner: Runner | None) -> Runner:
         return runner
     if sys.platform != "darwin" or not os.path.exists(LAUNCHCTL):
         raise ValueError("launchd is only available on macOS")
-    return _run
+    return run
 
 
 def _call(runner: Runner, argv: list[str]) -> Any:
@@ -253,3 +253,8 @@ def _domain() -> str:
 
 def _service(label: str) -> str:
     return f"{_domain()}/{_label(label)}"
+
+
+# Private aliases kept until every caller patches the public seams (P0-26, #30).
+# Patching an alias does not change what the module calls.
+_run = run

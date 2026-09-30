@@ -1,0 +1,158 @@
+"""The threat model and secrets policy cite code that exists, at lines that still say it."""
+
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+THREAT_MODEL = ROOT / "docs" / "security" / "threat-model.md"
+SECRETS_POLICY = ROOT / "docs" / "security" / "secrets-policy.md"
+DOCS = (THREAT_MODEL, SECRETS_POLICY)
+
+CITATION = re.compile(
+    r"`((?:jevtrader|tools|tests|docs)/[\w/.-]+\.(?:py|md|json|toml|yml))(?::(\d+)(?:-(\d+))?)?`"
+)
+
+# (document, citation, text the cited range must contain): pins the load-bearing claims.
+ANCHORS = [
+    (THREAT_MODEL, "jevtrader/secrets.py:120-121", "add-generic-password"),
+    (THREAT_MODEL, "jevtrader/secrets.py:369-390", "os.environ[name] = value"),
+    (THREAT_MODEL, "jevtrader/cli.py:66-68", "USES_KEYS"),
+    (THREAT_MODEL, "jevtrader/cli.py:574-576", "export_to_environ"),
+    (THREAT_MODEL, "jevtrader/app.py:480-485", "export_to_environ"),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:46-48", '"head", "template", "ix:hidden"'),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:54-64", "font-size"),
+    (THREAT_MODEL, "jevtrader/security/sanitize.py:120-125", '"Co", "Cn"'),
+    (THREAT_MODEL, "jevtrader/security/quarantine.py:136-142", "near-white text"),
+    (SECRETS_POLICY, "jevtrader/cli.py:84-86", "ALPACA_KEYS"),
+    (THREAT_MODEL, "jevtrader/sec.py:177-196", "approved HTTPS URL"),
+    (THREAT_MODEL, "jevtrader/providers.py:282-302", "instructions"),
+    (THREAT_MODEL, "jevtrader/providers.py:411-419", "_questions_text(questions)"),
+    (THREAT_MODEL, "jevtrader/lab.py:197-209", "question_approved"),
+    (THREAT_MODEL, "jevtrader/security/quarantine.py:28", "QUOTE_DIRECTIVE = re.compile"),
+    (THREAT_MODEL, "jevtrader/security/quarantine.py:51", "QUARANTINE_DIRECTIVE = re.compile"),
+    (THREAT_MODEL, "jevtrader/engine.py:192", 'extraction["quarantine"]'),
+    (THREAT_MODEL, "jevtrader/evidence.py:49", "def _admissible"),
+    (THREAT_MODEL, "jevtrader/engine.py:394", '"quarantined"'),
+    (THREAT_MODEL, "jevtrader/paper.py:131", '"quarantined"'),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:42", "EXCERPT_TOOLS"),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:51", "PROVENANCE"),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:218", "_bad_id"),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:190-192", "KNOWN"),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:306-311", "a credential"),
+    (THREAT_MODEL, "jevtrader/mcp_server.py:518-529", "stdin"),
+    (THREAT_MODEL, "jevtrader/web.py:30", "127.0.0.1"),
+    (THREAT_MODEL, "jevtrader/web.py:336-341", "405"),
+    (THREAT_MODEL, "jevtrader/web.py:430-431", "loopback only"),
+    (THREAT_MODEL, "jevtrader/local.py:45", "LOOPBACK_HOSTS"),
+    (THREAT_MODEL, "jevtrader/notify.py:19", "osascript"),
+    (THREAT_MODEL, "jevtrader/cli.py:71-89", "def keys_for"),
+    (THREAT_MODEL, "jevtrader/security/childenv.py:16-31", "_SECRETISH"),
+    (SECRETS_POLICY, "jevtrader/cli.py:71-89", "OPENAI_API_KEY"),
+    (THREAT_MODEL, "jevtrader/providers.py:203-207", "redirect"),
+    (THREAT_MODEL, "jevtrader/bars.py:177-178", "APCA-API-SECRET-KEY"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:23", "KNOWN"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:109", "find-generic-password"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:347-354", "environment wins"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:120-121", "stdin"),
+    (SECRETS_POLICY, "jevtrader/secrets.py:369-390", "export_to_environ"),
+    (SECRETS_POLICY, "jevtrader/launchd.py:197-209", "store it in the Keychain"),
+    (SECRETS_POLICY, "jevtrader/launchd.py:212-216", "Refusing to write an API key"),
+    (SECRETS_POLICY, "jevtrader/config.py:1", "never secrets"),
+    (SECRETS_POLICY, "jevtrader/config.py:81", "0o600"),
+    (SECRETS_POLICY, "jevtrader/config.py:125-137", "dedicated alias"),
+    (SECRETS_POLICY, "jevtrader/providers.py:186-190", "os.environ.get(variable"),
+    (SECRETS_POLICY, "jevtrader/mcp_server.py:190-192", "KNOWN"),
+    (SECRETS_POLICY, "jevtrader/app.py:571", "getpass"),
+    (SECRETS_POLICY, "tools/secret_scan.py:94-97", "_canary"),
+]
+
+THREAT_SECTIONS = (
+    "## Assets",
+    "## Trust zones",
+    "## Actors",
+    "## Entry points",
+    "## Threats",
+    "## Mitigations",
+    "## Residual risks",
+)
+POLICY_SECTIONS = (
+    "## Inventory",
+    "## Where each secret lives",
+    "## Who may read",
+    "## Never",
+    "## Rotation",
+    "## Canary testing",
+    "## Owner identity",
+)
+
+
+def _lines(path: str) -> list[str]:
+    return (ROOT / path).read_text(encoding="utf-8").splitlines()
+
+
+class SecurityDocTests(unittest.TestCase):
+    def test_documents_exist_with_their_sections(self):
+        for doc, sections in ((THREAT_MODEL, THREAT_SECTIONS), (SECRETS_POLICY, POLICY_SECTIONS)):
+            text = doc.read_text(encoding="utf-8")
+            for heading in sections:
+                self.assertIn(heading, text, f"{doc.name} lacks {heading}")
+
+    def test_every_citation_names_an_existing_file_and_line_range(self):
+        for doc in DOCS:
+            found = CITATION.findall(doc.read_text(encoding="utf-8"))
+            self.assertGreater(len(found), 10, doc.name)
+            for path, start, end in found:
+                self.assertTrue((ROOT / path).is_file(), f"{doc.name}: {path} is missing")
+                if not start:
+                    continue
+                first, last = int(start), int(end or start)
+                self.assertLessEqual(first, last, f"{doc.name}: {path}:{start}-{end}")
+                self.assertGreaterEqual(first, 1)
+                self.assertLessEqual(last, len(_lines(path)), f"{doc.name}: {path}:{last}")
+
+    def test_load_bearing_citations_still_point_at_their_code(self):
+        for doc, citation, needle in ANCHORS:
+            self.assertIn(f"`{citation}`", doc.read_text(encoding="utf-8"), citation)
+            path, _, span = citation.partition(":")
+            first, _, last = span.partition("-")
+            lines = _lines(path)[int(first) - 1 : int(last or first)]
+            self.assertIn(needle, "\n".join(lines), citation)
+
+    def test_threat_model_maps_mitigations_to_the_security_issues(self):
+        text = THREAT_MODEL.read_text(encoding="utf-8")
+        for issue in ("#9", "#10", "#11", "#12", "#13", "#28", "#46"):
+            self.assertRegex(text, rf"{issue}(?!\d)", issue)
+        for actor in ("malicious filer", "prompt injection"):
+            self.assertIn(actor, text.lower())
+
+    def test_t1_states_the_current_sanitizer_residual(self):
+        # RT-5: T1 must not claim the sanitizer keeps display:none or ix:hidden text.
+        text = THREAT_MODEL.read_text(encoding="utf-8")
+        t1 = next(line for line in text.splitlines() if line.startswith("| T1 | T, E |"))
+        self.assertNotIn("sanitizer keeps them", t1)
+        self.assertNotIn("three tags", t1)
+        self.assertIn("sanitize-v2", text)
+        self.assertIn("Sanitizer residual (T1)", text)
+
+    def test_alpaca_keys_are_classified_as_trading_capable(self):
+        # RT-4: ADR-0008 and the policy must not call the Alpaca keys market-data keys.
+        adr = (ROOT / "docs" / "adr" / "0008-trading-key-isolation.md").read_text(encoding="utf-8")
+        policy = SECRETS_POLICY.read_text(encoding="utf-8")
+        self.assertIn("The Alpaca keys are trading keys.", adr)
+        self.assertNotIn("provider and market-data keys", adr.lower())
+        self.assertIn("trading-capable", policy)
+        self.assertNotIn("Alpaca market data (paper account)", policy)
+
+    def test_policy_forbids_every_leak_channel(self):
+        text = SECRETS_POLICY.read_text(encoding="utf-8").lower()
+        for channel in ("config", "argv", "logs", "ledger", "prompts", "mcp", "error text"):
+            self.assertIn(channel, text)
+        for store in ("keychain", "libsecret", "credential manager", "docker secrets"):
+            self.assertIn(store, text)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -213,7 +213,10 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(
             set(payload["text"]["format"]["schema"]["required"]), providers._FEATURE_KEYS
         )
-        self.assertEqual(json.loads(payload["input"])["questions"], STRATEGY["questions"])
+        # Issue #11: questions in the instructions channel, never in the filing input.
+        for question in STRATEGY["questions"].values():
+            self.assertIn(question, payload["instructions"])
+            self.assertNotIn(question, payload["input"])
 
     def test_openai_refusal_and_incomplete_are_rejected(self):
         refusal = openai_response()

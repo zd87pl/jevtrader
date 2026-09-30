@@ -11,8 +11,12 @@ from .providers import (
     ProviderInputError,
     ProviderValidationError,
     extract_features,
+    prompt_template_hash,
+    render_request,
 )
 from .research import FEATURE_NAMES, VERSION, fit_model, predict, walk_forward
+from .security.quarantine import Quarantine, assess
+from .security.sanitize import SANITIZER_VERSION, sanitize_text
 
 PREVIOUS_MIN_CHARS = 10_000
 
@@ -116,6 +120,10 @@ def observe(
         "horizon_sessions": strategy["horizon_sessions"],
         "history_sessions": strategy["min_history_sessions"],
         "spread_bps": strategy["spread_bps"],
+        # Providers only ever see sanitized text (P0-05); the version is part of the key.
+        "sanitizer_version": SANITIZER_VERSION,
+        # A template edit is a different extractor, never a silent reuse (P0-07).
+        "prompt_template": prompt_template_hash(provider),
     }
     extraction_id = digest(
         {"spec": spec, "current": event["text"], "previous": prior["text"] if prior else ""}
@@ -142,8 +150,9 @@ def observe(
         if not compatible:
             raise ObservationRejected("Calibrator and extraction schemas/models do not match")
     if extraction is None:
+        # Legacy ledger text predates the sanitizer; sanitizing is idempotent for newer text.
         current_text, previous_text, excerpt = _excerpt(
-            event["text"], prior["text"] if prior else ""
+            sanitize_text(event["text"]), sanitize_text(prior["text"]) if prior else ""
         )
         # Only a local engine takes an address; other adapters keep their exact call.
         location = {"base_url": base_url} if provider == "local" and base_url is not None else {}
@@ -180,11 +189,18 @@ def observe(
         )
         if excerpt:
             extraction["text_excerpt"] = excerpt
+        extraction["quarantine"] = _quarantine(event, prior)
+        # The exact request body (first attempt), so every prompt is auditable from the ledger.
+        extraction["prompt"] = render_request(
+            provider, model, current_text, previous_text, strategy
+        )
         ledger.put("extractions", extraction_id, extraction)
     if mode == "forward":
         # A prediction only exists when extraction has finished; never backdate API latency.
         decision_at = utc_now()
     features = [extraction[name] if name in extraction else market[name] for name in FEATURE_NAMES]
+    # Extractions written before #13 carry no quarantine; assess their source text now.
+    quarantine = extraction.get("quarantine") or _quarantine(event, prior)
     if forecast_model and forecast_model["extractor_key"] != extraction["extractor_key"]:
         # Reached only after a fresh extraction (e.g. a paid one resolving to another model).
         raise ValueError("Calibrator and extraction schemas/models do not match")
@@ -258,9 +274,20 @@ def observe(
         "action": action,
         "reasons": reasons,
         "strategy": strategy,
+        # Adversarial-looking source text: never counts, trains or plans (ADR-0001 D3, #13).
+        "quarantined": quarantine["flagged"] is True,
     }
     ledger.put("forecasts", identity, record)
     return record
+
+
+def _quarantine(event: dict, prior: dict | None) -> Quarantine:
+    """The quarantine of the texts a provider sees: the current and the previous disclosure."""
+    result = assess(event["text"], event.get("sanitize_diff"))
+    if prior is not None:
+        earlier = assess(prior["text"], prior.get("sanitize_diff"))
+        result["reasons"] += [f"previous disclosure: {reason}" for reason in earlier["reasons"]]
+    return {"flagged": bool(result["reasons"]), "reasons": result["reasons"]}
 
 
 def _eligibility(
@@ -364,6 +391,9 @@ def training_rows(
             continue
         # Freeze the earliest observation per event even if its outcome is missing.
         seen.add(forecast["event_id"])
+        if forecast.get("quarantined") is True:
+            # Adversarial-looking source text never trains a calibrator (#13).
+            continue
         label = ledger.get("outcomes", forecast["id"])
         if label is None:
             continue

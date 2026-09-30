@@ -14,6 +14,7 @@ from jevtrader.providers import (
     ProviderValidationError,
     extract_features,
 )
+from jevtrader.security.sanitize import SANITIZER_VERSION
 from jevtrader.research import FEATURE_NAMES, VERSION
 from jevtrader.store import Ledger
 
@@ -131,6 +132,20 @@ class EngineTests(unittest.TestCase):
             result = self.observe()
         self.assertEqual(result["previous_event_id"], "known")
         self.assertEqual(extract.call_args.args[3], "The previous operating report was stable.")
+
+    def test_legacy_text_is_sanitized_before_the_provider_and_version_is_in_the_spec(self):
+        self.populate()
+        self.event("known", index=17, text="Prior re\u200bport was \u202estable.")
+        self.event(text="Raised guid\u200bance and \uff33trong demand for subscription contracts.")
+        with patch.object(engine, "extract_features", wraps=extract_features) as extract:
+            result = self.observe()
+        self.assertEqual(
+            extract.call_args.args[2],
+            "Raised guidance and Strong demand for subscription contracts.",
+        )
+        self.assertEqual(extract.call_args.args[3], "Prior report was stable.")
+        spec = self.ledger.get("extractions", result["extraction_id"])["spec"]
+        self.assertEqual(spec["sanitizer_version"], SANITIZER_VERSION)
 
     def test_decision_path_reads_disclosures_and_bars_through_as_of(self):
         # Issue #21: the prior disclosure and the market snapshot come from Ledger.as_of at

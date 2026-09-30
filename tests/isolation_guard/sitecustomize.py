@@ -17,7 +17,11 @@ import subprocess
 from collections.abc import Callable
 from typing import Any
 
-SYSTEM_COMMANDS = frozenset({"security", "launchctl", "osascript"})
+# macOS Keychain, launchd and notifications, plus the Linux and Windows service and secret
+# backends (#28): systemd units, libsecret and the Windows Credential Manager via PowerShell.
+SYSTEM_COMMANDS = frozenset(
+    {"security", "launchctl", "osascript", "systemctl", "secret-tool", "powershell", "pwsh"}
+)
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})  # jevtrader.local.LOOPBACK_HOSTS
 BROKER_DOMAINS = frozenset({"alpaca.markets", "interactivebrokers.com", "ibkr.com", "ibllc.com"})
 BROKER_PORTS = frozenset({7496, 7497, 4001, 4002})  # TWS and IB Gateway, both on loopback
@@ -50,8 +54,10 @@ def system_command(args: object) -> str | None:
         except TypeError:
             continue
         for word in _WORDS.split(text):
-            if os.path.basename(word) in SYSTEM_COMMANDS:
-                return os.path.basename(word)
+            # Windows names match too: case-insensitive, with or without ".exe".
+            name = os.path.basename(word.replace("\\", "/")).lower().removesuffix(".exe")
+            if name in SYSTEM_COMMANDS:
+                return name
     return None
 
 

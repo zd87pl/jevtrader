@@ -607,7 +607,10 @@ class ReadSideTests(TempHome):
         ]
         self.assertIn(identity, [filing["event_id"] for filing in today["filings"]])
         self.assertIn(identity, [filing["event_id"] for filing in found["filings"]])
-        self.assertEqual(card[mcp_server.EXCERPT_KEY], [plain])
+        self.assertEqual(
+            card[mcp_server.EXCERPT_KEY],
+            {"untrusted": True, "source": "sec-filing", "value": [plain]},
+        )
         self.assertEqual(card["excerpt_note"], mcp_server.EXCERPT_NOTE)
 
     def test_brief_command_notifies_only_when_asked(self):
@@ -627,19 +630,56 @@ class ServiceTests(TempHome):
         program = app.program_args()
         self.assertEqual(program[1:], ["-m", "jevtrader", "daemon"])
         with self.assertRaisesRegex(ValueError, "setup"):
-            app.up(settings.validate({}), ledger_path="x", program=program, runner=runner)
+            app.up(
+                settings.validate({}),
+                ledger_path="x",
+                program=program,
+                runner=runner,
+                platform="darwin",
+            )
         config = settings.validate({"sec_user_agent": UA})
         ledger = str(self.dir / "forward.sqlite")
         with self.assertRaisesRegex(ValueError, "run `jevtrader setup` first"):
-            app.up(config, ledger_path=ledger, program=program, runner=runner)
+            app.up(config, ledger_path=ledger, program=program, runner=runner, platform="darwin")
         Ledger(ledger).close()
-        result = app.up(config, ledger_path=ledger, program=program, runner=runner, home=self.dir)
+        result = app.up(
+            config,
+            ledger_path=ledger,
+            program=program,
+            runner=runner,
+            home=self.dir,
+            platform="darwin",
+        )
         self.assertTrue(Path(result["plist"]).is_file())
         self.assertTrue(str(result["plist"]).startswith(str(self.dir)))
         self.assertIn("bootstrap", [call[1] for call in runner.calls])
-        removed = app.down(runner=runner, home=self.dir)
+        removed = app.down(runner=runner, home=self.dir, platform="darwin")
         self.assertTrue(removed["removed"])
         self.assertFalse(Path(result["plist"]).exists())
+
+    def test_up_and_down_use_systemd_on_linux(self):
+        from tests.test_systemd import FakeSystemctl
+
+        config = settings.validate({"sec_user_agent": UA})
+        ledger = str(self.dir / "forward.sqlite")
+        Ledger(ledger).close()
+        runner = FakeSystemctl()
+        program = app.program_args()
+        with patch.object(app.systemd, "run", side_effect=AssertionError("real systemctl")):
+            result = app.up(
+                config,
+                ledger_path=ledger,
+                program=program,
+                runner=runner,
+                home=self.dir,
+                platform="linux",
+            )
+            self.assertTrue(Path(result["unit"]).is_file())
+            self.assertTrue(result["unit"].startswith(str(self.dir)))
+            self.assertIn("enable", [call[2] for call in runner.calls])
+            removed = app.down(runner=runner, home=self.dir, platform="linux")
+        self.assertTrue(removed["removed"])
+        self.assertFalse(Path(result["unit"]).exists())
 
     def test_program_args_pin_explicit_paths(self):
         program = app.program_args(ledger="rel/forward.sqlite", strategy="s.json")
@@ -860,16 +900,18 @@ class SetupTests(TempHome):
     def run_setup(self, answers, secrets_typed=(), **options):
         replies, hidden, said = iter(answers), iter(secrets_typed), []
         keychain, launchctl = FakeKeychain(), FakeLaunchctl()
-        result = app.setup(
-            ask=lambda prompt: next(replies),
-            ask_secret=lambda prompt: next(hidden),
-            say=said.append,
-            keychain_runner=keychain,
-            launchd_runner=launchctl,
-            program=["/usr/bin/python3", "-m", "jevtrader", "daemon"],
-            home=self.dir,
-            **options,
-        )
+        # The fake is launchctl, so use launchd on every OS (Linux would pick systemd).
+        with patch.object(app, "service_manager", lambda platform=None: launchd):
+            result = app.setup(
+                ask=lambda prompt: next(replies),
+                ask_secret=lambda prompt: next(hidden),
+                say=said.append,
+                keychain_runner=keychain,
+                launchd_runner=launchctl,
+                program=["/usr/bin/python3", "-m", "jevtrader", "daemon"],
+                home=self.dir,
+                **options,
+            )
         return result, said, keychain, launchctl
 
     def test_guided_setup_saves_config_keys_ledgers_and_starts_the_service(self):
@@ -1124,6 +1166,7 @@ class CLITests(TempHome):
             patch.object(Path, "home", return_value=self.dir),
             # The fake stands in for launchctl, so this runs on any OS.
             patch("jevtrader.launchd._runner", lambda runner: runner or launchctl),
+            patch.object(app, "service_manager", lambda platform=None: launchd),
         ):
             code, report, _ = self.command("doctor")
             self.assertEqual(code, 0, report["problems"])
@@ -1136,10 +1179,11 @@ class CLITests(TempHome):
         self.assertEqual(len(program), 1)
 
     def test_up_refuses_cleanly_off_macos(self):
+        # Linux has systemd since #28, so a platform with no service manager stands in.
         self.configure()
         with (
             patch.object(Path, "home", return_value=self.dir),
-            patch("jevtrader.launchd.sys.platform", "linux"),
+            patch("jevtrader.launchd.sys.platform", "win32"),
         ):
             code, _, error = self.command("up")
         self.assertEqual(code, 2)

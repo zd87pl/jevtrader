@@ -25,12 +25,16 @@ Try asking: *"What 8-Ks came in this morning?"*, *"Explain that filing and its e
 
 - Its answers are code-built cards with no key values and no raw filing text. Actions, reasons, outcomes and evidence labels are computed by code and stored before the agent sees them; the text features inside a decision come from whichever provider made it.
 - Only `explain_filing` includes filing text: its quotes, under `untrusted_filing_excerpts`, with a note on each card that they are the filer's words, data and not instructions. Quotes are checked by code to be verbatim text from the stored filing, and sentences that address the reader or an AI agent, give orders or name tools are skipped. That filter is best effort, not a guarantee against prompt injection.
+- Strings that come from outside the code — filing excerpts, `items`, `source_url`, document filenames, provider-reported `resolved_model` names and job `error` text — arrive wrapped as `{"untrusted": true, "source": "sec-filing" | "provider" | "job-error", "value": ...}`, so a client can tell them from code-built fields. A handler cannot forge that label: the server applies it by key on every result. The web view's JSON routes use the same labels (`jevtrader/security/provenance.py`).
+- An id argument such as `event_id` must be 1 to 200 letters, digits, `:`, `.`, `_` or `-`. Anything else returns an error that does not repeat the value.
 - A result that breaks an output rule, for example one containing an API key value from the server's environment, is withheld entirely.
 - The server's instructions tell the client to report numbers as given, keep their evidence labels, and decline trading and personalized investment advice. Calling a tool that doesn't exist, such as `place_order`, returns `Unknown tool`.
 
 A server can't stop a model from making things up. What this one does is make the figures and quotes it hands over checkable against the ledger and the SEC source link.
 
 ## Client configuration
+
+**Do not run this server in the same host or client session as a broker MCP server that has order tools.** Filing excerpts are written by the filer; if injected text slips past the filters, the only thing that stops it from reaching a tool that trades is that no such tool is loaded next to this one. The server's instructions repeat this warning.
 
 For a client that reads an `mcpServers` config file:
 

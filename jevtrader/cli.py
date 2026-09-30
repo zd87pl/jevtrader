@@ -13,8 +13,10 @@ import os
 import shlex
 import sqlite3
 import sys
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from . import app as local_app
 from . import config as settings
@@ -22,7 +24,14 @@ from . import mcp_server, paths, secrets, web
 from .common import digest, load_strategy, symbol, timestamp, utc_now
 from .demo import run_demo
 from .engine import evaluate, observe, settle, train
-from .lab import autoresearch, experiment, generate_proposal
+from .lab import (
+    autoresearch,
+    experiment,
+    generate_proposal,
+    question_diff,
+    questions_sha256,
+    record_question_approval,
+)
 from .local import DEFAULT_MODEL as LOCAL_MODEL
 from .market import import_bars
 from .paper import plan_order
@@ -30,6 +39,7 @@ from .pipeline import check_options, observe_queue
 from .providers import PROVIDERS
 from .research import VERSION
 from .sec import collect_disclosures
+from .security.question_lint import lint_questions
 from .store import KINDS, Ledger
 
 APP = paths.APP_NAME
@@ -56,6 +66,25 @@ APP_COMMANDS = frozenset(
 USES_KEYS = frozenset(
     {"observe", "experiment", "autoresearch", "propose", "bars", "daemon", "backfill"}
 )
+
+
+def keys_for(args: argparse.Namespace, config: Mapping[str, Any]) -> tuple[str, ...]:
+    """The keys one command needs, and no others (P0-42): only these reach os.environ."""
+    command = args.command
+    provider_key = local_app.PROVIDER_KEYS.get(getattr(args, "provider", ""))
+    if command in ("observe", "experiment"):
+        return (provider_key,) if provider_key else ()
+    if command == "autoresearch":
+        # OpenAI writes the question; the chosen provider evaluates it.
+        return tuple(dict.fromkeys(("OPENAI_API_KEY", *([provider_key] if provider_key else []))))
+    if command == "propose":
+        return ("OPENAI_API_KEY",)
+    if command == "bars" or (command == "backfill" and args.bars):
+        return local_app.ALPACA_KEYS
+    if command == "daemon":
+        configured = local_app.PROVIDER_KEYS.get(config.get("provider", ""))
+        return (*local_app.ALPACA_KEYS, *([configured] if configured else []))
+    return ()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -169,6 +198,13 @@ def parser() -> argparse.ArgumentParser:
     propose.add_argument(
         "--output", required=True, help="New candidate JSON file; existing files are preserved"
     )
+    approve = commands.add_parser(
+        "approve-questions",
+        help="Approve a changed question set after reading its diff (a human step; no LLM tool)",
+    )
+    source = approve.add_mutually_exclusive_group(required=True)
+    source.add_argument("--proposal", help="Proposal id printed by propose or autoresearch")
+    source.add_argument("--candidate", help="Candidate strategy JSON file")
     trial = commands.add_parser(
         "experiment", help="Test one question candidate on a locked development universe"
     )
@@ -190,7 +226,7 @@ def parser() -> argparse.ArgumentParser:
 
 def _app_commands(commands) -> None:
     commands.add_parser("setup", help="Guided setup: SEC contact, watchlist, provider, keys")
-    commands.add_parser("up", help="Install and start the background service (launchd)")
+    commands.add_parser("up", help="Install and start the background service (launchd or systemd)")
     commands.add_parser("down", help="Stop and remove the background service")
     commands.add_parser("daemon", help="Run the background schedule in the foreground")
     commands.add_parser("poll", help="Collect new qualifying 8-Ks once (as the service does)")
@@ -376,6 +412,29 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
             "output": str(Path(args.output).resolve()),
             "promoted": False,
         }
+    if command == "approve-questions":
+        if args.proposal:
+            pending = ledger.get("experiments", args.proposal)
+            if pending is None or pending.get("type") != "proposal":
+                raise ValueError("Proposal not found; rejected proposals cannot be approved")
+            questions = pending["candidate"]["questions"]
+        else:
+            questions = load_strategy(args.candidate)["questions"]
+        problems = lint_questions(questions)
+        if problems:
+            raise ValueError("Question set fails the lint: " + "; ".join(problems))
+        sha = questions_sha256(questions)
+        # The diff and prompt go to stderr, so stdout stays machine-readable JSON.
+        print(question_diff(questions, strategy["questions"]), file=sys.stderr)
+        print(
+            f"Question set {sha}. Type its first 8 characters to approve: ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        if sys.stdin.readline().strip() != sha[:8]:
+            raise ValueError(f"Question set {sha[:8]} not approved")
+        return record_question_approval(ledger, questions, strategy["questions"])
     if command == "experiment":
         return experiment(
             ledger,
@@ -513,7 +572,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command in USES_KEYS:
-            secrets.export_to_environ()
+            config = settings.load() if args.command == "daemon" else {}
+            secrets.export_to_environ(keys_for(args, config))
         strategy = load_strategy(args.strategy)
         if args.command in APP_COMMANDS:
             result = app_dispatch(args, strategy)

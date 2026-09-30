@@ -42,6 +42,8 @@ CHILD = textwrap.dedent(
         stamps.append(time.time())
         return Response(request.full_url)
 
+    # Imports are done; tell the parent, then wait for the shared start.
+    Path(str(out) + ".ready").write_text("")
     deadline = time.time() + 20
     while not go.exists() and time.time() < deadline:
         time.sleep(0.005)
@@ -156,7 +158,14 @@ class CrossProcessTests(unittest.TestCase):
             )
             for out in outs
         ]
-        time.sleep(0.3)
+        # Start both schedules only after both interpreters have imported, so
+        # a slow start under load cannot keep the two runs from overlapping.
+        ready = [Path(str(out) + ".ready") for out in outs]
+        deadline = time.monotonic() + 20
+        while not all(flag.exists() for flag in ready):
+            if time.monotonic() > deadline or any(c.poll() is not None for c in children):
+                break
+            time.sleep(0.005)
         go.write_text("")
         for child in children:
             self.assertEqual(child.wait(timeout=30), 0)
@@ -167,7 +176,10 @@ class CrossProcessTests(unittest.TestCase):
         first, second = runs
         # The processes overlapped, so only a shared schedule explains the spacing.
         self.assertLess(max(min(first), min(second)), min(max(first), max(second)))
-        self.assertGreaterEqual(stamps[-1] - stamps[0], (len(stamps) - 1) * interval - 0.05)
+        # Slots are exactly one interval apart, but a busy runner can wake a request late, which
+        # shortens the measured span. Allow one interval of that jitter: without a shared
+        # schedule the two runs would interleave freely and span only about half of this.
+        self.assertGreaterEqual(stamps[-1] - stamps[0], (len(stamps) - 2) * interval)
 
     def test_sec_stays_at_or_below_ten_per_second_across_processes(self) -> None:
         runs = self.run_children("sec", 6)

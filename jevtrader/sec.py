@@ -23,8 +23,6 @@ import re
 import threading
 import time
 from datetime import date, datetime, time as clock_time, timedelta, timezone
-from html import unescape
-from html.parser import HTMLParser
 from typing import Callable
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -32,6 +30,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .common import EASTERN
 from .ratelimit import SharedLimiter
+from .security.sanitize import SanitizedDocument, sanitize_document
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_BULK_BYTES = 10_000_000  # One day's form index or the ticker map; both are single SEC files.
@@ -145,7 +144,7 @@ def verified_acceptance(index_page: bytes, raw: str) -> datetime:
     JSON acceptanceDateTime (its "Z" as UTC, or as Eastern wall clock); anything else
     fails closed. The result never exceeds ``latest_acceptance(raw)``.
     """
-    text, _ = _read_document(index_page, "index.htm")
+    text = _read_document(index_page, "index.htm")["text"]
     found = _ACCEPTED.findall(text)
     if len(found) != 1:
         raise SECError("Filing index must show exactly one Accepted timestamp")
@@ -302,80 +301,9 @@ class _SECClient:
         return value
 
 
-class _DocumentParser(HTMLParser):
-    _BLOCKS = {
-        "p",
-        "div",
-        "li",
-        "tr",
-        "br",
-        "hr",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "table",
-        "section",
-    }
-    _HIDDEN = {"script", "style", "noscript"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.links: list[tuple[str, str]] = []
-        self.hidden: list[str] = []
-        self.anchor: tuple[str, list[str]] | None = None
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self._HIDDEN:
-            self.hidden.append(tag)
-        if self.hidden:
-            return
-        if tag in self._BLOCKS:
-            self.parts.append("\n")
-        elif tag in {"td", "th"}:
-            self.parts.append(" ")
-        if tag == "a":
-            self.anchor = (dict(attrs).get("href", ""), [])
-
-    def handle_endtag(self, tag):
-        if self.hidden:
-            if tag == self.hidden[-1]:
-                self.hidden.pop()
-            return
-        if tag in self._BLOCKS:
-            self.parts.append("\n")
-        if tag == "a" and self.anchor is not None:
-            href, text = self.anchor
-            if href:
-                self.links.append((href, "".join(text)))
-            self.anchor = None
-
-    def handle_data(self, data):
-        if not self.hidden:
-            self.parts.append(data)
-            if self.anchor is not None:
-                self.anchor[1].append(data)
-
-    @property
-    def text(self) -> str:
-        lines = [re.sub(r"\s+", " ", line).strip() for line in "".join(self.parts).splitlines()]
-        return "\n\n".join(line for line in lines if line)
-
-
-def _read_document(payload: bytes, filename: str) -> tuple[str, list[tuple[str, str]]]:
-    content = payload.decode("utf-8-sig", errors="replace")
-    if filename.lower().endswith(".txt") and not re.search(
-        r"<(?:html|body|div|p)\b", content, re.I
-    ):
-        lines = [re.sub(r"[\t ]+", " ", line).strip() for line in unescape(content).splitlines()]
-        return "\n\n".join(line for line in lines if line), []
-    parser = _DocumentParser()
-    parser.feed(content)
-    parser.close()
-    return parser.text, parser.links
+def _read_document(payload: bytes, filename: str) -> SanitizedDocument:
+    """Every fetched document goes through the central sanitizer (P0-05)."""
+    return sanitize_document(payload, filename)
 
 
 def _directory_names(client: _SECClient, base: str) -> list[str]:
@@ -431,20 +359,24 @@ def _cover_exhibit(links: list[tuple[str, str]], base: str, primary: str) -> str
     return min(candidates, key=_exhibit_rank) if candidates else None
 
 
-def _filing_document(client: _SECClient, base: str, primary: str) -> tuple[str, str, str, str]:
+def _filing_document(
+    client: _SECClient, base: str, primary: str
+) -> tuple[str, SanitizedDocument, str, str]:
     names = _directory_names(client, base)
     exhibits = [name for name in names if name != primary and _EXHIBIT.search(name)]
     if exhibits:
         name = min(exhibits, key=_exhibit_rank)
-        text, _ = _read_document(client.get(base + name), name)
-        return name, text, "exhibit", "ex99_filename_heuristic"
-    cover_payload = client.get(base + primary)
-    cover_text, links = _read_document(cover_payload, primary)
-    exhibit = _cover_exhibit(links, base, primary)
+        return (
+            name,
+            _read_document(client.get(base + name), name),
+            "exhibit",
+            "ex99_filename_heuristic",
+        )
+    cover = _read_document(client.get(base + primary), primary)
+    exhibit = _cover_exhibit(cover["links"], base, primary)
     if exhibit:
-        text, _ = _read_document(client.get(base + exhibit), exhibit)
-        return exhibit, text, "exhibit", "cover_link"
-    return primary, cover_text, "primary_document_fallback", "no_supported_ex99_found"
+        return exhibit, _read_document(client.get(base + exhibit), exhibit), "exhibit", "cover_link"
+    return primary, cover, "primary_document_fallback", "no_supported_ex99_found"
 
 
 def _check_cik(cik: object) -> str:
@@ -589,7 +521,8 @@ def collect_filing(
     if row is None:
         return None
     base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/"
-    document, text, role, method = _filing_document(client, base, row["primary"])
+    document, sanitized, role, method = _filing_document(client, base, row["primary"])
+    text = sanitized["text"]
     observed = _iso_utc(client.now())
     if not text.strip():
         # Empty source content is an error rather than a reason to exceed
@@ -620,6 +553,9 @@ def collect_filing(
         "first_seen_at": seen,
         "source_url": base + document,
         "text": text[:MAX_TEXT_CHARS],
+        "sanitizer_version": sanitized["sanitizer_version"],
+        "raw_sha256": sanitized["raw_sha256"],
+        "sanitize_diff": dict(sanitized["diff"]),
         "source_type": "sec",
         "cik": normalized_cik,
         "accession": accession,

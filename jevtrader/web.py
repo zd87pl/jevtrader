@@ -23,6 +23,7 @@ from urllib.parse import unquote
 from . import brief, evidence, paths
 from .brief import escape
 from .common import instant, symbol, timestamp, utc_now
+from .security import provenance
 from .store import Ledger
 
 DEFAULT_PORT = 8765
@@ -46,6 +47,7 @@ SECURITY_HEADERS = {
 HTML_TYPE = "text/html; charset=utf-8"
 _FILING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,299}")
 Response = tuple[int, dict[str, str], bytes]
+JSON_EXTRA_PROVENANCE = {"quotes": "sec-filing"}
 
 CSS = """
 :root {
@@ -105,6 +107,8 @@ h3 { font-size: .95rem; font-weight: 600; margin: 1rem 0 .25rem; }
   margin: .5rem 0; padding: .1rem 0 .1rem .75rem; border-left: 3px solid var(--line);
   color: var(--text); font-size: .95rem; overflow-wrap: anywhere;
 }
+.untrusted { font-style: italic; }
+q.untrusted { overflow-wrap: anywhere; }
 .links { font-size: .9rem; margin: .5rem 0 0; }
 .jobs { list-style: none; padding: 0; margin: 0; }
 .jobs li { padding: .15rem 0; }
@@ -148,7 +152,9 @@ def _plain(status: int, message: str) -> Response:
 
 
 def _json(value: object) -> Response:
-    text = json.dumps(value, sort_keys=True, allow_nan=False, ensure_ascii=True)
+    # External-derived fields leave wrapped with their source, as in MCP results (#12).
+    labeled = provenance.label(value, extra=JSON_EXTRA_PROVENANCE)
+    text = json.dumps(labeled, sort_keys=True, allow_nan=False, ensure_ascii=True)
     # Belt and braces with nosniff: no markup-significant bytes even if sniffed.
     text = text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     headers = {**SECURITY_HEADERS, "Content-Type": "application/json; charset=utf-8"}
@@ -249,8 +255,14 @@ def _ago(minutes: int) -> str:
 
 
 def _detail(run: dict) -> str:
+    """Escaped HTML: job error text is quoted and labeled, run counts stay outside it."""
     counts = ", ".join(f"{name} {value}" for name, value in sorted(run["counts"].items()))
-    return " \u00b7 ".join(part for part in (run["error"], counts) if part)
+    error = (
+        f'<q class="untrusted" data-source="job-error">{escape(run["error"])}</q>'
+        if run["error"]
+        else ""
+    )
+    return " \u00b7 ".join(part for part in (error, escape(counts) if counts else "") if part)
 
 
 def health_html(report: dict) -> str:
@@ -262,7 +274,7 @@ def health_html(report: dict) -> str:
             f"<td>{escape(job)}</td>"
             f'<td class="st-{"ok" if run["status"] in brief.OK_STATUSES else "bad"}">{escape(run["status"])}</td>'
             f'<td class="num">{escape(_ago(run["age_minutes"]))}</td>'
-            f"<td>{escape(_detail(run))}</td>"
+            f"<td>{_detail(run)}</td>"
             "</tr>"
             for job, run in report["jobs"].items()
         )

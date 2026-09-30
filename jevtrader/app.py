@@ -30,6 +30,7 @@ from . import (
     paths,
     registry,
     secrets,
+    systemd,
     web,
 )
 from . import config as settings
@@ -292,6 +293,11 @@ def program_args(*, ledger: str | None = None, strategy: str | None = None) -> l
     return [*args, "daemon"]
 
 
+def service_manager(platform: str | None = None) -> Any:
+    """systemd on Linux, launchd elsewhere; both expose install, uninstall and status."""
+    return systemd if (platform or sys.platform).startswith("linux") else launchd
+
+
 def up(
     config: dict,
     *,
@@ -299,16 +305,24 @@ def up(
     program: list[str],
     runner: launchd.Runner | None = None,
     home: Path | None = None,
+    platform: str | None = None,
 ) -> dict:
-    """Install and start the LaunchAgent; setup must have created the ledger first."""
+    """Install and start the background service; setup must have created the ledger first."""
     if not config["sec_user_agent"]:
         raise ValueError(f"Run `{paths.APP_NAME} setup` first: no contact for SEC is declared")
     open_ledger(ledger_path).close()
-    return launchd.install(program, runner=runner, home=home)
+    result: dict = service_manager(platform).install(program, runner=runner, home=home)
+    return result
 
 
-def down(*, runner: launchd.Runner | None = None, home: Path | None = None) -> dict:
-    return launchd.uninstall(runner=runner, home=home)
+def down(
+    *,
+    runner: launchd.Runner | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> dict:
+    result: dict = service_manager(platform).uninstall(runner=runner, home=home)
+    return result
 
 
 # ---------------------------------------------------------------- doctor
@@ -464,14 +478,14 @@ def _provider_check(config: dict, problems: list[str], transport: Callable | Non
 
 
 def _key_check(config: dict, problems: list[str], runner: secrets.Runner | None) -> dict:
-    try:
-        secrets.export_to_environ(runner=runner)
-    except (RuntimeError, ValueError) as exc:
-        problems.append(f"Keychain: {exc}")
-    present = [name for name in secrets.KNOWN if os.environ.get(name)]
     needed = [PROVIDER_KEYS[config["provider"]]] if config["provider"] in PROVIDER_KEYS else []
     if config["bars_source"] == "alpaca":
         needed += list(ALPACA_KEYS)
+    try:
+        secrets.export_to_environ(needed, runner=runner)  # only the configured keys (P0-42)
+    except (RuntimeError, ValueError) as exc:
+        problems.append(f"Keychain: {exc}")
+    present = [name for name in secrets.KNOWN if os.environ.get(name)]
     missing = [name for name in needed if name not in present]
     if missing:
         problems.append(f"Missing keys: {', '.join(missing)} (setup can store them)")

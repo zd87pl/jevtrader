@@ -18,6 +18,9 @@ from . import evidence, paths
 from .common import EASTERN, instant, sec_symbol, timestamp
 from .market import _compatible, bars_for
 from .providers import _NEGATIVE, _POSITIVE
+from .security.quarantine import DIRECTIVE as _DIRECTIVE
+from .security import sanitize
+from .security.sanitize import sanitize_text, skeleton
 
 MAX_FILINGS = 50
 MAX_QUOTE_CHARS = 200
@@ -45,23 +48,6 @@ _BOILERPLATE = re.compile(
     r"pursuant to the requirements|forward-looking statement|safe harbor|"
     r"incorporated (?:herein )?by reference|shall not be deemed|securities exchange act|"
     r"\bsignatures?\b",
-    re.I,
-)
-# The filer writes the text and the lexicon picks which sentences get quoted, so a filer could
-# get an instruction quoted to an assistant that reads the card (and may hold trading tools).
-# Best effort, erring toward dropping: a dropped sentence only means another one is quoted.
-_DIRECTIVE = re.compile(
-    r"\b(?:you|your|yours|yourself|assistants?|chatbots?|llms?|language models?|"
-    r"ai (?:agents?|assistants?|models?)|prompts?|instructions?|tool[ _-]?(?:calls?|use)|"
-    r"ignore|disregard|forget|override)\b"
-    r"|\b(?:system|user|human|assistant|ai|agent|model|developer)\s*:"
-    r"|^\W*(?:please\s+)?(?:buy|sell|short|place|submit|execute|cancel|use|call|invoke|tell|"
-    r"send|do not|don't|never|always)(?![\w-])"
-    r"|\b(?:buy|sell|limit|market|stop)\s+orders?\b"
-    r"|\bplac(?:e|ing)\s+(?:an?\s+|the\s+)?(?:\w+\s+)?(?:orders?|trades?)\b"
-    r"|\b(?:use|call|invoke)\b[^.!?]{0,40}\btools?\b"
-    r"|\b[a-z0-9]+_[a-z0-9_]+\b"  # snake_case reads as a tool or function name
-    r"|<\||\|>",
     re.I,
 )
 _ITEM = re.compile(r"\d{1,2}\.\d{2}")
@@ -128,7 +114,10 @@ def verified_quotes(
     wanted = [p.lower() for p in phrases if p.strip()]
     preferred, fallback = [], []
     for sentence in _sentences(text):
-        if len(sentence) < MIN_QUOTE_CHARS or not _safe(sentence) or _DIRECTIVE.search(sentence):
+        if len(sentence) < MIN_QUOTE_CHARS or not _safe(sentence):
+            continue
+        # Match on the skeleton so homoglyph, fullwidth and zero-width spellings are caught (#12).
+        if _DIRECTIVE.search(skeleton(sentence)):
             continue
         if not any(ch.isalpha() for ch in sentence):
             continue
@@ -241,14 +230,16 @@ def _filing(
         "evidence": evidence.evidence_label(forecast) if forecast else None,
         "counts_as_evidence": evidence.is_evidence(forecast) if forecast else False,
         "unscored_reason": _unscored(ledger, event, forecast, boundary),
-        "quotes": verified_quotes(event["text"], phrases=PHRASES, max_total=CARD_QUOTE_CHARS),
+        "quotes": verified_quotes(
+            sanitize_text(event["text"]), phrases=PHRASES, max_total=CARD_QUOTE_CHARS
+        ),
     }
 
 
 def _short(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    cleaned = "".join(ch if _safe(ch) else " " for ch in value).strip()
+    cleaned = "".join(ch if _safe(ch) else " " for ch in sanitize_text(value)).strip()
     return cleaned[:MAX_ERROR_CHARS] or None
 
 
@@ -493,6 +484,9 @@ def _basis(value: object) -> dict | None:
     }
 
 
+LEGACY_NOTE = "Stored before the sanitizer existed; text shown after display cleaning."
+
+
 def filing_card(ledger, event_id: str, *, now: str) -> dict:
     """One filing and every decision on it visible at ``now``; no raw filing text."""
     boundary = instant(now)
@@ -519,7 +513,10 @@ def filing_card(ledger, event_id: str, *, now: str) -> dict:
         "source_url": _https(event.get("source_url")),
         "document_role": _word(event.get("document_role")),
         "selection_method": _word(event.get("selection_method")),
-        "quotes": verified_quotes(event["text"], phrases=PHRASES, max_total=CARD_QUOTE_CHARS),
+        "quotes": verified_quotes(
+            sanitize_text(event["text"]), phrases=PHRASES, max_total=CARD_QUOTE_CHARS
+        ),
+        "sanitization": sanitize.sanitization_status(event),
         "decisions": [_decision(ledger, f, boundary) for f in forecasts],
         "notice": NOTICE,
     }
@@ -580,7 +577,13 @@ def _source(url: str | None) -> str:
     if url is None:
         return '<span class="muted">source link unavailable</span>'
     host = urlsplit(url).hostname or "source"
-    return f'<a href="{escape(url)}" rel="noopener noreferrer">Source ({escape(host)})</a>'
+    link = f'<a href="{escape(url)}" rel="noopener noreferrer">Source ({escape(host)})</a>'
+    return _untrusted(link)
+
+
+def _untrusted(markup: str, source: str = "sec-filing") -> str:
+    """Already-escaped markup labeled as external text (#12)."""
+    return f'<span class="untrusted" data-source="{escape(source)}">{markup}</span>'
 
 
 def _quotes(quotes: list[str], heading: str = "") -> str:
@@ -588,13 +591,16 @@ def _quotes(quotes: list[str], heading: str = "") -> str:
         return '<p class="muted">No short verified quote available.</p>'
     # Beside an action pill, an unattributed sentence could read as this tool's advice.
     lead = f'<p class="meta">{escape(heading)}</p>' if heading else ""
-    return lead + "".join(f'<blockquote class="quote">{escape(q)}</blockquote>' for q in quotes)
+    return lead + "".join(
+        f'<blockquote class="quote untrusted" data-source="sec-filing">{escape(q)}</blockquote>'
+        for q in quotes
+    )
 
 
 def _meta(item: dict) -> str:
     parts = [escape(item["form"] or "Filing")]
     if item["items"]:
-        parts.append("Items " + escape(", ".join(item["items"])))
+        parts.append("Items " + _untrusted(escape(", ".join(item["items"]))))
     parts.append("first seen " + escape(et_time(item["first_seen_at"])))
     if item["mode"] != "forward":
         parts.append(escape(f"{item['mode']} record"))
@@ -740,6 +746,11 @@ def _basis_html(basis: dict | None) -> str:
 def render_filing_html(card: dict) -> str:
     """One filing card as an HTML fragment; every value is escaped."""
     item = {**card, "watchlist": False}
+    legacy = (
+        f'<p class="muted">{escape(LEGACY_NOTE)}</p>'
+        if card.get("sanitization") == sanitize.LEGACY
+        else ""
+    )
     decisions = (
         "".join(_decision_html(d) for d in card["decisions"])
         if card["decisions"]
@@ -750,7 +761,7 @@ def render_filing_html(card: dict) -> str:
         f'<h1><span class="sym">{escape(card["symbol"])}</span></h1>'
         f'<p class="meta">{_meta(item)} · accepted {escape(et_time(card["published_at"]))}</p>'
         f'<p class="links">{_source(card["source_url"])}</p>'
-        f"<h2>From the filing</h2>{_quotes(card['quotes'])}"
+        f"<h2>From the filing</h2>{legacy}{_quotes(card['quotes'])}"
         f"<h2>Decisions</h2>{decisions}"
         "</article>"
     )

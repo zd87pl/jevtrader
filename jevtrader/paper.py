@@ -128,6 +128,10 @@ def plan_order(
         return result
 
     reasons = result["reasons"]
+    if forecast.get("quarantined") is True:
+        # ADR-0001 D3 (#13): adversarial-looking source text never reaches a plan.
+        reasons.append("Forecast is quarantined: its source text looked adversarial.")
+        return result
     drawdown = (peak - account_equity) / peak
     if drawdown >= settings["pause_drawdown"] - 1e-12:
         reasons.append("Portfolio drawdown reached the pause threshold.")

@@ -413,6 +413,17 @@ class RunJobTests(IsolatedTest):
         self.assertTrue(record["error"].startswith("RuntimeError: sent [redacted]"))
         self.assertLessEqual(len(record["error"]), daemon.MAX_ERROR_CHARS)
 
+    def test_error_text_is_sanitized_and_a_key_split_by_zero_width_is_redacted(self):
+        os.environ["OPENAI_API_KEY"] = "sk-proj-SECRET123"
+        fakes = Fakes()
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("bad \u202egnp.exe\u200b sk-proj-SEC\u200bRET123 end")
+
+        fakes.poll = explode
+        record = run_job("poll", context(fakes=fakes))
+        self.assertEqual(record["error"], "RuntimeError: bad gnp.exe [redacted] end")
+
     def test_unknown_job_is_rejected_without_a_record(self):
         ledger = FakeLedger()
         with self.assertRaisesRegex(ValueError, "Unknown job"):

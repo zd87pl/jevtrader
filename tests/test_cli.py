@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jevtrader.cli import main
-from jevtrader.common import load_strategy, timestamp
+from jevtrader.common import digest, load_strategy, timestamp
 from jevtrader.engine import ObservationRejected
 from jevtrader.market import normalize_bar
 from jevtrader.providers import ProviderError, ProviderInputError
@@ -567,6 +567,44 @@ class CLITests(unittest.TestCase):
         proposer.assert_not_called()
         with Ledger(self.db) as ledger:
             self.assertEqual([r["id"] for r in ledger.all("experiments")], ["trial"])
+
+    def approve_questions(self, proposal_id, typed):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch("sys.stdin", io.StringIO(typed)),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main(["--db", self.db, "approve-questions", "--proposal", proposal_id])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_approve_questions_needs_the_typed_digest_prefix(self):
+        candidate = load_strategy()
+        candidate["questions"]["novelty"] = "Is there new supply evidence versus the prior filing?"
+        proposal = {"id": "proposal-1", "type": "proposal", "candidate": candidate}
+        with Ledger(self.db) as ledger:
+            ledger.put("experiments", "proposal-1", proposal)
+            ledger.put("experiments", "rejected-1", {**proposal, "type": "proposal_rejected"})
+        sha = digest(candidate["questions"])
+        code, out, error = self.approve_questions("proposal-1", "deadbeef\n")
+        self.assertEqual(code, 2)
+        self.assertIn("+novelty: Is there new supply evidence", error)
+        self.assertIn(sha[:8], error)
+        self.assertIn("not approved", error)
+        for missing in ("missing", "rejected-1"):
+            self.assertEqual(self.approve_questions(missing, sha[:8] + "\n")[0], 2)
+        with Ledger(self.db) as ledger:
+            types = [row.get("type") for row in ledger.all("experiments")]
+        self.assertNotIn("question_approval", types)
+        code, out, error = self.approve_questions("proposal-1", sha[:8] + "\n")
+        self.assertEqual(code, 0, error)
+        result = json.loads(out)
+        self.assertEqual(result["questions_sha256"], sha)
+        self.assertEqual(result["approved_by"], "cli")
+        with Ledger(self.db) as ledger:
+            [row] = [r for r in ledger.all("experiments") if r.get("type") == "question_approval"]
+        self.assertEqual(row["questions_sha256"], sha)
+        self.assertIn("-novelty:", row["diff"])
 
     def test_fit_and_evaluate_forward_explicit_mode(self):
         self.assertEqual(self.command("init")[0], 0)

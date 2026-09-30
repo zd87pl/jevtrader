@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
+from .security import childenv
 from .secrets import KNOWN as SECRET_NAMES
 
 LAUNCHCTL = "/bin/launchctl"
@@ -32,7 +33,12 @@ Runner = Callable[[list[str]], Any]  # runner(argv) -> .returncode, .stdout, .st
 
 def run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
-        argv, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        check=False,
+        env=childenv.scrubbed(),
     )
 
 

@@ -45,7 +45,7 @@ CI runs four jobs (`.github/workflows/ci.yml`):
 
 Every test runs under one autouse fixture (`tests/conftest.py`), with the process and network guards in `tests/isolation_guard/sitecustomize.py`. It guarantees:
 - **Keychain and launchctl** runners are refused.
-- **Programs:** `security`, `launchctl` or `osascript` named anywhere in the argv or shell string (so `env` and `sh -c` wrappers too) is refused through `Popen`, `os.system` and `posix_spawn`; `os.exec*` and `os.spawn*` are refused outright.
+- **Programs:** `security`, `launchctl`, `osascript`, `systemctl`, `secret-tool`, `powershell` or `pwsh` (any case, with or without `.exe`) named anywhere in the argv or shell string (so `env` and `sh -c` wrappers too) is refused through `Popen`, `os.system` and `posix_spawn`; `os.exec*` and `os.spawn*` are refused outright.
 - **Network:** DNS lookups, TCP connections and UDP sends reach loopback only. Alpaca and IBKR hosts, and the TWS / IB Gateway ports on loopback, are refused by name.
 - **Child interpreters** get the guard directory first on `PYTHONPATH`, install the same guards as `sitecustomize`, and report trips to the parent test.
 - **Environment:** real keys, the SEC contact and credential-like variables are removed for every test.

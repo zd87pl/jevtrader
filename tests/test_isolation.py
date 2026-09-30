@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from jevtrader import daemon, local, notify, paths, secrets
+from jevtrader import daemon, launchd, local, notify, paths, secrets, systemd
 from jevtrader.common import load_strategy
 from jevtrader.store import Ledger
 
@@ -87,6 +87,32 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0)
         self.refused(
             "run 'security'", "run 'launchctl'", "run 'osascript'", "run a real system command"
+        )
+
+    def test_linux_and_windows_service_and_secret_tools_are_refused(self):
+        # The systemd, libsecret and Windows backends (#28) must never reach the real system,
+        # even on a Linux or Windows machine where these programs exist.
+        for argv in (
+            ["systemctl", "--user", "status", "jevtrader.service"],
+            ["/usr/bin/secret-tool", "lookup", "service", "jevtrader"],
+            ["powershell", "-NoProfile", "-Command", "-"],
+            ["pwsh", "-NoProfile", "-Command", "-"],
+        ):
+            with self.subTest(program=argv[0]):
+                name = argv[0].rsplit("/", 1)[-1]
+                with self.assertRaisesRegex(AssertionError, f"run '{name}'"):
+                    subprocess.run(argv, check=False)
+        with self.assertRaisesRegex(AssertionError, "run 'systemctl'"):
+            os.system("env systemctl --user daemon-reload")
+        with self.assertRaisesRegex(AssertionError, "run 'powershell'"):
+            subprocess.run([r"C:\Windows\System32\PowerShell.exe", "-Command", "-"], check=False)
+        self.refused(
+            "run 'systemctl'",
+            "run 'secret-tool'",
+            "run 'powershell'",
+            "run 'pwsh'",
+            "run 'systemctl'",
+            "run 'powershell'",
         )
 
     def test_daemon_loop_cannot_sleep_for_real_or_forever(self):
@@ -323,8 +349,25 @@ class GuardTests(unittest.TestCase):
         from conftest import GUARD
 
         self.assertEqual(GUARD.LOOPBACK_HOSTS, local.LOOPBACK_HOSTS)
-        self.assertEqual(GUARD.SYSTEM_COMMANDS, {"security", "launchctl", "osascript"})
+        self.assertEqual(
+            GUARD.SYSTEM_COMMANDS,
+            {
+                "security",
+                "launchctl",
+                "osascript",
+                "systemctl",
+                "secret-tool",
+                "powershell",
+                "pwsh",
+            },
+        )
         self.assertGreaterEqual(GUARD.BROKER_DOMAINS, {"alpaca.markets", "ibkr.com"})
+        # Every system program the package can start is refused under test.
+        self.assertLessEqual(
+            {launchd.LAUNCHCTL.rsplit("/", 1)[-1], systemd.SYSTEMCTL}
+            | {secrets.SECRET_TOOL, secrets.POWERSHELL},
+            GUARD.SYSTEM_COMMANDS,
+        )
 
 
 if __name__ == "__main__":

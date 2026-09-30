@@ -40,12 +40,17 @@ class NoSoftGateTests(unittest.TestCase):
 class DevExtraTests(unittest.TestCase):
     def test_dev_extra_declares_the_gate_tools(self) -> None:
         dev = " ".join(PYPROJECT["project"]["optional-dependencies"]["dev"])
-        for tool in ("pytest-cov", "pytest-timeout", "mypy==1.20.1"):
+        for tool in ("pytest-cov", "pytest-timeout", "mypy"):
             with self.subTest(tool=tool):
                 self.assertIn(tool, dev)
 
-    def test_lint_job_pins_the_same_mypy_as_the_dev_extra(self) -> None:
-        self.assertIn("mypy==1.20.1", WORKFLOW)
+    def test_lint_job_takes_mypy_from_the_constraints_file(self) -> None:
+        # The exact version lives only in requirements/test-constraints.txt,
+        # so the lint job and the dev extra run the same mypy.
+        lines = [line for line in WORKFLOW.splitlines() if "pip install" in line and "mypy" in line]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertRegex(lines[0], r"\bmypy\b")
+        self.assertIn("-c requirements/test-constraints.txt", lines[0])
 
 
 class CoverageFloorTests(unittest.TestCase):

@@ -34,7 +34,7 @@ JEVTRADER_HOME="$(mktemp -d)" python -m jevtrader --db "$(mktemp -d)/demo.sqlite
 - **`python -m jevtrader` works without installing the package** when run from the repo root, as `docs/data-and-ledger.md:68` does. The bare `jevtrader` command exists only after `pip install -e .`.
 
 CI runs four jobs (`.github/workflows/ci.yml`):
-- **Lint and types:** ruff 0.15.9, and mypy 1.20.1 on Python 3.14 against an exact baseline of 0.
+- **Lint and types:** ruff and mypy on Python 3.14, mypy against an exact baseline of 0. Exact tool versions live only in `requirements/test-constraints.txt`; every CI `pip install` uses it with `-c`.
 - **Tests:** ubuntu with Python 3.11 to 3.14 and macOS with 3.11 and 3.14, with a 95% coverage floor and a hang timeout.
 - **Secret scan and dependency audit:** `tools/secret_scan.py` (with a canary self-check) and `pip-audit`.
 - **Wheel smoke test:** on ubuntu and macOS, runs the demo from a clean venv.

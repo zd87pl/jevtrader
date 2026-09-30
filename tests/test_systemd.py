@@ -203,6 +203,7 @@ class SystemdTests(unittest.TestCase):
             text=True,
             timeout=systemd.TIMEOUT_SECONDS,
             check=False,
+            env=systemd.childenv.scrubbed(extra=systemd.CHILD_ENV_EXTRA),  # no keys (P0-42)
         )
 
 

@@ -478,14 +478,14 @@ def _provider_check(config: dict, problems: list[str], transport: Callable | Non
 
 
 def _key_check(config: dict, problems: list[str], runner: secrets.Runner | None) -> dict:
-    try:
-        secrets.export_to_environ(runner=runner)
-    except (RuntimeError, ValueError) as exc:
-        problems.append(f"Keychain: {exc}")
-    present = [name for name in secrets.KNOWN if os.environ.get(name)]
     needed = [PROVIDER_KEYS[config["provider"]]] if config["provider"] in PROVIDER_KEYS else []
     if config["bars_source"] == "alpaca":
         needed += list(ALPACA_KEYS)
+    try:
+        secrets.export_to_environ(needed, runner=runner)  # only the configured keys (P0-42)
+    except (RuntimeError, ValueError) as exc:
+        problems.append(f"Keychain: {exc}")
+    present = [name for name in secrets.KNOWN if os.environ.get(name)]
     missing = [name for name in needed if name not in present]
     if missing:
         problems.append(f"Missing keys: {', '.join(missing)} (setup can store them)")

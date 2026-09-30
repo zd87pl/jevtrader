@@ -185,6 +185,7 @@ class SecretsTests(unittest.TestCase):
             text=True,
             timeout=secrets.TIMEOUT_SECONDS,
             check=False,
+            env=secrets.childenv.scrubbed(extra=secrets.CHILD_ENV_EXTRA),  # no keys (P0-42)
         )
 
 

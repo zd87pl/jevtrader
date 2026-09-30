@@ -13,8 +13,10 @@ import os
 import shlex
 import sqlite3
 import sys
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from . import app as local_app
 from . import config as settings
@@ -64,6 +66,25 @@ APP_COMMANDS = frozenset(
 USES_KEYS = frozenset(
     {"observe", "experiment", "autoresearch", "propose", "bars", "daemon", "backfill"}
 )
+
+
+def keys_for(args: argparse.Namespace, config: Mapping[str, Any]) -> tuple[str, ...]:
+    """The keys one command needs, and no others (P0-42): only these reach os.environ."""
+    command = args.command
+    provider_key = local_app.PROVIDER_KEYS.get(getattr(args, "provider", ""))
+    if command in ("observe", "experiment"):
+        return (provider_key,) if provider_key else ()
+    if command == "autoresearch":
+        # OpenAI writes the question; the chosen provider evaluates it.
+        return tuple(dict.fromkeys(("OPENAI_API_KEY", *([provider_key] if provider_key else []))))
+    if command == "propose":
+        return ("OPENAI_API_KEY",)
+    if command == "bars" or (command == "backfill" and args.bars):
+        return local_app.ALPACA_KEYS
+    if command == "daemon":
+        configured = local_app.PROVIDER_KEYS.get(config.get("provider", ""))
+        return (*local_app.ALPACA_KEYS, *([configured] if configured else []))
+    return ()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -551,7 +572,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command in USES_KEYS:
-            secrets.export_to_environ()
+            config = settings.load() if args.command == "daemon" else {}
+            secrets.export_to_environ(keys_for(args, config))
         strategy = load_strategy(args.strategy)
         if args.command in APP_COMMANDS:
             result = app_dispatch(args, strategy)

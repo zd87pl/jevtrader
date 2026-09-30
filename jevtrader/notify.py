@@ -13,6 +13,8 @@ import unicodedata
 from collections.abc import Callable
 from typing import Any
 
+from .security import childenv
+
 OSASCRIPT = "/usr/bin/osascript"
 TIMEOUT_SECONDS = 10
 MAX_TITLE_CHARS = 80
@@ -31,7 +33,13 @@ Runner = Callable[..., Any]  # runner(argv: list[str], input: str | None) -> .re
 
 def _run(argv: list[str], input: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        argv, input=input, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
+        argv,
+        input=input,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        check=False,
+        env=childenv.scrubbed(),
     )
 
 

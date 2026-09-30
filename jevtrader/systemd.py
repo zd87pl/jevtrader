@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
+from .security import childenv
 from .secrets import KNOWN as SECRET_NAMES
 
 SYSTEMCTL = "systemctl"
 UNIT_NAME = f"{paths.APP_NAME}.service"
 TIMEOUT_SECONDS = 30
+CHILD_ENV_EXTRA = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")  # systemctl --user
 RESTART_SECONDS = 30
 MAX_DETAIL_CHARS = 200
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
@@ -31,7 +33,12 @@ Runner = Callable[[list[str]], Any]  # runner(argv) -> .returncode, .stdout, .st
 
 def run(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
-        argv, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        check=False,
+        env=childenv.scrubbed(extra=CHILD_ENV_EXTRA),
     )
 
 

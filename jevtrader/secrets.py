@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import paths
+from .security import childenv
 
 SERVICE = paths.APP_NAME
 KNOWN = ("TYPESAFE_API_KEY", "OPENAI_API_KEY", "ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY")
@@ -27,6 +28,18 @@ POWERSHELL = "powershell"
 DOCKER_SECRETS_DIR = Path("/run/secrets")
 SECRETS_DIR_ENV = "JEVTRADER_SECRETS_DIR"
 TIMEOUT_SECONDS = 30
+# Child environments add only what these tools need to reach the user's session (P0-42).
+CHILD_ENV_EXTRA = (
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+)
 # `security -i` tokenizes its input line; this set needs no quoting and cannot start an option.
 _VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=:-]{0,511}")
 
@@ -35,7 +48,13 @@ Runner = Callable[..., Any]  # runner(argv: list[str], input: str | None) -> .re
 
 def run(argv: list[str], input: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        argv, input=input, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False
+        argv,
+        input=input,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT_SECONDS,
+        check=False,
+        env=childenv.scrubbed(extra=CHILD_ENV_EXTRA),
     )
 
 
@@ -355,6 +374,8 @@ def export_to_environ(
 ) -> list[str]:
     """Fill unset variables from the secret store; returns the names loaded, never values."""
     names = [_name(name) for name in names]
+    if not names:
+        return []
     chosen = _resolve(runner, store)
     if chosen is None:
         return []

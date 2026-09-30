@@ -8,12 +8,17 @@ training and paper plans.
 """
 
 import copy
+import html
 import json
+import re
+import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import Mock, patch
 
-from jevtrader import brief, engine, evidence, mcp_server, paper, sec
+from jevtrader import brief, engine, evidence, mcp_server, paper, sec, web
 from jevtrader.common import load_strategy
 from jevtrader.providers import ProviderValidationError
 from jevtrader.security import quarantine
@@ -222,6 +227,39 @@ class RedTeamTests(unittest.TestCase):
             for marker in case["markers"]:
                 self.assertNotIn(marker.casefold(), loose.casefold())
 
+        # Web view: the same markers appear only inside an untrusted label, if at all.
+        for target, kind, body in self.web_output(event["id"]):
+            if kind == "json":
+                loose = json.dumps(_unlabelled(json.loads(body)))
+            else:
+                loose = _UNTRUSTED_ELEMENT.sub("", html.unescape(body))
+            for marker in case["markers"]:
+                self.assertNotIn(marker.casefold(), loose.casefold(), target)
+
+    def web_output(self, event_id):
+        # web.respond opens a ledger file read-only, so snapshot the in-memory ledger to one.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "redteam.sqlite"
+        snapshot = sqlite3.connect(path)
+        try:
+            self.ledger.db.backup(snapshot)
+        finally:
+            snapshot.close()
+        port = 8765
+        outputs = []
+        for target, kind in (
+            ("/api/brief.json", "json"),
+            ("/filing/" + quote(event_id, safe=""), "html"),
+        ):
+            status, headers, body = web.respond(
+                path, "GET", target, [f"127.0.0.1:{port}"], port=port, now=self.fixture.at(30)
+            )
+            self.assertEqual(status, 200, target)
+            self.assertIn("Content-Security-Policy", headers)
+            outputs.append((target, kind, body.decode()))
+        return outputs
+
 
 class SanitizerDiffQuarantineTests(unittest.TestCase):
     """RT-1, RT-2, RT-3: v2 diffs quarantine on concealed body text, not structural drops."""
@@ -279,6 +317,11 @@ class _Relabelled:
 
     def get(self, collection, identity):
         return self.ledger.get(collection, identity)
+
+
+_UNTRUSTED_ELEMENT = re.compile(
+    r'<(blockquote|q|span)[^>]*class="[^"]*\buntrusted\b[^"]*"[^>]*>.*?</\1>', re.DOTALL
+)
 
 
 def _unlabelled(value):

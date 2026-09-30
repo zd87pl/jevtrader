@@ -58,7 +58,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | E4 | Provider HTTP with redirects refused | `jevtrader/providers.py:203-207` | untrusted response |
 | E5 | Alpaca bars with key headers | `jevtrader/bars.py:177-178` | untrusted response |
 | E6 | Autoresearch proposals, run as experiments only after a person approves the question diff | `jevtrader/lab.py:197-209` | LLM-written |
-| E7 | Brief cards quoting filing sentences, directive filter | `jevtrader/security/quarantine.py:24` | untrusted |
+| E7 | Brief cards quoting filing sentences, directive filter | `jevtrader/security/quarantine.py:28` | untrusted |
 | E8 | MCP stdio server | `jevtrader/mcp_server.py:525-536`, `jevtrader/mcp_server.py:41` | untrusted client |
 | E9 | Web view, loopback, GET/HEAD only | `jevtrader/web.py:323-328`, `jevtrader/web.py:417-418` | untrusted client |
 | E10 | Local reader, loopback endpoints only | `jevtrader/local.py:45` | local |
@@ -90,9 +90,9 @@ of service, E elevation of privilege.
 
 | Threat | In place (cited) | Planned (issue) |
 | --- | --- | --- |
-| T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:45-47`) on collection, and again in the engine before any provider call for legacy ledger text. `sanitize-v2` drops `display:none`, `visibility:hidden`, `font-size:0`, `opacity:0`, off-screen offsets and zero-height `overflow:hidden` after removing CSS comments (`jevtrader/security/sanitize.py:53-63`), and strips private-use, unassigned and default-ignorable characters (`jevtrader/security/sanitize.py:118-123`). Concealed body text and near-white text quarantine the filing; structural drops such as `head` or the iXBRL header do not (`jevtrader/security/quarantine.py:61-67`) | Done in #9 and #13 (red-team fix-ups RT-1 to RT-3); display surfaces still use their own filters (#12) |
+| T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:46-48`) on collection, and again in the engine before any provider call for legacy ledger text. `sanitize-v2` drops `display:none`, `visibility:hidden`, `font-size:0`, `opacity:0`, off-screen offsets and zero-height `overflow:hidden` after removing CSS comments (`jevtrader/security/sanitize.py:54-64`), and strips private-use, unassigned and default-ignorable characters (`jevtrader/security/sanitize.py:120-125`). Concealed body text and near-white text quarantine the filing; structural drops such as `head` or the iXBRL header do not (`jevtrader/security/quarantine.py:136-142`). Quarantine matches a narrow directive pattern (AI-reader references, override phrasing, role markers, tool calls and names, sentence-initial buy/sell), not the broad quote filter, so 8-K boilerplate still counts (`jevtrader/security/quarantine.py:51`) | Done in #9 and #13 (red-team fix-ups RT-1 to RT-3); display surfaces still use their own filters (#12) |
 | T2 | Readers have no tools and return bounded numbers; adversarial-looking source text flags the extraction quarantined (`jevtrader/engine.py:192`), and a quarantined forecast never counts (`jevtrader/evidence.py:49`), trains (`jevtrader/engine.py:394`) or gets a paper plan (`jevtrader/paper.py:131`); red-team corpus in CI (`tests/redteam/cases.json`, `tests/test_redteam.py`) | Done in #13; paraphrased directives can still pass unflagged |
-| T3 | Directive sentences dropped from cards, matched on the confusable skeleton (`jevtrader/security/quarantine.py:24`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`); external-derived MCP fields wrapped with provenance (`jevtrader/mcp_server.py:50`); id arguments bounded and never echoed (`jevtrader/mcp_server.py:225`); co-installed broker warning in `docs/mcp.md` and the server instructions | Paraphrased directives; `/api/brief.json` fields still unlabelled (escaped in HTML only) |
+| T3 | Directive sentences dropped from cards, matched on the confusable skeleton (`jevtrader/security/quarantine.py:28`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`); external-derived MCP fields wrapped with provenance (`jevtrader/mcp_server.py:50`); id arguments bounded and never echoed (`jevtrader/mcp_server.py:225`); co-installed broker warning in `docs/mcp.md` and the server instructions | Paraphrased directives; `/api/brief.json` fields still unlabelled (escaped in HTML only) |
 | T4 | Proposals pass validation and a question lint, and run only after human approval of the diff (`jevtrader/lab.py:197-209`) | Done in #10 |
 | T5 | Values go through stdin, never argv (`jevtrader/secrets.py:120-121`); MCP withholds any result containing a key (`jevtrader/mcp_server.py:197-199`, `jevtrader/mcp_server.py:313-318`); `tools/secret_scan.py` | Canary secrets across every sink: #28 |
 | T6 | Only key-using commands export, and only their needed keys (`jevtrader/cli.py:71-89`); children get a scrubbed env (`jevtrader/security/childenv.py:16-31`) | Execution-only trading keys (ADR-0008) and the owner's ACL check: #46 |
@@ -121,7 +121,7 @@ Cross-platform storage for every mitigation above is #28; broker-key isolation i
   in the text unflagged. Near-white text is kept (the background is unknown) but quarantines the
   filing. Mitigations: the E2 sanitizer, quarantine, and the directive filter on quotes.
 - **The directive filter is best effort.** A paraphrased instruction can survive
-  (`jevtrader/security/quarantine.py:24`); the host LLM remains the last line (#12).
+  (`jevtrader/security/quarantine.py:28`); the host LLM remains the last line (#12).
 - **Co-installed broker MCP servers** are outside our control; we can only warn (#12).
 - **Paper keys double as market-data keys** and can probably place paper orders (ADR-0001 D2).
 - **Provider-side retention** of filing text and prompts is governed by provider terms, not code.

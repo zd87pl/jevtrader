@@ -12,8 +12,9 @@ letters.
 
 The diff keeps structural drops (``head``, ``script``, ``style``, the iXBRL header) apart from
 ``concealed`` body text, which a reader of the rendered page would not see; only the latter,
-and near-white text (``faint_elements``, kept because the background is unknown), is a
-quarantine signal (``quarantine.assess``).
+and near-white text (``faint_elements``, with ``faint_chars`` non-whitespace characters, kept
+because the background is unknown), is a quarantine signal (``quarantine.assess``).
+``faint_chars`` was added to the diff without a version bump: the stored text is unchanged.
 
 A record without ``sanitizer_version`` was written before the sanitizer and is legacy
 (``LEGACY``): its text may still hold hidden-HTML text that cannot be removed now.
@@ -103,6 +104,7 @@ class SanitizeDiff(TypedDict):
     concealed_chars: int
     structural_elements: int
     faint_elements: int
+    faint_chars: int
     removed_chars: dict[str, int]
     nfkc_changed_chars: int
 
@@ -210,6 +212,10 @@ class _Parser(HTMLParser):
         self.concealed_chars = 0
         self.structural_elements = 0
         self.faint_elements = 0
+        # Open elements while inside near-white text: (tag, is_faint), and how many are faint.
+        self.open: list[tuple[str, bool]] = []
+        self.faint_depth = 0
+        self.faint_chars = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _STRUCTURAL:
@@ -227,8 +233,12 @@ class _Parser(HTMLParser):
                 self.structural_depth = 1 if tag in _STRUCTURAL else 0
                 self.concealed_parts = []
             return
-        if _faint(tag, attrs):
+        faint = _faint(tag, attrs)
+        if faint:
             self.faint_elements += 1
+        if tag not in _VOID and (faint or self.faint_depth):
+            self.open.append((tag, faint))
+            self.faint_depth += faint
         if tag in _BLOCKS:
             self.parts.append("\n")
         elif tag in {"td", "th"}:
@@ -253,6 +263,7 @@ class _Parser(HTMLParser):
                 if self.hidden_depth == 0:
                     self._close_hidden()
             return
+        self._close_faint(tag)
         if tag in _BLOCKS:
             self.parts.append("\n")
         if tag == "a" and self.anchor is not None:
@@ -260,6 +271,16 @@ class _Parser(HTMLParser):
             if href:
                 self.links.append((href, _line("".join(text))))
             self.anchor = None
+
+    def _close_faint(self, tag: str) -> None:
+        """Pop open elements down to the matching start tag; a stray end tag changes nothing."""
+        if not any(name == tag for name, _ in self.open):
+            return
+        while self.open:
+            name, faint = self.open.pop()
+            self.faint_depth -= faint
+            if name == tag:
+                return
 
     def _close_hidden(self) -> None:
         excerpt = _line("".join(self.concealed_parts))[:MAX_EXCERPT_CHARS]
@@ -278,6 +299,8 @@ class _Parser(HTMLParser):
                 self.concealed_parts.append(data)
             return
         self.parts.append(data)
+        if self.faint_depth:
+            self.faint_chars += sum(1 for ch in data if not ch.isspace())
         if self.anchor is not None:
             self.anchor[1].append(data)
 
@@ -324,6 +347,7 @@ def sanitize_document(payload: bytes, filename: str) -> SanitizedDocument:
             "concealed_chars": parser.concealed_chars,
             "structural_elements": parser.structural_elements,
             "faint_elements": parser.faint_elements,
+            "faint_chars": parser.faint_chars,
             "removed_chars": dict(sorted(removed.items())),
             "nfkc_changed_chars": changed,
         },

@@ -66,7 +66,7 @@ class CorpusTests(unittest.TestCase):
         self.assertTrue(any(not case["quarantined"] for case in CORPUS))
         for case in CORPUS:
             with self.subTest(case=case["id"]):
-                self.assertEqual(case["quarantined"], case["id"] != "benign_control")
+                self.assertEqual(case["quarantined"], not case["id"].startswith("benign_"))
 
     def test_assess_flags_each_reason(self):
         diff = {"hidden_elements": 1, "hidden_chars": 0, "removed_chars": {}}
@@ -77,7 +77,7 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(quarantine.assess("Plain text.", None), {"flagged": False, "reasons": []})
         self.assertIn(
             "format or control characters removed",
-            quarantine.assess("Plain​ text.")["reasons"],
+            quarantine.assess("Plain\u202e text.")["reasons"],
         )
         self.assertIn("look-alike letters", quarantine.assess("Buy АВС.")["reasons"])
         self.assertIn(

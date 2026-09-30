@@ -607,7 +607,10 @@ class ReadSideTests(TempHome):
         ]
         self.assertIn(identity, [filing["event_id"] for filing in today["filings"]])
         self.assertIn(identity, [filing["event_id"] for filing in found["filings"]])
-        self.assertEqual(card[mcp_server.EXCERPT_KEY], [plain])
+        self.assertEqual(
+            card[mcp_server.EXCERPT_KEY],
+            {"untrusted": True, "source": "sec-filing", "value": [plain]},
+        )
         self.assertEqual(card["excerpt_note"], mcp_server.EXCERPT_NOTE)
 
     def test_brief_command_notifies_only_when_asked(self):

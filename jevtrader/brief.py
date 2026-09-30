@@ -18,6 +18,7 @@ from . import evidence, paths
 from .common import EASTERN, instant, sec_symbol, timestamp
 from .market import _compatible, bars_for
 from .providers import _NEGATIVE, _POSITIVE
+from .security.sanitize import skeleton
 
 MAX_FILINGS = 50
 MAX_QUOTE_CHARS = 200
@@ -128,7 +129,10 @@ def verified_quotes(
     wanted = [p.lower() for p in phrases if p.strip()]
     preferred, fallback = [], []
     for sentence in _sentences(text):
-        if len(sentence) < MIN_QUOTE_CHARS or not _safe(sentence) or _DIRECTIVE.search(sentence):
+        if len(sentence) < MIN_QUOTE_CHARS or not _safe(sentence):
+            continue
+        # Match on the skeleton so homoglyph, fullwidth and zero-width spellings are caught (#12).
+        if _DIRECTIVE.search(skeleton(sentence)):
             continue
         if not any(ch.isalpha() for ch in sentence):
             continue

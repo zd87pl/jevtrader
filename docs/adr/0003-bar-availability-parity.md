@@ -17,10 +17,10 @@ Separately, the public `bars.daily_bars` could request a session that had not fi
 ## Decision
 
 1. **One constant.** `SETTLE_DELAY = timedelta(minutes=20)` lives in `jevtrader/market.py`; `bars.SETTLE_DELAY` is the same object.
-2. **Historical availability = close + `SETTLE_DELAY`.** A historical bar without an explicit `available_at` gets `close_at + SETTLE_DELAY`. An explicit `available_at` (a recorded receipt) is kept, and must still be at or after the close. Forward bars still carry the actual receipt. Synthetic (demo) bars keep the close; they never count as evidence.
+2. **Historical availability = close + `SETTLE_DELAY`.** A historical bar without an explicit `available_at` gets `close_at + SETTLE_DELAY`. An explicit `available_at` must still be at or after the close, and `SETTLE_DELAY` is a floor under it: the stored value is `max(supplied, close_at + SETTLE_DELAY)`. A later recorded receipt is kept; an earlier one is raised to the floor, so no replay sees a historical bar sooner than a forward run could. Forward bars still carry the actual receipt. Synthetic (demo) bars keep the close; they never count as evidence.
 3. **`daily_bars` is guarded.** It raises `BarsError` before any request unless `now >= end 16:00 New York + SETTLE_DELAY`. 16:00 is the latest regular close, so early-close sessions are covered too. "Now" comes from `bars.utc_now`, the same seam `fetch_historical` uses.
 
-I-15 now reads: *forward bars are stored ≥ `SETTLE_DELAY` after close with receipt time; historical bars without a receipt are available at close + `SETTLE_DELAY`; forward and historical bars never mix; `daily_bars` never returns an unfinished session.*
+I-15 now reads: *forward bars are stored ≥ `SETTLE_DELAY` after close with receipt time; historical bars are never available before close + `SETTLE_DELAY`, receipt or not; forward and historical bars never mix; `daily_bars` never returns an unfinished session.*
 
 Pinned by `tests/test_bars.py::BarAvailabilityParityTests` and `tests/test_store_market.py::HistoricalAvailabilityTests` (boundary at exactly close + 20 min, one second before, and across the March DST change).
 

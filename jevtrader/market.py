@@ -54,18 +54,20 @@ def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
     if result["split_ratio"] <= 0:
         raise ValueError("split_ratio must be positive")
     # Actual receipt time is mandatory for forward use. Replayed bars stay labeled historical.
-    # Without a receipt, a historical bar is assumed available at close + SETTLE_DELAY
-    # (ADR-0003); synthetic bars keep the close.
+    # A historical bar is never available before close + SETTLE_DELAY (ADR-0003): the delay
+    # is a floor under any supplied receipt. Synthetic bars keep the supplied value or the close.
     if mode == "forward":
         result["available_at"] = utc_now()
     elif row.get("available_at"):
         result["available_at"] = timestamp(row["available_at"])
-    elif mode == "historical":
-        result["available_at"] = timestamp((instant(result["close_at"]) + SETTLE_DELAY).isoformat())
     else:
         result["available_at"] = result["close_at"]
     if instant(result["available_at"]) < instant(result["close_at"]):
         raise ValueError("A completed bar cannot be available before close")
+    if mode == "historical":
+        settled = instant(result["close_at"]) + SETTLE_DELAY
+        if instant(result["available_at"]) < settled:
+            result["available_at"] = timestamp(settled.isoformat())
     result["id"] = f"{result['symbol']}:{result['session']}"
     return result
 

@@ -159,6 +159,24 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(master.tickers(XYZ, date(2026, 9, 24)), ())
         self.assertEqual(master.tickers(XYZ, date(2026, 9, 25)), ("XYZ", "XYZ-B"))
 
+    def test_the_earliest_delisting_ends_the_listing(self):
+        master = SecurityMaster(
+            [
+                parse_event(ticker(XYZ, ["XYZ"], "2020-01-02", "2020-01-02T00:00Z")),
+                parse_event(delisting(XYZ, "2024-06-01", "2024-06-01T00:00Z")),
+                parse_event(delisting(XYZ, "2024-03-01", "2024-07-01T00:00Z")),
+            ]
+        )
+        event = master.delisting(XYZ)
+        assert event is not None
+        self.assertEqual(event["effective"], "2024-03-01")
+        self.assertEqual(master.tickers(XYZ, date(2024, 4, 1)), ())
+
+    def test_ticker_snapshot_uses_the_new_york_date(self):
+        # 01:00 UTC on 2 Jan is still 1 Jan in New York.
+        events = ticker_snapshot({ABC: ["ABC"]}, Instant.parse("2026-01-02T01:00:00Z"))
+        self.assertEqual(events[0]["effective"], "2026-01-01")
+
     def test_empty_master(self):
         master = SecurityMaster([])
         self.assertFalse(master)

@@ -6,11 +6,13 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
+
+from .pit.time import SYSTEM_CLOCK, Instant
 
 # US equity sessions and EDGAR dates are defined in New York time.
 EASTERN = ZoneInfo("America/New_York")
@@ -28,23 +30,16 @@ COST_FLOOR: dict[str, float] = {
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return SYSTEM_CLOCK.now().iso()
 
 
 def instant(value: str) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError("Timestamp must be an ISO 8601 string with an explicit timezone")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"Invalid timestamp: {value!r}") from exc
-    if parsed.tzinfo is None:
-        raise ValueError(f"Timestamp needs an explicit timezone: {value!r}")
-    return parsed.astimezone(timezone.utc)
+    """Parse through the one timestamp type, ``pit.Instant``; naive values are rejected."""
+    return Instant.parse(value).moment
 
 
 def timestamp(value: str) -> str:
-    return instant(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return Instant.parse(value).iso()
 
 
 def canonical(value: object) -> str:
@@ -90,8 +85,8 @@ def ledger_file(ledger: object) -> Path | None:
     return None
 
 
-def load_strategy(path: str | Path | None = None) -> dict:
-    data = json.loads(
+def load_strategy(path: str | Path | None = None) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(
         Path(path).read_text()
         if path
         else files("jevtrader").joinpath("default_strategy.json").read_text()
@@ -100,7 +95,7 @@ def load_strategy(path: str | Path | None = None) -> dict:
     return data
 
 
-def validate_strategy(data: dict) -> None:
+def validate_strategy(data: dict[str, Any]) -> None:
     defaults = json.loads(files("jevtrader").joinpath("default_strategy.json").read_text())
     if not isinstance(data, dict) or set(data) != set(defaults):
         raise ValueError("Strategy must contain exactly the documented configuration fields")
@@ -172,7 +167,7 @@ def meets_cost_floor(strategy: object) -> bool:
     return True
 
 
-def round_trip_bps(strategy: dict, *, short: bool = False) -> float:
+def round_trip_bps(strategy: dict[str, Any], *, short: bool = False) -> float:
     cost = strategy["spread_bps"] + 2 * strategy["slippage_bps_per_side"]
     if short:
         cost += strategy["short_borrow_bps_annual"] * strategy["horizon_sessions"] / 252

@@ -21,6 +21,7 @@ from jevtrader import (
     app,
     brief,
     cli,
+    cohorts,
     daemon,
     engine,
     launchd,
@@ -251,6 +252,14 @@ class EligibilityTests(unittest.TestCase):
         self.days = seed(self.ledger)
 
     def observe(self, identity, provider="rules", model="rules-v1", **options):
+        # #35: these replays test registry labels, so their cohort is pre-registered.
+        cohorts.register(
+            self.ledger,
+            identity,
+            event_ids=[identity],
+            rule="fixture",
+            now=f"{self.days[0]}T00:00:00Z",
+        )
         self.ledger.disclosure(event(identity, self.days[25]))
         return engine.observe(
             self.ledger,
@@ -471,6 +480,14 @@ class ReadSideTests(TempHome):
         self.path = str(self.dir / "forward.sqlite")
         with Ledger(self.path) as ledger:
             days = seed(ledger, mode="historical")
+            # #35: an imported replay keeps its registry label only in a pre-registered cohort.
+            cohorts.register(
+                ledger,
+                "c",
+                event_ids=["sec:0000000001-26-000001:ex99.htm"],
+                rule="fixture",
+                now=f"{days[0]}T00:00:00Z",
+            )
             ledger.disclosure(event("sec:0000000001-26-000001:ex99.htm", days[25]))
             engine.observe(
                 ledger,

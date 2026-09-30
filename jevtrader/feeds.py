@@ -3,9 +3,9 @@
 ``poll`` stamps each filing with the time its selected document was actually received
 (forward mode). ``backfill`` is historical only: availability is an explicit conservative
 assumption (``first_seen_basis: "backfill_assumed"``), never evidence of a forward
-observation, and it refuses the forward ledger. Symbols come from SEC's *current* ticker
-map, so a backfill is survivorship-biased: delisted or renamed companies are missing or
-carry today's ticker. Every request goes through sec.py's allowlist, byte bounds, a
+observation, and it refuses the forward ledger. Backfill symbols come from the
+point-in-time security master (``pit.securities``, ADR-0006); only when it is empty does a
+backfill fall back to SEC's *current* ticker map, which is survivorship-biased. Every request goes through sec.py's allowlist, byte bounds, a
 per-call request budget and the shared 5 requests/second limiter.
 """
 
@@ -22,6 +22,7 @@ from xml.etree import ElementTree
 
 from . import paths, sec
 from .common import EASTERN, instant, ledger_file, sec_symbol
+from .pit.securities import SecurityMaster
 
 TIMEOUT = 20.0
 FEED_COUNTS = (10, 20, 40, 80, 100)
@@ -32,6 +33,7 @@ MAX_FILING_ATTEMPTS = 10
 MAX_REMEMBERED = 10_000
 TICKER_TTL_SECONDS = 6 * 3600
 REQUESTS_PER_FILING = 4  # submissions + directory + cover + exhibit
+VERIFY_REQUESTS = 1  # the filing's -index.htm, with verify_acceptance
 FIRST_SEEN_DELAY = timedelta(minutes=15)
 MORNING = clock_time(6, 0)  # EDGAR opens; nothing is disseminated earlier.
 EVENING = sec.AFTER_HOURS
@@ -56,6 +58,19 @@ _SKIPS = (
     "failed_before",
     "deferred",
 )
+
+
+def _acceptance(verify: bool) -> dict:
+    """collect_filing options: with ``verify``, published_at, accepted_at and after_hours
+    come from the filing index's 'Accepted' instant, or, when that page is gone, from the
+    later JSON reading marked unverified (#16)."""
+    if not isinstance(verify, bool):
+        raise ValueError("verify_acceptance must be a boolean")
+    return {"verify_acceptance": verify, "unverified_fallback": verify}
+
+
+def _per_filing(verify: bool) -> int:
+    return REQUESTS_PER_FILING + (VERIFY_REQUESTS if verify else 0)
 
 
 def _client(user_agent: str, max_requests: int, transport: Callable | None) -> sec._SECClient:
@@ -197,6 +212,11 @@ def _check_day(value: object, name: str) -> date:
 
 
 def _daily_index(client: sec._SECClient, day: date) -> list[dict]:
+    return _published_index(client, day) or []
+
+
+def _published_index(client: sec._SECClient, day: date) -> list[dict] | None:
+    """The day's 8-K rows; None when SEC has no index for a weekday (404)."""
     if day.weekday() >= 5:
         return []
     try:
@@ -205,7 +225,7 @@ def _daily_index(client: sec._SECClient, day: date) -> list[dict]:
         if exc.code != 404:
             raise
         exc.close()  # A holiday, or an index SEC has not published yet.
-        return []
+        return None
     lines = payload.decode("latin-1").splitlines()
     try:
         start = next(i for i, line in enumerate(lines) if re.fullmatch(r"-{20,}\s*", line, re.A))
@@ -379,13 +399,14 @@ def poll(
     transport: Callable | None = None,
     max_filings: int = 25,
     memory: PollMemory | None = None,
+    verify_acceptance: bool = False,
 ) -> dict:
     """Collect new qualifying 8-Ks from the current feed into the forward ledger.
 
     Oldest first, so filings about to leave the 100-entry feed are not starved. Accessions
     already in the ledger cost no request; the ticker map is fetched only when something
-    new needs mapping. At most ``max_filings`` filings are fetched (<= 4 requests each);
-    the rest are counted as ``deferred`` for the next poll. One bad filing is recorded in
+    new needs mapping. At most ``max_filings`` filings are fetched (<= 4 requests each, 5
+    with ``verify_acceptance``); the rest are counted as ``deferred`` for the next poll. One bad filing is recorded in
     ``errors``; SEC throttling (403/429), 5xx or a network failure stops the batch
     (``stopped``). -> {"seen", "new", "added", "skipped", "errors", "stopped", "requests"}
     """
@@ -395,7 +416,8 @@ def poll(
         ledger, paths.research_ledger_path(), "poll writes forward records; not the research ledger"
     )
     memory = _MEMORY if memory is None else memory
-    client = _client(user_agent, 2 + REQUESTS_PER_FILING * max_filings, transport)
+    options = _acceptance(verify_acceptance)
+    client = _client(user_agent, 2 + _per_filing(verify_acceptance) * max_filings, transport)
     registrants: dict[str, list[dict]] = {}
     for row in _latest_8k(client, FEED_COUNTS[-1]):
         registrants.setdefault(row["accession"], []).append(row)
@@ -426,7 +448,7 @@ def poll(
         examined += 1
         cik, ticker = choice
         try:
-            record = sec.collect_filing(client, cik, accession, ticker)
+            record = sec.collect_filing(client, cik, accession, ticker, **options)
         except sec.FilingNotFound:
             memory.fail(accession)
             skipped["not_indexed"] += 1
@@ -479,24 +501,37 @@ def backfill(
     symbols: set[str] | None = None,
     transport: Callable | None = None,
     max_filings: int = 500,
+    master: SecurityMaster | None = None,
+    verify_acceptance: bool = False,
 ) -> dict:
     """Historical 8-K collection from daily form indexes into a separate research ledger.
 
     Never forward: ``first_seen_at`` is assumed_first_seen(acceptance), marked
     ``first_seen_basis: "backfill_assumed"``; filings whose assumed availability is still in
     the future are skipped. Covers filings within each company's recent SEC submissions.
-    ``max_filings`` bounds filings examined (<= 4 requests each); ``truncated`` means a
-    candidate was left unexamined, so the range was not finished. -> poll's keys plus "days", "truncated".
+    ``max_filings`` bounds filings examined (<= 4 requests each, 5 with
+    ``verify_acceptance``); ``truncated`` means a candidate was left unexamined, so the range was not finished. -> poll's keys plus "days", "truncated".
+
+    Symbols come from the point-in-time security master (``master``, or by default the
+    ledger's ``securities`` records known at the run's start) as of each index day, so
+    delisted and renamed companies keep the ticker they had then (``symbol_basis:
+    "security_master"``). Only with an empty master does it fall back to SEC's current map
+    (``"sec_ticker_map_at_backfill"``), which is survivorship-biased (ADR-0006).
     """
     days = _days(start, end)
     max_filings = _bounded(max_filings, MAX_BACKFILL_FILINGS, "max_filings")
     wanted = _watched(symbols)
     _require_research_ledger(ledger)
-    budget = 1 + sum(day.weekday() < 5 for day in days) + REQUESTS_PER_FILING * max_filings
+    options = _acceptance(verify_acceptance)
+    per_filing = _per_filing(verify_acceptance)
+    budget = 1 + sum(day.weekday() < 5 for day in days) + per_filing * max_filings
     client = _client(user_agent, budget, transport)
     now = client.now()
     if days[-1] > now.astimezone(EASTERN).date():
         raise ValueError("Backfill cannot cover a future day")
+    if master is None:
+        master = SecurityMaster.from_ledger(ledger, now)
+    basis = "security_master" if master else "sec_ticker_map_at_backfill"
     result = _result(days=0, truncated=False)
     skipped = result["skipped"]
     skipped.update(not_in_submissions=0, not_yet_available=0)
@@ -512,6 +547,8 @@ def backfill(
             stop = _failure(result, {"day": day.isoformat()}, exc)
             continue
         result["days"] += 1
+        if master:
+            table = master.table(day)
         registrants: dict[str, list[dict]] = {}
         for row in index:
             registrants.setdefault(row["accession"], []).append(row)
@@ -544,6 +581,7 @@ def backfill(
                     submissions=submissions[cik],
                     mode="historical",
                     first_seen=assumed_first_seen,
+                    **options,
                 )
             except sec.FilingNotFound:
                 skipped["not_in_submissions"] += 1
@@ -560,7 +598,104 @@ def backfill(
                 skipped["not_yet_available"] += 1
                 continue
             record["first_seen_basis"] = "backfill_assumed"
-            record["symbol_basis"] = "sec_ticker_map_at_backfill"
+            record["symbol_basis"] = basis
             _store(ledger, result, record)
+    result["requests"] = client.requests
+    return result
+
+
+def reconcile(
+    ledger,
+    user_agent: str,
+    day: date,
+    *,
+    symbols: set[str] | None,
+    transport: Callable | None = None,
+    max_filings: int = 25,
+    memory: PollMemory | None = None,
+    verify_acceptance: bool = False,
+) -> dict:
+    """Classify every 8-K in ``day``'s daily index and recover the qualifying ones poll missed.
+
+    Each accession is ``collected`` (already in the ledger), ``not_qualifying``, ``unmapped``,
+    ``not_watched``, ``recovered`` or a coverage gap. A recovered filing is a forward record
+    stamped with this collection's actual receipt, marked ``first_seen_basis:
+    "reconcile_late"``; it is never backdated to acceptance. Filings the poller gave up on
+    (MAX_FILING_ATTEMPTS) are tried again. Gaps are {"accession", "cik", "form", "reason"}
+    with reason "not_in_submissions", "deferred" (over ``max_filings``), "stopped" (after SEC
+    throttling or an outage) or "error: ...". ``index_missing`` means a weekday had no index.
+    -> {"indexed", "collected", "recovered", "not_qualifying", "unmapped", "not_watched",
+    "gaps", "index_missing", "stopped", "errors", "requests"}
+    """
+    day = _check_day(day, "day")
+    max_filings = _bounded(max_filings, MAX_POLL_FILINGS, "max_filings")
+    wanted = _watched(symbols)
+    _refuse(
+        ledger,
+        paths.research_ledger_path(),
+        "reconcile writes forward records; not the research ledger",
+    )
+    memory = _MEMORY if memory is None else memory
+    options = _acceptance(verify_acceptance)
+    client = _client(user_agent, 2 + _per_filing(verify_acceptance) * max_filings, transport)
+    index = _published_index(client, day)
+    registrants: dict[str, list[dict]] = {}
+    for row in index or []:
+        registrants.setdefault(row["accession"], []).append(row)
+    result = _result(indexed=len(registrants), index_missing=index is None)
+    del result["seen"], result["new"], result["skipped"]
+    result.update(collected=0, not_qualifying=0, unmapped=0, not_watched=0, gaps=[])
+    examined = 0
+
+    def gap(rows: list[dict], reason: str) -> None:
+        row = rows[0]
+        result["gaps"].append(
+            {
+                "accession": row["accession"],
+                "cik": row["cik"],
+                "form": row["form"],
+                "reason": reason,
+            }
+        )
+
+    for accession, rows in registrants.items():
+        if ledger.prefix("disclosures", f"sec:{accession}:"):
+            result["collected"] += 1
+            continue
+        if accession in memory.rejected:
+            result["not_qualifying"] += 1
+            continue
+        choice = _choose(rows, memory.table(client), wanted)
+        if isinstance(choice, str):
+            result[choice] += 1
+            continue
+        if result["stopped"]:
+            gap(rows, "stopped")
+            continue
+        if examined >= max_filings:
+            gap(rows, "deferred")
+            continue
+        examined += 1
+        cik, ticker = choice
+        try:
+            record = sec.collect_filing(client, cik, accession, ticker, **options)
+        except sec.FilingNotFound:
+            gap(rows, "not_in_submissions")
+            continue
+        except (ValueError, OSError, HTTPException) as exc:
+            _failure(result, {"accession": accession, "cik": cik, "symbol": ticker}, exc)
+            gap(rows, f"error: {_describe(exc)}"[:300])
+            continue
+        if record is None:
+            memory.reject(accession)
+            result["not_qualifying"] += 1
+            continue
+        memory.attempts.pop(accession, None)
+        record["first_seen_basis"] = "reconcile_late"
+        before = len(result["added"])
+        _store(ledger, result, record)
+        if len(result["added"]) == before:
+            gap(rows, "error: not stored")
+    result["recovered"] = result.pop("added")
     result["requests"] = client.requests
     return result

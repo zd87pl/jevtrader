@@ -1,0 +1,60 @@
+{
+  "provenance": "read via WebFetch by an agent; owner browser spot-check pending",
+  "captured": "2026-09-29",
+  "method": "Each filing's -index.htm 'Accepted' (Eastern wall clock) paired with the same accession's acceptanceDateTime in data.sec.gov submissions JSON. WebFetch passes pages through a summarizing model and no User-Agent was set by the agent; index pages read cleanly, but whole-file JSON reads mixed up array positions, so only positional reads of the newest elements are trusted and each row says where its JSON value comes from.",
+  "owner_check": "Open each index_url and submissions_url in a browser, compare 'Accepted' and acceptanceDateTime with the values below, then replace provenance with 'owner-verified in a browser on YYYY-MM-DD'.",
+  "filings": [
+    {
+      "cik": 320193,
+      "company": "Apple Inc.",
+      "accession": "0000320193-26-000018",
+      "form": "8-K",
+      "index_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000018/0000320193-26-000018-index.htm",
+      "submissions_url": "https://data.sec.gov/submissions/CIK0000320193.json",
+      "index_accepted_et": "2026-07-30 16:30:28",
+      "json_acceptance": "2026-07-30T20:30:28.000Z",
+      "z_meaning": "utc",
+      "json_source": "this capture (lookup by accession) and the Phase 0 audit, section 3; both agree",
+      "confidence": "high"
+    },
+    {
+      "cik": 320193,
+      "company": "Apple Inc.",
+      "accession": "0000320193-26-000005",
+      "form": "8-K",
+      "index_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/0000320193-26-000005-index.htm",
+      "submissions_url": "https://data.sec.gov/submissions/CIK0000320193.json",
+      "index_accepted_et": "2026-01-29 16:30:33",
+      "json_acceptance": "2026-01-29T21:30:33.000Z",
+      "z_meaning": "utc",
+      "json_source": "this capture (lookup by accession) and the Phase 0 audit, section 3; both agree",
+      "confidence": "high"
+    },
+    {
+      "cik": 1137411,
+      "company": "Rockwell Collins Inc",
+      "accession": "0001137411-18-000134",
+      "form": "4",
+      "index_url": "https://www.sec.gov/Archives/edgar/data/1137411/000113741118000134/0001137411-18-000134-index.htm",
+      "submissions_url": "https://data.sec.gov/submissions/CIK0001137411.json",
+      "index_accepted_et": "2018-11-28 19:11:02",
+      "json_acceptance": "2018-11-28T19:11:02.000Z",
+      "z_meaning": "eastern_wall_clock",
+      "json_source": "this capture, positional read of filings.recent element 4",
+      "confidence": "medium"
+    },
+    {
+      "cik": 1137411,
+      "company": "Rockwell Collins Inc",
+      "accession": "0001137411-18-000111",
+      "form": "10-K",
+      "index_url": "https://www.sec.gov/Archives/edgar/data/1137411/000113741118000111/0001137411-18-000111-index.htm",
+      "submissions_url": "https://data.sec.gov/submissions/CIK0001137411.json",
+      "index_accepted_et": "2018-11-26 16:09:52",
+      "json_acceptance": "2018-11-26T16:09:52.000Z",
+      "z_meaning": "eastern_wall_clock",
+      "json_source": "Phase 0 audit, section 3; this capture's JSON reads for this accession were inconsistent with its index page and are not used",
+      "confidence": "medium-low"
+    }
+  ]
+}

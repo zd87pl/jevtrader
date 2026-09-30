@@ -28,6 +28,7 @@ class Disclosure(TypedDict):
     # SEC filings only.
     accepted_at: NotRequired[str]
     after_hours: NotRequired[bool]
+    acceptance_basis: NotRequired[str]
     cik: NotRequired[str]
     accession: NotRequired[str]
     form: NotRequired[str]

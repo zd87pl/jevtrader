@@ -243,7 +243,9 @@ class EndToEndTests(unittest.TestCase):
                     *a, **k, transport=self.sec, memory=feeds.PollMemory()
                 ),
                 bars=lambda *a, **k: bars.fetch_forward(*a, **k, transport=self.alpaca),
-                reconcile=lambda *a, **k: feeds.daily_index(*a, **k, transport=self.sec),
+                reconcile=lambda *a, **k: feeds.reconcile(
+                    *a, **k, transport=self.sec, memory=feeds.PollMemory()
+                ),
                 notify=lambda title, body: self.notes.append((title, body)) or True,
                 log=lambda line: None,
             )

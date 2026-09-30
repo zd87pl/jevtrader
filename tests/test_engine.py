@@ -5,7 +5,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from jevtrader import engine, registry
+from jevtrader import cohorts, engine, registry
 from jevtrader.common import digest, load_strategy, round_trip_bps, timestamp
 from jevtrader.market import normalize_bar, outcome
 from jevtrader.providers import (
@@ -132,6 +132,34 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["previous_event_id"], "known")
         self.assertEqual(extract.call_args.args[3], "The previous operating report was stable.")
 
+    def test_decision_path_reads_disclosures_and_bars_through_as_of(self):
+        # Issue #21: the prior disclosure and the market snapshot come from Ledger.as_of at
+        # decision_at, so a record the ledger learned after the decision is invisible.
+        self.populate(receipts={("ABC", 21): self.at(23), ("SPY", 21): self.at(23)})
+        self.event("known", index=17, text="The previous operating report was stable.")
+        self.event("late", index=19, first_seen=self.at(23), text="Received after decision.")
+        self.event(index=21)
+
+        def guarded(read):
+            def call(kind, *args):
+                if kind in {"disclosures", "bars"}:
+                    raise AssertionError(f"decision path bypassed as_of: {kind}")
+                return read(kind, *args)
+
+            return call
+
+        with (
+            patch.object(self.ledger, "all", side_effect=guarded(self.ledger.all)),
+            patch.object(self.ledger, "prefix", side_effect=guarded(self.ledger.prefix)),
+            patch.object(self.ledger, "as_of", wraps=self.ledger.as_of) as as_of,
+        ):
+            result = self.observe(index=21)
+        self.assertEqual(result["previous_event_id"], "known")
+        self.assertEqual(result["market"]["session"], self.days[20])
+        decision = timestamp(self.at(21))
+        self.assertIn(("disclosures", decision), [c.args for c in as_of.call_args_list])
+        self.assertIn(("bars", decision), [c.args for c in as_of.call_args_list])
+
     def test_previous_document_does_not_cross_synthetic_provenance(self):
         self.populate()
         self.event("fixture-prior", index=19, mode="synthetic")
@@ -176,6 +204,8 @@ class EngineTests(unittest.TestCase):
 
     def test_replay_freezes_its_evidence_basis_and_hand_picked_replays_never_count(self):
         self.populate()
+        # #35: only a pre-registered cohort keeps its registry label.
+        cohorts.register(self.ledger, "c", event_ids=["current"], rule="fixture", now=self.at(0))
         self.event("previous", index=17, text="Business was unchanged.")
         current = self.event()
         result = self.observe()
@@ -201,6 +231,39 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(adhoc["eligibility"], "adhoc_replay")
         self.assertFalse(registry.counts_as_evidence(adhoc["eligibility"]))
+
+    def test_replay_of_an_unregistered_import_is_not_evidence(self):
+        # #35: a user could import only filings that were followed by moves.
+        self.populate()
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], cohorts.LABEL)
+        self.assertFalse(registry.counts_as_evidence(result["eligibility"]))
+
+    def test_replay_of_a_preregistered_cohort_keeps_its_registry_label(self):
+        self.populate()
+        cohorts.register(
+            self.ledger,
+            "feb",
+            event_ids=["current", "previous"],
+            rule="Every fixture filing",
+            now=self.at(0),
+        )
+        self.event("previous", index=17, text="Business was unchanged.")
+        self.event()
+        result = self.observe()
+        self.assertEqual(result["eligibility"], "no_model_knowledge")
+        self.assertEqual(cohorts.preregistered(self.ledger, "current"), "feb")
+        adhoc = self.observe(index=21, adhoc=True)
+        self.assertEqual(adhoc["eligibility"], "adhoc_replay")
+
+    def test_cohort_rule_leaves_forward_and_non_evidence_labels_alone(self):
+        self.populate()
+        self.event()
+        with patch.object(registry, "eligibility", return_value="contaminated"):
+            result = self.observe()
+        self.assertEqual(result["eligibility"], "contaminated")
 
     def test_replay_the_registry_cannot_label_is_never_evidence(self):
         self.populate()
@@ -273,6 +336,24 @@ class EngineTests(unittest.TestCase):
         rows = engine.training_rows(self.ledger, key, before=self.at(28))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["outcome_at"], timestamp(receipt))
+
+    def test_outcome_reads_bars_through_as_of_at_the_settlement_time(self):
+        # Issue #21: a label bar the ledger learns after as_of is invisible to outcome().
+        self.populate(receipts={("ABC", 23): self.at(27)})
+        self.event()
+        forecast = self.observe()
+
+        def guarded(kind, *args):
+            raise AssertionError(f"outcome bypassed as_of: {kind}")
+
+        with (
+            patch.object(self.ledger, "prefix", side_effect=guarded),
+            patch.object(self.ledger, "as_of", wraps=self.ledger.as_of) as as_of,
+        ):
+            self.assertIsNone(outcome(self.ledger, forecast, self.at(24)))
+            settled = outcome(self.ledger, forecast, self.at(28))
+        self.assertEqual(settled["label_available_at"], timestamp(self.at(27)))
+        self.assertIn(("bars", self.at(24)), [c.args for c in as_of.call_args_list])
 
     def test_training_freezes_earliest_event_observation_even_if_unresolved(self):
         self.populate()

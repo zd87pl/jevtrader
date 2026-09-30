@@ -289,7 +289,11 @@ def dispatch(args, ledger: Ledger, strategy: dict) -> dict:
         return {"added": import_bars(ledger, args.file, mode=args.mode)}
     if command == "collect":
         records = collect_disclosures(
-            args.cik, args.symbol, user_agent=_sec_contact(args.user_agent), limit=args.limit
+            args.cik,
+            args.symbol,
+            user_agent=_sec_contact(args.user_agent),
+            limit=args.limit,
+            verify_acceptance=True,
         )
         return {
             "collected": len(records),

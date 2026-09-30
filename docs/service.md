@@ -46,7 +46,7 @@ Settings live in `~/Library/Application Support/jevtrader/` (`config.json`, owne
 | `observe` | after new filings or bars | One frozen forward decision per new filing with the configured provider; a batch starts no new filing after 2 minutes, so polling keeps up |
 | `settle` | after bars | Next-open to tenth-close labels once they have matured |
 | `brief` | weekdays at your brief time | Notification of the filings first seen since the previous brief (the `brief` command, page and MCP show the last 3 days) |
-| `reconcile` | 22:45 | Compares the day's EDGAR index with what was collected |
+| `reconcile` | 22:45 | Classifies each 8-K in the day's EDGAR index, recovers missed qualifying filings as forward records stamped with their late receipt (`first_seen_basis: "reconcile_late"`), and records the rest as a `filing_gap` run |
 
 Every run, skip and failure is recorded in the ledger as a `runs` record. If the Mac slept, the service was stopped, or jobs held up polling for more than 5 minutes past its interval, a `coverage_gap` record says so; filings that left SEC's 100-entry feed meanwhile are not reconstructed. `jevtrader poll` and `jevtrader bars` run one job by hand (they refuse while the service or another such job runs); a service starting meanwhile waits up to 10 minutes for them, then exits with an error so launchd tries again. `jevtrader daemon` runs the schedule in the foreground.
 

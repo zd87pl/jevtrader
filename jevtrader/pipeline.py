@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from . import engine
+from . import cohorts, engine
 from .common import digest, instant
 from .engine import ObservationRejected
 from .market import bars_for
@@ -239,6 +239,7 @@ def _run(
     out_of_time: Callable[[], bool] | None = None,
 ) -> dict:
     records, errors, attempted, rejected = [], [], 0, 0
+    labels: list[dict] = []
     for event in events:
         if attempted >= limit:
             break
@@ -259,6 +260,7 @@ def _run(
                 **extra,
             )
             records.append({key: result[key] for key in FORECAST_FIELDS})
+            labels.append(result)
         except MissingCredentials as exc:
             # Every uncached event would fail the same way; cached ones never need a key.
             errors.append({"event_id": event["id"], "error": str(exc)})
@@ -286,4 +288,10 @@ def _run(
                 break  # The engine is down or refusing; every later event would fail too.
         else:
             attempted += 1
-    return {"forecasts": records, "errors": errors, "skipped": skipped}
+    # The label mix shows how much of a run can count, e.g. unregistered cohorts (#35).
+    return {
+        "forecasts": records,
+        "errors": errors,
+        "skipped": skipped,
+        "labels": cohorts.label_mix(labels),
+    }

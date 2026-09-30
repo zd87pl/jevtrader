@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import csv
 import math
-from datetime import date
+from datetime import date, timedelta
 from statistics import pstdev
 from typing import Any
 
 from .common import EASTERN, instant, number, symbol, timestamp, utc_now
+
+# A forward bar is stored no sooner than this after its close (invariant I-15, ADR-0003).
+# Historical bars without a receipt assume the same delay, so replays see no bar earlier
+# than a forward run could have.
+SETTLE_DELAY = timedelta(minutes=20)
 
 
 def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
@@ -49,11 +54,20 @@ def normalize_bar(row: dict, *, mode: str = "historical") -> dict:
     if result["split_ratio"] <= 0:
         raise ValueError("split_ratio must be positive")
     # Actual receipt time is mandatory for forward use. Replayed bars stay labeled historical.
-    result["available_at"] = (
-        utc_now() if mode == "forward" else timestamp(row.get("available_at") or result["close_at"])
-    )
+    # A historical bar is never available before close + SETTLE_DELAY (ADR-0003): the delay
+    # is a floor under any supplied receipt. Synthetic bars keep the supplied value or the close.
+    if mode == "forward":
+        result["available_at"] = utc_now()
+    elif row.get("available_at"):
+        result["available_at"] = timestamp(row["available_at"])
+    else:
+        result["available_at"] = result["close_at"]
     if instant(result["available_at"]) < instant(result["close_at"]):
         raise ValueError("A completed bar cannot be available before close")
+    if mode == "historical":
+        settled = instant(result["close_at"]) + SETTLE_DELAY
+        if instant(result["available_at"]) < settled:
+            result["available_at"] = timestamp(settled.isoformat())
     result["id"] = f"{result['symbol']}:{result['session']}"
     return result
 
@@ -74,6 +88,11 @@ def bars_for(ledger, ticker: str) -> list[dict]:
     return sorted(ledger.prefix("bars", f"{ticker}:"), key=lambda b: b["open_at"])
 
 
+def bars_as_of(ledger, ticker: str, t: str) -> list[dict]:
+    """A ticker's bars the ledger knew at ``t`` (available_at <= t), in open order (ADR-0004)."""
+    return sorted(ledger.as_of("bars", t, prefix=f"{ticker}:"), key=lambda b: b["open_at"])
+
+
 def _compatible(bar: dict, mode: str) -> bool:
     return bar["mode"] == mode if mode in {"forward", "synthetic"} else bar["mode"] != "synthetic"
 
@@ -90,10 +109,8 @@ def snapshot(ledger, ticker: str, decision_at: str, strategy: dict, *, mode: str
     def visible(name):
         return [
             b
-            for b in bars_for(ledger, name)
-            if instant(b["available_at"]) <= boundary
-            and instant(b["close_at"]) <= boundary
-            and _compatible(b, mode)
+            for b in bars_as_of(ledger, name, decision_at)
+            if instant(b["close_at"]) <= boundary and _compatible(b, mode)
         ]
 
     stock, benchmark = visible(ticker), visible(strategy["benchmark"])
@@ -136,12 +153,12 @@ def outcome(ledger, forecast: dict, as_of: str) -> dict | None:
     mode = forecast.get("mode", "historical")
     stock_all = [
         b
-        for b in bars_for(ledger, forecast["symbol"])
+        for b in bars_as_of(ledger, forecast["symbol"], as_of)
         if _compatible(b, mode) and instant(b["open_at"]) > decision
     ]
     benchmark = [
         b
-        for b in bars_for(ledger, strategy["benchmark"])
+        for b in bars_as_of(ledger, strategy["benchmark"], as_of)
         if instant(b["open_at"]) > decision and _compatible(b, mode)
     ]
     horizon = strategy["horizon_sessions"]

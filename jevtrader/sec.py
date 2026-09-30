@@ -31,6 +31,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .common import EASTERN
+from .ratelimit import SharedLimiter
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_BULK_BYTES = 10_000_000  # One day's form index or the ticker map; both are single SEC files.
@@ -63,6 +64,10 @@ class SECError(ValueError):
 
 class FilingNotFound(SECError):
     """The accession is absent from the company's recent submissions (not yet indexed or older)."""
+
+
+class AcceptanceMismatch(SECError):
+    """The filing index 'Accepted' value matches neither reading of the submissions JSON."""
 
 
 def utc_now() -> datetime:
@@ -107,6 +112,56 @@ def latest_acceptance(value: str) -> datetime:
     if parsed.tzinfo is not None:
         readings.append(parsed.astimezone(timezone.utc))
     return max(readings)
+
+
+_ACCEPTED = re.compile(r"\bAccepted\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\b")
+ACCEPTANCE_BASES = (
+    "edgar_index_accepted",
+    "submissions_json_unverified",
+    "submissions_json_latest_unverified",
+)
+# An index page that is gone, not a throttle or an outage (those stop the batch instead).
+_INDEX_UNAVAILABLE = (404, 410)
+
+
+def index_url(cik: str, accession: str) -> str:
+    """The filing's EDGAR index page, whose 'Accepted' value is Eastern wall-clock time."""
+    cik = _check_cik(cik)
+    if not isinstance(accession, str) or not _ACCESSION.fullmatch(accession):
+        raise SECError("Accession must look like 0000000000-00-000000")
+    folder = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{folder}/{accession}-index.htm"
+
+
+def _eastern_wall(wall: datetime) -> datetime:
+    """A naive Eastern wall time as UTC; an ambiguous fall-back time reads at its later instant."""
+    return max(wall.replace(tzinfo=EASTERN, fold=fold).astimezone(timezone.utc) for fold in (0, 1))
+
+
+def verified_acceptance(index_page: bytes, raw: str) -> datetime:
+    """The acceptance instant from an -index.htm 'Accepted' value, checked against the JSON.
+
+    The index value must appear exactly once and equal one reading of the submissions
+    JSON acceptanceDateTime (its "Z" as UTC, or as Eastern wall clock); anything else
+    fails closed. The result never exceeds ``latest_acceptance(raw)``.
+    """
+    text, _ = _read_document(index_page, "index.htm")
+    found = _ACCEPTED.findall(text)
+    if len(found) != 1:
+        raise SECError("Filing index must show exactly one Accepted timestamp")
+    try:
+        wall = datetime.strptime(found[0], "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise SECError("Invalid Accepted timestamp on the filing index") from exc
+    instant = _eastern_wall(wall)
+    _published_at(raw)
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    readings = {latest_acceptance(raw)}
+    if parsed.tzinfo is not None:
+        readings.add(parsed.astimezone(timezone.utc).replace(microsecond=0))
+    if instant not in {reading.replace(microsecond=0) for reading in readings}:
+        raise AcceptanceMismatch("Filing index Accepted disagrees with SEC acceptanceDateTime")
+    return instant
 
 
 def _daily_index_path(match: re.Match[str]) -> bool:
@@ -172,9 +227,9 @@ class _RateLimiter:
             self.last_request = self.clock()
 
 
-# Shared by ordinary calls, including repeated symbols and concurrent threads.
-# Separate processes must be coordinated by their caller or run only one poller.
-_DEFAULT_LIMITER = _RateLimiter(time.monotonic, time.sleep)
+# Shared by ordinary calls in every thread and every process using this app directory
+# (daemon, backfill and collect together), so SEC sees at most five requests a second.
+_DEFAULT_LIMITER: _RateLimiter | SharedLimiter = SharedLimiter("sec", REQUEST_INTERVAL)
 
 
 class _SECClient:
@@ -211,7 +266,7 @@ class _SECClient:
         self.sleep = sleep or time.sleep
         self.now = now or utc_now
         self.requests = 0
-        self.limiter = (
+        self.limiter: _RateLimiter | SharedLimiter = (
             _DEFAULT_LIMITER
             if clock is None and sleep is None
             else _RateLimiter(self.clock, self.sleep)
@@ -463,6 +518,12 @@ def _supplied_first_seen(first_seen: str | Callable[[str], str], row: dict) -> s
     return _iso_utc(parsed)
 
 
+def _index_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in _INDEX_UNAVAILABLE
+    return not isinstance(exc, AcceptanceMismatch)
+
+
 def collect_filing(
     client: _SECClient,
     cik: str,
@@ -472,6 +533,8 @@ def collect_filing(
     submissions: dict | None = None,
     mode: str = "forward",
     first_seen: str | Callable[[str], str] | None = None,
+    verify_acceptance: bool = False,
+    unverified_fallback: bool = False,
 ) -> dict | None:
     """Collect one filing's selected document, or None when the filing does not qualify.
 
@@ -480,7 +543,17 @@ def collect_filing(
     Historical mode requires one: a timestamp, or a callable given SEC's raw
     acceptanceDateTime; it may not precede the latest reading of that acceptance.
     Raises FilingNotFound when the accession is absent from the recent submissions.
-    At most 1 + 3 requests, all through ``client``'s allowlist, budget and limiter.
+    ``verify_acceptance`` also reads the filing's -index.htm: its 'Accepted' instant then
+    sets published_at, accepted_at and after_hours (acceptance_basis "edgar_index_accepted").
+    Otherwise published_at reads the JSON "Z" as UTC and after_hours uses the latest reading
+    ("submissions_json_unverified"). A supplied first_seen is always checked against the
+    latest reading, verified or not. At most 1 + 3 requests, or 1 + 4 when verifying, all
+    through ``client``'s allowlist, budget and limiter.
+    ``unverified_fallback`` (with ``verify_acceptance``) keeps collecting when the index page
+    is gone (404/410), shows no single Accepted value, or the budget is spent: published_at,
+    accepted_at and after_hours then use the latest JSON reading, which is never earlier
+    ("submissions_json_latest_unverified"). A disagreeing index (AcceptanceMismatch),
+    throttling, an outage or a network error still raise.
     """
     cik = _check_cik(cik)
     symbol = _check_symbol(symbol)
@@ -492,6 +565,8 @@ def collect_filing(
         raise SECError("Forward collection records actual receipt; first_seen is not accepted")
     if mode == "historical" and first_seen is None:
         raise SECError("Historical collection requires an explicit first_seen assumption")
+    if unverified_fallback and not verify_acceptance:
+        raise SECError("unverified_fallback applies only with verify_acceptance")
     normalized_cik = cik.zfill(10)
     data = (
         submissions
@@ -521,13 +596,27 @@ def collect_filing(
         # the filing/request budget while looking for another candidate.
         raise SECError("Selected SEC document contains no readable text")
     seen = observed if first_seen is None else _supplied_first_seen(first_seen, row)
-    latest = latest_acceptance(row["acceptance"]).astimezone(EASTERN)
+    if verify_acceptance:
+        try:
+            accepted = verified_acceptance(client.get(index_url(cik, accession)), row["acceptance"])
+            basis = ACCEPTANCE_BASES[0]
+        except (HTTPError, SECError) as exc:
+            if not unverified_fallback or not _index_unavailable(exc):
+                raise
+            if isinstance(exc, HTTPError):
+                exc.close()
+            accepted, basis = latest_acceptance(row["acceptance"]), ACCEPTANCE_BASES[2]
+        published = _iso_utc(accepted)
+    else:
+        accepted, basis = latest_acceptance(row["acceptance"]), ACCEPTANCE_BASES[1]
+        published = row["published_at"]
     return {
         "id": f"sec:{accession}:{document}",
         "symbol": symbol.upper(),
-        "published_at": row["published_at"],
-        "accepted_at": row["published_at"],
-        "after_hours": latest.time() >= AFTER_HOURS,
+        "published_at": published,
+        "accepted_at": published,
+        "after_hours": accepted.astimezone(EASTERN).time() >= AFTER_HOURS,
+        "acceptance_basis": basis,
         "first_seen_at": seen,
         "source_url": base + document,
         "text": text[:MAX_TEXT_CHARS],
@@ -553,11 +642,15 @@ def collect_disclosures(
     user_agent: str,
     limit: int = 5,
     timeout: float = 20,
+    transport: Callable | None = None,
+    verify_acceptance: bool = False,
 ) -> list[dict]:
     """Collect up to ``limit`` recent non-earnings operating disclosures.
 
     Explicit contact-bearing User-Agent is required. Each call is bounded to
-    1 + 3*limit requests and at most five requests/second. Only SEC-hosted HTML or
+    1 + 3*limit requests (1 + 4*limit with ``verify_acceptance``, which reads each
+    filing's -index.htm Accepted instant and falls back as collect_filing's
+    ``unverified_fallback``) and at most five requests/second. Only SEC-hosted HTML or
     text is fetched; PDF-only exhibits and unknown item metadata are skipped or
     marked as cover-page fallbacks. Errors propagate so callers can fail closed.
     """
@@ -565,7 +658,9 @@ def collect_disclosures(
     _check_symbol(symbol)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise SECError(f"limit must be an integer from 1 to {MAX_LIMIT}")
-    client = _SECClient(user_agent, timeout, 1 + 3 * limit)
+    per_filing = 4 if verify_acceptance else 3
+    seam = {} if transport is None else {"transport": transport}
+    client = _SECClient(user_agent, timeout, 1 + per_filing * limit, **seam)
     data = client.get_json(f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json")
     recent = _recent_filings(data)
     records = []
@@ -573,7 +668,15 @@ def collect_disclosures(
         row = _qualifying(recent, index)
         if row is None:
             continue
-        record = collect_filing(client, cik, row["accession"], symbol, submissions=data)
+        record = collect_filing(
+            client,
+            cik,
+            row["accession"],
+            symbol,
+            submissions=data,
+            verify_acceptance=verify_acceptance,
+            unverified_fallback=verify_acceptance,
+        )
         if record is not None:
             records.append(record)
         if len(records) >= limit:

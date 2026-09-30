@@ -4,6 +4,7 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
+from jevtrader import cohorts
 from jevtrader.common import digest, load_strategy, timestamp
 from jevtrader.engine import ObservationRejected
 from jevtrader.market import normalize_bar
@@ -164,6 +165,21 @@ class ObserveQueueTests(unittest.TestCase):
             [timestamp(event("x", self.days[i])["first_seen_at"]) for i in (25, 26)],
         )
         self.assertEqual(len(replayed["forecasts"]), 2)
+
+    def test_queue_replay_shows_the_label_mix_and_needs_a_preregistered_cohort(self):
+        # #35: imported cohorts only count when registered before the import.
+        cohorts.register(
+            self.ledger, "c1", event_ids=["listed"], rule="fixture", now="2026-01-01T00:00:00Z"
+        )
+        self.ledger.disclosure(event("listed", self.days[25]))
+        self.ledger.disclosure(event("unlisted", self.days[26]))
+        result = self.queue(replay=True)
+        stored = {
+            f["event_id"]: self.ledger.get("forecasts", f["id"])["eligibility"]
+            for f in result["forecasts"]
+        }
+        self.assertEqual(stored, {"listed": "no_model_knowledge", "unlisted": cohorts.LABEL})
+        self.assertEqual(result["labels"], {"no_model_knowledge": 1, cohorts.LABEL: 1})
 
     def test_limit_counts_attempts_but_not_local_rejections(self):
         for index in range(21, 27):

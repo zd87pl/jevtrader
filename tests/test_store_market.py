@@ -239,7 +239,8 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(value["split_ratio"], 2.0)
         self.assertEqual(value["cash_dividend"], 0.5)
         self.assertEqual(value["mode"], "historical")
-        self.assertEqual(value["available_at"], timestamp(f"{DAYS[0]}T21:01:00Z"))
+        # ADR-0003: SETTLE_DELAY is a floor, so an explicit close + 1 min becomes close + 20 min.
+        self.assertEqual(value["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
 
     def test_forward_bar_records_receipt_time_not_imported_claim(self):
         received = f"{DAYS[1]}T22:00:00.000000Z"
@@ -425,6 +426,48 @@ class MarketTests(unittest.TestCase):
         self.assertIsNone(outcome(self.ledger, forecast, f"{DAYS[3]}T22:00:00Z"))
 
 
+class HistoricalAvailabilityTests(unittest.TestCase):
+    """P0-15: a replay never sees a bar before close + SETTLE_DELAY unless a receipt says so."""
+
+    def test_historical_default_is_close_plus_settle_delay(self):
+        value = normalize_bar(raw_bar(available_at=None), mode="historical")
+        self.assertEqual(value["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
+        empty = normalize_bar(raw_bar(available_at=""), mode="historical")
+        self.assertEqual(empty["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
+
+    def test_settle_delay_is_a_floor_for_an_explicit_historical_receipt(self):
+        early = normalize_bar(raw_bar(available_at=f"{DAYS[0]}T21:00:00Z"), mode="historical")
+        self.assertEqual(early["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
+        later = normalize_bar(raw_bar(available_at=f"{DAYS[0]}T21:20:01Z"), mode="historical")
+        self.assertEqual(later["available_at"], timestamp(f"{DAYS[0]}T21:20:01Z"))
+        synthetic = normalize_bar(raw_bar(available_at=f"{DAYS[0]}T21:01:00Z"), mode="synthetic")
+        self.assertEqual(synthetic["available_at"], timestamp(f"{DAYS[0]}T21:01:00Z"))
+
+    def test_snapshot_boundary_at_settle_delay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with Ledger(Path(folder) / "l.sqlite") as ledger:
+                for name, price in (("ABC", 100.0), ("SPY", 500.0)):
+                    for day in DAYS[:22]:
+                        row = normalize_bar(
+                            raw_bar(name, day, price=price, available_at=None), mode="historical"
+                        )
+                        ledger.put("bars", row["id"], row)
+                strategy = {
+                    "benchmark": "SPY",
+                    "min_history_sessions": 21,
+                    "max_market_age_hours": 96,
+                    "spread_bps": 5,
+                }
+                early = snapshot(
+                    ledger, "ABC", f"{DAYS[21]}T21:19:59Z", strategy, mode="historical"
+                )
+                self.assertEqual(early["session"], DAYS[20])
+                equal = snapshot(
+                    ledger, "ABC", f"{DAYS[21]}T21:20:00Z", strategy, mode="historical"
+                )
+                self.assertEqual(equal["session"], DAYS[21])
+
+
 class ImportBarsTests(unittest.TestCase):
     """``import_bars`` (market.py): all-or-nothing, idempotent, first receipt kept (P0-20)."""
 
@@ -448,7 +491,7 @@ class ImportBarsTests(unittest.TestCase):
         self.assertEqual(import_bars(self.ledger, path), 0)
         stored = self.ledger.get("bars", f"ABC:{DAYS[0]}")
         self.assertEqual(stored["mode"], "historical")
-        self.assertEqual(stored["available_at"], timestamp(f"{DAYS[0]}T21:01:00Z"))
+        self.assertEqual(stored["available_at"], timestamp(f"{DAYS[0]}T21:20:00Z"))
         self.assertEqual(self.ledger.counts()["bars"], 3)
 
     def test_one_invalid_row_rejects_the_whole_file(self):

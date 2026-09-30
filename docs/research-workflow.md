@@ -140,6 +140,14 @@ python -m jevtrader --db data/research.sqlite autoresearch --provider jev --mode
 
 The first round evaluates the baseline; later rounds ask OpenAI to change only question text/name. The ledger locks the development cutoff, baseline, provider, model, and event universe. Before locking, it rejects a universe that mixes real and synthetic events or that purging would leave with fewer than 10 evaluated events. Missing API keys fail before the research settings are locked or any trial or proposal budget is reserved (with `--rounds` above 1, both the OpenAI key and the extraction provider's key are checked first); a completed trial is returned again without keys. A completed trial is reused only if the current evaluator (`ridge-event-v2`) scored it; running one scored by an earlier evaluator uses a new trial slot. A paid proposal that fails local strategy validation is recorded as `proposal_rejected` with its response and still counts as a proposal attempt; `autoresearch` lists it under `rejected_proposals`, and that round produces no trial.
 
+**Changed questions need a person's approval before any paid trial.** A proposal must also pass a question lint: no tickers, no return or price language, no "ignore the evidence" phrasing, no tool names. A proposal that fails is recorded as `proposal_rejected`. `autoresearch` stops at the first unapproved proposal and returns its id under `awaiting_approval`. Review the diff and approve it:
+
+```sh
+python -m jevtrader --db data/research.sqlite approve-questions --proposal PROPOSAL_ID
+```
+
+The command prints the question diff and the question set's SHA-256, and asks you to type its first 8 characters. `experiment` refuses any question set that differs from the baseline until it is approved; use `approve-questions --candidate FILE` for a hand-written candidate. No MCP or LLM tool can approve.
+
 The limit is **five candidate trials per ledger, at most 200 events each**, plus at most **four proposal API attempts**, including failures and manual `propose` calls. Failed started trials are retained and are not automatically retried, even under a later evaluator. This bounds calls, not a dollar amount. The resolved provider model is pinned; changes during comparison are rejected. `experiment` tests a candidate JSON; `propose` writes a candidate from a completed development trial. Run either with `--help` for arguments.
 
 The development winner is never automatically promoted. All adaptive results remain development results; freeze a chosen version and collect new forward observations before judging it. Repeatedly changing questions against the same holdout contaminates that holdout.

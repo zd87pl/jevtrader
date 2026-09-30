@@ -7,10 +7,13 @@ No candidate is automatically promoted. The ledger remains human-owned.
 
 from __future__ import annotations
 
+import difflib
+
 from .common import digest, instant, timestamp, utc_now, validate_strategy
 from .engine import evaluate, observe, settle
 from .providers import propose_strategy, require_credentials
 from .research import FEATURE_NAMES, VERSION, walk_forward
+from .security.question_lint import lint_questions
 
 
 MAX_TRIALS = 5
@@ -61,6 +64,51 @@ def development_feedback(trial: dict) -> dict:
     }
 
 
+def questions_sha256(questions: dict) -> str:
+    return digest(questions)
+
+
+def question_diff(questions: dict, baseline: dict) -> str:
+    """A unified diff of question text, one ``name: text`` line per question."""
+
+    def lines(values: dict) -> list[str]:
+        return [f"{name}: {values[name]}" for name in sorted(values)]
+
+    return "\n".join(
+        difflib.unified_diff(
+            lines(baseline), lines(questions), "baseline", "candidate", lineterm=""
+        )
+    )
+
+
+def question_approved(ledger, questions: dict) -> bool:
+    record = ledger.get("experiments", f"question-approval:{questions_sha256(questions)}")
+    return record is not None and record.get("type") == "question_approval"
+
+
+def record_question_approval(ledger, questions: dict, baseline: dict) -> dict:
+    """Record a human's approval of a question set (P0-06). Only the CLI calls this.
+
+    It is never exposed as an MCP or LLM tool: an approval stands for a person having
+    read the diff. Approving the same set again returns the existing record.
+    """
+    sha = questions_sha256(questions)
+    identity = f"question-approval:{sha}"
+    existing = ledger.get("experiments", identity)
+    if existing is not None:
+        return existing
+    record = {
+        "id": identity,
+        "type": "question_approval",
+        "questions_sha256": sha,
+        "approved_at": utc_now(),
+        "approved_by": "cli",
+        "diff": question_diff(questions, baseline),
+    }
+    ledger.put("experiments", identity, record)
+    return record
+
+
 def generate_proposal(ledger, trial: dict, model: str) -> dict:
     feedback = development_feedback(trial)
     attempts = [r for r in ledger.all("experiments") if r.get("type") == "proposal_started"]
@@ -84,6 +132,9 @@ def generate_proposal(ledger, trial: dict, model: str) -> dict:
     try:
         candidate = propose_strategy(trial["candidate"], feedback, model, metadata=metadata)
         validate_strategy(candidate)
+        problems = lint_questions(candidate["questions"])
+        if problems:
+            raise ValueError("; ".join(problems))
     except ValueError as exc:
         if candidate is None and not metadata:
             raise  # No response came back to record.
@@ -134,6 +185,7 @@ def autoresearch(
         development_until=development_until,
     )
     trials, rejected = [best["id"]], []
+    awaiting = None
     for _ in range(rounds - 1):
         if sum(r.get("type") == "trial_started" for r in ledger.all("experiments")) >= MAX_TRIALS:
             break
@@ -143,6 +195,10 @@ def autoresearch(
             rejected.append(str(exc))  # Recorded in the ledger; the round is used.
             continue
         candidate = proposal["candidate"]
+        if not question_approved(ledger, candidate["questions"]):
+            # LLM-written questions are drafts until a person approves the diff (P0-06).
+            awaiting = proposal["id"]
+            break
         trial = experiment(
             ledger,
             candidate,
@@ -157,6 +213,7 @@ def autoresearch(
     return {
         "trials": trials,
         "rejected_proposals": rejected,
+        "awaiting_approval": awaiting,
         "best_trial_id": best["id"],
         "candidate": best["candidate"],
         "development_score": best["score"],
@@ -232,6 +289,16 @@ def experiment(
     legacy = ledger.get("experiments", digest({"protocol": protocol, "candidate": candidate}))
     if legacy and legacy["report"].get("version") == VERSION:
         return legacy
+    if candidate["questions"] != baseline["questions"] and not question_approved(
+        ledger, candidate["questions"]
+    ):
+        # Checked before any slot reservation or paid call (P0-06); a completed
+        # trial of the same candidate is returned above without spending anything.
+        sha = questions_sha256(candidate["questions"])
+        raise ValueError(
+            f"Question set {sha[:8]} is not approved; review its diff with "
+            "`jevtrader approve-questions` before any paid trial"
+        )
     stored = ledger.all("experiments")
     attempts = [r for r in stored if r.get("type") == "trial_started"]
     # The protocol is locked per ledger, so the candidate identifies its trials under any

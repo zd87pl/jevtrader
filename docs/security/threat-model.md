@@ -40,7 +40,7 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 - **Prompt injection via any external text.** Filing text, provider error bodies, provider model
   names and URLs can all carry instructions aimed at a reader LLM or at a host LLM that reads our
   MCP or web output.
-- **Autoresearch LLM.** Writes questions that become instructions (`jevtrader/lab.py:141-156`);
+- **Autoresearch LLM.** Writes questions that become instructions; they stay drafts until a person approves the diff (`jevtrader/lab.py:197-209`);
   compromised or merely wrong, it can drift the instruction channel.
 - **Co-installed agent or local process.** Runs as the same user: a coding agent, another MCP
   server (possibly a broker server with order tools), a browser tab doing DNS rebinding.
@@ -57,13 +57,13 @@ secrets, D8 read-only surfaces). Every `path:line` citation is checked by
 | E3 | Provider prompts: fixed instructions and questions in the instruction channel; filing text only in hash-tagged data blocks | `jevtrader/providers.py:282-302`, `jevtrader/providers.py:411-419` | trusted template, untrusted blocks |
 | E4 | Provider HTTP with redirects refused | `jevtrader/providers.py:203-207` | untrusted response |
 | E5 | Alpaca bars with key headers | `jevtrader/bars.py:177-178` | untrusted response |
-| E6 | Autoresearch proposals run as experiments | `jevtrader/lab.py:141-156` | LLM-written |
+| E6 | Autoresearch proposals, run as experiments only after a person approves the question diff | `jevtrader/lab.py:197-209` | LLM-written |
 | E7 | Brief cards quoting filing sentences, directive filter | `jevtrader/brief.py:53` | untrusted |
 | E8 | MCP stdio server | `jevtrader/mcp_server.py:485-496`, `jevtrader/mcp_server.py:41` | untrusted client |
 | E9 | Web view, loopback, GET/HEAD only | `jevtrader/web.py:323-328`, `jevtrader/web.py:417-418` | untrusted client |
 | E10 | Local reader, loopback endpoints only | `jevtrader/local.py:45` | local |
 | E11 | Keychain reads and writes | `jevtrader/secrets.py:79-81`, `jevtrader/secrets.py:99-114` | owner |
-| E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:56-58`, `jevtrader/cli.py:515-516`, `jevtrader/app.py:466-468` | owner |
+| E12 | Key export for key-using commands and doctor | `jevtrader/cli.py:64-66`, `jevtrader/cli.py:553-554`, `jevtrader/app.py:466-468` | owner |
 | E13 | Notifier child process | `jevtrader/notify.py:16` | our text, inherited env |
 
 ## Threats
@@ -93,9 +93,9 @@ of service, E elevation of privilege.
 | T1 | Central versioned sanitizer (`jevtrader/security/sanitize.py:34`) on collection, and again in the engine before any provider call for legacy ledger text | Done in #9; display surfaces still use their own filters (#12) |
 | T2 | Readers have no tools and return bounded numbers | Quarantine flag and exclusions, red-team corpus in CI: #13 |
 | T3 | Directive sentences dropped from cards (`jevtrader/brief.py:53`); excerpts only from `explain_filing` under an untrusted label (`jevtrader/mcp_server.py:41`) | Provenance on external-derived text, warn against co-installed broker servers: #12 |
-| T4 | Proposals must pass validation before an experiment (`jevtrader/lab.py:141-156`) | Human review of LLM-written questions: #10 |
+| T4 | Proposals pass validation and a question lint, and run only after human approval of the diff (`jevtrader/lab.py:197-209`) | Done in #10 |
 | T5 | Values go through stdin, never argv (`jevtrader/secrets.py:79-81`); MCP withholds any result containing a key (`jevtrader/mcp_server.py:181-183`, `jevtrader/mcp_server.py:280-285`); `tools/secret_scan.py` | Canary secrets across every sink: #28 |
-| T6 | Only key-using commands export (`jevtrader/cli.py:56-58`) | Export only needed keys, scrub child env, execution-only trading keys: #46 |
+| T6 | Only key-using commands export (`jevtrader/cli.py:64-66`) | Export only needed keys, scrub child env, execution-only trading keys: #46 |
 | T7 | Loopback bind only (`jevtrader/web.py:417-418`), Host check and read-only methods (`jevtrader/web.py:323-328`) | Auth and CSRF on any future state-changing route (ADR-0001 D2) |
 | T8 | Redirects refused (`jevtrader/providers.py:203-207`) | none |
 | T9 | Approved-URL allowlist (`jevtrader/sec.py:177-196`); local reader loopback only (`jevtrader/local.py:45`) | none |

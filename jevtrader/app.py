@@ -256,6 +256,7 @@ def backfill(
             symbols=wanted,
             transport=sec_transport,
             max_filings=max_filings,
+            verify_acceptance=True,
         )
         if with_bars:
             names = sorted(

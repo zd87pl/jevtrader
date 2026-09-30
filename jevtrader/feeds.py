@@ -33,6 +33,7 @@ MAX_FILING_ATTEMPTS = 10
 MAX_REMEMBERED = 10_000
 TICKER_TTL_SECONDS = 6 * 3600
 REQUESTS_PER_FILING = 4  # submissions + directory + cover + exhibit
+VERIFY_REQUESTS = 1  # the filing's -index.htm, with verify_acceptance
 FIRST_SEEN_DELAY = timedelta(minutes=15)
 MORNING = clock_time(6, 0)  # EDGAR opens; nothing is disseminated earlier.
 EVENING = sec.AFTER_HOURS
@@ -57,6 +58,19 @@ _SKIPS = (
     "failed_before",
     "deferred",
 )
+
+
+def _acceptance(verify: bool) -> dict:
+    """collect_filing options: with ``verify``, published_at, accepted_at and after_hours
+    come from the filing index's 'Accepted' instant, or, when that page is gone, from the
+    later JSON reading marked unverified (#16)."""
+    if not isinstance(verify, bool):
+        raise ValueError("verify_acceptance must be a boolean")
+    return {"verify_acceptance": verify, "unverified_fallback": verify}
+
+
+def _per_filing(verify: bool) -> int:
+    return REQUESTS_PER_FILING + (VERIFY_REQUESTS if verify else 0)
 
 
 def _client(user_agent: str, max_requests: int, transport: Callable | None) -> sec._SECClient:
@@ -385,13 +399,14 @@ def poll(
     transport: Callable | None = None,
     max_filings: int = 25,
     memory: PollMemory | None = None,
+    verify_acceptance: bool = False,
 ) -> dict:
     """Collect new qualifying 8-Ks from the current feed into the forward ledger.
 
     Oldest first, so filings about to leave the 100-entry feed are not starved. Accessions
     already in the ledger cost no request; the ticker map is fetched only when something
-    new needs mapping. At most ``max_filings`` filings are fetched (<= 4 requests each);
-    the rest are counted as ``deferred`` for the next poll. One bad filing is recorded in
+    new needs mapping. At most ``max_filings`` filings are fetched (<= 4 requests each, 5
+    with ``verify_acceptance``); the rest are counted as ``deferred`` for the next poll. One bad filing is recorded in
     ``errors``; SEC throttling (403/429), 5xx or a network failure stops the batch
     (``stopped``). -> {"seen", "new", "added", "skipped", "errors", "stopped", "requests"}
     """
@@ -401,7 +416,8 @@ def poll(
         ledger, paths.research_ledger_path(), "poll writes forward records; not the research ledger"
     )
     memory = _MEMORY if memory is None else memory
-    client = _client(user_agent, 2 + REQUESTS_PER_FILING * max_filings, transport)
+    options = _acceptance(verify_acceptance)
+    client = _client(user_agent, 2 + _per_filing(verify_acceptance) * max_filings, transport)
     registrants: dict[str, list[dict]] = {}
     for row in _latest_8k(client, FEED_COUNTS[-1]):
         registrants.setdefault(row["accession"], []).append(row)
@@ -432,7 +448,7 @@ def poll(
         examined += 1
         cik, ticker = choice
         try:
-            record = sec.collect_filing(client, cik, accession, ticker)
+            record = sec.collect_filing(client, cik, accession, ticker, **options)
         except sec.FilingNotFound:
             memory.fail(accession)
             skipped["not_indexed"] += 1
@@ -486,14 +502,15 @@ def backfill(
     transport: Callable | None = None,
     max_filings: int = 500,
     master: SecurityMaster | None = None,
+    verify_acceptance: bool = False,
 ) -> dict:
     """Historical 8-K collection from daily form indexes into a separate research ledger.
 
     Never forward: ``first_seen_at`` is assumed_first_seen(acceptance), marked
     ``first_seen_basis: "backfill_assumed"``; filings whose assumed availability is still in
     the future are skipped. Covers filings within each company's recent SEC submissions.
-    ``max_filings`` bounds filings examined (<= 4 requests each); ``truncated`` means a
-    candidate was left unexamined, so the range was not finished. -> poll's keys plus "days", "truncated".
+    ``max_filings`` bounds filings examined (<= 4 requests each, 5 with
+    ``verify_acceptance``); ``truncated`` means a candidate was left unexamined, so the range was not finished. -> poll's keys plus "days", "truncated".
 
     Symbols come from the point-in-time security master (``master``, or by default the
     ledger's ``securities`` records known at the run's start) as of each index day, so
@@ -505,7 +522,9 @@ def backfill(
     max_filings = _bounded(max_filings, MAX_BACKFILL_FILINGS, "max_filings")
     wanted = _watched(symbols)
     _require_research_ledger(ledger)
-    budget = 1 + sum(day.weekday() < 5 for day in days) + REQUESTS_PER_FILING * max_filings
+    options = _acceptance(verify_acceptance)
+    per_filing = _per_filing(verify_acceptance)
+    budget = 1 + sum(day.weekday() < 5 for day in days) + per_filing * max_filings
     client = _client(user_agent, budget, transport)
     now = client.now()
     if days[-1] > now.astimezone(EASTERN).date():
@@ -562,6 +581,7 @@ def backfill(
                     submissions=submissions[cik],
                     mode="historical",
                     first_seen=assumed_first_seen,
+                    **options,
                 )
             except sec.FilingNotFound:
                 skipped["not_in_submissions"] += 1
@@ -593,6 +613,7 @@ def reconcile(
     transport: Callable | None = None,
     max_filings: int = 25,
     memory: PollMemory | None = None,
+    verify_acceptance: bool = False,
 ) -> dict:
     """Classify every 8-K in ``day``'s daily index and recover the qualifying ones poll missed.
 
@@ -615,7 +636,8 @@ def reconcile(
         "reconcile writes forward records; not the research ledger",
     )
     memory = _MEMORY if memory is None else memory
-    client = _client(user_agent, 2 + REQUESTS_PER_FILING * max_filings, transport)
+    options = _acceptance(verify_acceptance)
+    client = _client(user_agent, 2 + _per_filing(verify_acceptance) * max_filings, transport)
     index = _published_index(client, day)
     registrants: dict[str, list[dict]] = {}
     for row in index or []:
@@ -656,7 +678,7 @@ def reconcile(
         examined += 1
         cik, ticker = choice
         try:
-            record = sec.collect_filing(client, cik, accession, ticker)
+            record = sec.collect_filing(client, cik, accession, ticker, **options)
         except sec.FilingNotFound:
             gap(rows, "not_in_submissions")
             continue

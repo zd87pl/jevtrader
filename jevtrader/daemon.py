@@ -251,10 +251,16 @@ def run_job(name: str, ctx: Context) -> dict:
     return _record(ctx, name, started_at, timestamp(ctx.clock()), status, counts, error)
 
 
+def _verified(adapter: Callable[..., dict], real: Callable[..., dict]) -> dict:
+    """The real collector records the filing index's verified 'Accepted' instant (#16);
+    an injected adapter keeps its own signature."""
+    return {"verify_acceptance": True} if adapter is real else {}
+
+
 def _poll(ctx: Context, now: str) -> tuple[dict, list]:
     agent = _user_agent(ctx)
     symbols = _scope(ctx.config)
-    result = ctx.poll(ctx.ledger, agent, symbols=symbols)
+    result = ctx.poll(ctx.ledger, agent, symbols=symbols, **_verified(ctx.poll, feeds.poll))
     errors = list(result.get("errors") or [])
     counts = {
         "seen": _count(result.get("seen")),
@@ -425,7 +431,8 @@ def _brief(ctx: Context, now: str) -> tuple[dict, list]:
 def _reconcile(ctx: Context, now: str) -> tuple[dict, list]:
     agent = _user_agent(ctx)
     day = reconcile_day(instant(now))
-    result = ctx.reconcile(ctx.ledger, agent, day, symbols=_scope(ctx.config))
+    verified = _verified(ctx.reconcile, feeds.reconcile)
+    result = ctx.reconcile(ctx.ledger, agent, day, symbols=_scope(ctx.config), **verified)
     gaps = [gap for gap in result.get("gaps") or [] if isinstance(gap, dict)]
     missing = bool(result.get("index_missing"))
     counts = {

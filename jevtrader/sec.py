@@ -66,6 +66,10 @@ class FilingNotFound(SECError):
     """The accession is absent from the company's recent submissions (not yet indexed or older)."""
 
 
+class AcceptanceMismatch(SECError):
+    """The filing index 'Accepted' value matches neither reading of the submissions JSON."""
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -111,7 +115,13 @@ def latest_acceptance(value: str) -> datetime:
 
 
 _ACCEPTED = re.compile(r"\bAccepted\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\b")
-ACCEPTANCE_BASES = ("edgar_index_accepted", "submissions_json_unverified")
+ACCEPTANCE_BASES = (
+    "edgar_index_accepted",
+    "submissions_json_unverified",
+    "submissions_json_latest_unverified",
+)
+# An index page that is gone, not a throttle or an outage (those stop the batch instead).
+_INDEX_UNAVAILABLE = (404, 410)
 
 
 def index_url(cik: str, accession: str) -> str:
@@ -150,7 +160,7 @@ def verified_acceptance(index_page: bytes, raw: str) -> datetime:
     if parsed.tzinfo is not None:
         readings.add(parsed.astimezone(timezone.utc).replace(microsecond=0))
     if instant not in {reading.replace(microsecond=0) for reading in readings}:
-        raise SECError("Filing index Accepted disagrees with SEC acceptanceDateTime")
+        raise AcceptanceMismatch("Filing index Accepted disagrees with SEC acceptanceDateTime")
     return instant
 
 
@@ -508,6 +518,12 @@ def _supplied_first_seen(first_seen: str | Callable[[str], str], row: dict) -> s
     return _iso_utc(parsed)
 
 
+def _index_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in _INDEX_UNAVAILABLE
+    return not isinstance(exc, AcceptanceMismatch)
+
+
 def collect_filing(
     client: _SECClient,
     cik: str,
@@ -518,6 +534,7 @@ def collect_filing(
     mode: str = "forward",
     first_seen: str | Callable[[str], str] | None = None,
     verify_acceptance: bool = False,
+    unverified_fallback: bool = False,
 ) -> dict | None:
     """Collect one filing's selected document, or None when the filing does not qualify.
 
@@ -532,6 +549,11 @@ def collect_filing(
     ("submissions_json_unverified"). A supplied first_seen is always checked against the
     latest reading, verified or not. At most 1 + 3 requests, or 1 + 4 when verifying, all
     through ``client``'s allowlist, budget and limiter.
+    ``unverified_fallback`` (with ``verify_acceptance``) keeps collecting when the index page
+    is gone (404/410), shows no single Accepted value, or the budget is spent: published_at,
+    accepted_at and after_hours then use the latest JSON reading, which is never earlier
+    ("submissions_json_latest_unverified"). A disagreeing index (AcceptanceMismatch),
+    throttling, an outage or a network error still raise.
     """
     cik = _check_cik(cik)
     symbol = _check_symbol(symbol)
@@ -543,6 +565,8 @@ def collect_filing(
         raise SECError("Forward collection records actual receipt; first_seen is not accepted")
     if mode == "historical" and first_seen is None:
         raise SECError("Historical collection requires an explicit first_seen assumption")
+    if unverified_fallback and not verify_acceptance:
+        raise SECError("unverified_fallback applies only with verify_acceptance")
     normalized_cik = cik.zfill(10)
     data = (
         submissions
@@ -573,8 +597,16 @@ def collect_filing(
         raise SECError("Selected SEC document contains no readable text")
     seen = observed if first_seen is None else _supplied_first_seen(first_seen, row)
     if verify_acceptance:
-        accepted = verified_acceptance(client.get(index_url(cik, accession)), row["acceptance"])
-        published, basis = _iso_utc(accepted), ACCEPTANCE_BASES[0]
+        try:
+            accepted = verified_acceptance(client.get(index_url(cik, accession)), row["acceptance"])
+            basis = ACCEPTANCE_BASES[0]
+        except (HTTPError, SECError) as exc:
+            if not unverified_fallback or not _index_unavailable(exc):
+                raise
+            if isinstance(exc, HTTPError):
+                exc.close()
+            accepted, basis = latest_acceptance(row["acceptance"]), ACCEPTANCE_BASES[2]
+        published = _iso_utc(accepted)
     else:
         accepted, basis = latest_acceptance(row["acceptance"]), ACCEPTANCE_BASES[1]
         published = row["published_at"]
@@ -610,11 +642,15 @@ def collect_disclosures(
     user_agent: str,
     limit: int = 5,
     timeout: float = 20,
+    transport: Callable | None = None,
+    verify_acceptance: bool = False,
 ) -> list[dict]:
     """Collect up to ``limit`` recent non-earnings operating disclosures.
 
     Explicit contact-bearing User-Agent is required. Each call is bounded to
-    1 + 3*limit requests and at most five requests/second. Only SEC-hosted HTML or
+    1 + 3*limit requests (1 + 4*limit with ``verify_acceptance``, which reads each
+    filing's -index.htm Accepted instant and falls back as collect_filing's
+    ``unverified_fallback``) and at most five requests/second. Only SEC-hosted HTML or
     text is fetched; PDF-only exhibits and unknown item metadata are skipped or
     marked as cover-page fallbacks. Errors propagate so callers can fail closed.
     """
@@ -622,7 +658,9 @@ def collect_disclosures(
     _check_symbol(symbol)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise SECError(f"limit must be an integer from 1 to {MAX_LIMIT}")
-    client = _SECClient(user_agent, timeout, 1 + 3 * limit)
+    per_filing = 4 if verify_acceptance else 3
+    seam = {} if transport is None else {"transport": transport}
+    client = _SECClient(user_agent, timeout, 1 + per_filing * limit, **seam)
     data = client.get_json(f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json")
     recent = _recent_filings(data)
     records = []
@@ -630,7 +668,15 @@ def collect_disclosures(
         row = _qualifying(recent, index)
         if row is None:
             continue
-        record = collect_filing(client, cik, row["accession"], symbol, submissions=data)
+        record = collect_filing(
+            client,
+            cik,
+            row["accession"],
+            symbol,
+            submissions=data,
+            verify_acceptance=verify_acceptance,
+            unverified_fallback=verify_acceptance,
+        )
         if record is not None:
             records.append(record)
         if len(records) >= limit:
